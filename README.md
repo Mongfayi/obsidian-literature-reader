@@ -16,7 +16,7 @@
 
 ### 手动安装
 
-1. 在 Releases 页面下载最新 `main.js`、`manifest.json`、`styles.css`（及 `cmaps/` 目录，仓库内已附带）
+1. 下载`main.js`、`manifest.json`、`styles.css`（及 `cmaps/` 目录，仓库内已附带）
 2. 放入 vault 的 `.obsidian/plugins/pdf-reader/` 目录
 3. 重启 Obsidian，在「设置 → 第三方插件」中启用「文献阅读助手」
 
