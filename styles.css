@@ -135,3 +135,57 @@
   height: 100%;
   border: none;
 }
+
+
+/* ---------- 截图批注 ---------- */
+
+/* 截图模式：crosshair 光标，禁止文本选中（不遮滚动条、不拦截滚轮） */
+.pdf-screenshot-selecting {
+  cursor: crosshair;
+}
+.pdf-screenshot-selecting .textLayer {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 框选矩形：挂页面 div 内，随页面滚动/缩放移动 */
+.pdf-screenshot-box {
+  position: absolute;
+  border: 2px dashed var(--interactive-accent, #7c6cf0);
+  background: rgba(124, 108, 240, 0.12);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+  z-index: 1000;
+}
+
+/* 工具条「截图批注」按钮激活态：直观反映截图模式是否开启 */
+.pdfreader-screenshot-button.is-active {
+  color: var(--interactive-accent);
+  background-color: var(--background-modifier-active-hover);
+}
+
+/* ---------- PDF 截图嵌入（无文件，实时渲染裁剪区域） ---------- */
+
+.pdf-crop-embed {
+  display: inline-block;
+  max-width: 100%;
+}
+
+.pdf-crop-embed img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+}
+
+.pdf-crop-embed-loading {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 8px 12px;
+}
+
+.pdf-crop-embed-error {
+  color: var(--text-error);
+  font-size: 13px;
+  padding: 8px 12px;
+}

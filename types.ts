@@ -28,6 +28,8 @@ export interface SavedSelectionInfo {
     beginOffset: number;
     endIndex: number;
     endOffset: number;
+    /** 截图 OCR 批注的归一化矩形（0-1，相对页面尺寸），仅 beginIndex<0 时使用 */
+    ocrRect?: { x: number; y: number; w: number; h: number };
 }
 
 /**
