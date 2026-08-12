@@ -1,6 +1,7 @@
-import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import type { PluginSettings } from '../types';
 import { DEFAULT_SETTINGS } from '../types';
+import { OcrService } from './OcrService';
 
 /**
  * 合并插件的统一设置面板
@@ -56,6 +57,89 @@ export class UnifiedSettingTab extends PluginSettingTab {
                     await this.saveSettings();
                 }));
 
+        // ===== 截图 OCR 批注设置 =====
+        containerEl.createEl('hr');
+        containerEl.createEl('h2', { text: '截图 OCR 批注设置' });
+
+        new Setting(containerEl)
+            .setName('LM Studio 服务器地址')
+            .setDesc('OpenAI 兼容接口地址，需先启动 LM Studio 并加载视觉模型')
+            .addText((text) => text
+                .setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl)
+                .setValue(this.getSettings().ocrServerUrl)
+                .onChange(async (value) => {
+                    this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('OCR 模型')
+            .setDesc('留空 = 自动选择服务器上的视觉模型')
+            .addText((text) => text
+                .setPlaceholder('留空自动选择')
+                .setValue(this.getSettings().ocrModel)
+                .onChange(async (value) => {
+                    this.getSettings().ocrModel = value.trim();
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('请求超时（秒）')
+            .setDesc('单次 OCR 请求超时时间')
+            .addText((text) => text
+                .setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec))
+                .setValue(String(this.getSettings().ocrRequestTimeoutSec))
+                .onChange(async (value) => {
+                    const n = parseInt(value, 10);
+                    if (!Number.isNaN(n) && n >= 10) {
+                        this.getSettings().ocrRequestTimeoutSec = n;
+                        await this.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('最大输出令牌')
+            .setDesc('单次识别请求允许的最大输出长度（token），框选区域文本较多时可调大')
+            .addText((text) => text
+                .setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens))
+                .setValue(String(this.getSettings().ocrMaxTokens))
+                .onChange(async (value) => {
+                    const n = parseInt(value, 10);
+                    if (!Number.isNaN(n) && n >= 512) {
+                        this.getSettings().ocrMaxTokens = n;
+                        await this.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('OCR 提示词')
+            .setDesc('PaddleOCR-VL 使用官方任务词（如 OCR:）')
+            .addTextArea((text) => text
+                .setPlaceholder(DEFAULT_SETTINGS.ocrPrompt)
+                .setValue(this.getSettings().ocrPrompt)
+                .onChange(async (value) => {
+                    this.getSettings().ocrPrompt = value || DEFAULT_SETTINGS.ocrPrompt;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('测试连接')
+            .setDesc('检测服务器可达性并列出可用模型')
+            .addButton((btn) => btn
+                .setButtonText('测试连接')
+                .onClick(async () => {
+                    const service = new OcrService(this.getSettings().ocrServerUrl);
+                    btn.setButtonText('测试中…').setDisabled(true);
+                    try {
+                        const models = await service.listModels();
+                        new Notice(`连接成功，可用模型：\n${models.join('\n')}`, 8000);
+                    } catch (e) {
+                        new Notice(`连接失败: ${(e as Error).message}`);
+                    } finally {
+                        btn.setButtonText('测试连接').setDisabled(false);
+                    }
+                }));
+
         // ===== 功能介绍 =====
         containerEl.createEl('hr');
         containerEl.createEl('h3', { text: '功能介绍' });
@@ -80,6 +164,10 @@ export class UnifiedSettingTab extends PluginSettingTab {
             {
                 title: '上传当前文件到 DeepSeek',
                 desc: '在 DeepSeek 浮动窗口标题栏点击「加载文件」按钮，或执行命令「将当前阅读文件上传到 DeepSeek 聊天框」，将当前正在阅读的 PDF 或 Markdown 笔记自动上传到 DeepSeek 聊天框（上限 100MB），便于直接与 AI 讨论。',
+            },
+            {
+                title: '截图 OCR 批注',
+                desc: '在 PDF 视图工具条点「截图 OCR 批注」按钮（crop 图标），拖拽框选区域，用 LM Studio 视觉模型识别文字并作为批注写入阅读笔记（含页码与区域链接），批注区域在 PDF 上持久高亮。适合扫描版/无文本层 PDF。',
             },
         ];
 

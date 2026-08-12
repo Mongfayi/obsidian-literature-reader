@@ -4,6 +4,8 @@ import { PdfReaderModule } from './modules/PdfReaderModule';
 import { DeepSeekModule } from './modules/DeepSeekModule';
 import { PdfHighlightModule } from './modules/PdfHighlightModule';
 import { ScreenshotModule } from './modules/ScreenshotModule';
+import { OcrModule } from './modules/OcrModule';
+import { OcrHighlightModule } from './modules/OcrHighlightModule';
 import { UnifiedSettingTab } from './modules/SettingsTab';
 
 /**
@@ -41,6 +43,12 @@ export default class LiteratureReaderPlugin extends Plugin {
         // 截图批注模块：框选 PDF 区域 → 截图保存为附件 → 嵌入阅读笔记
         const screenshotModule = new ScreenshotModule(ctx, pdfModule);
 
+        // OCR 高亮模块：OCR 批注后即时高亮 + 笔记链接驱动的高亮重建
+        const ocrHighlightModule = new OcrHighlightModule(ctx);
+        // 截图 OCR 批注模块：框选 PDF 区域 → LM Studio 视觉模型识别文字 → 写入阅读笔记
+        const ocrModule = new OcrModule(ctx, pdfModule);
+        ocrModule.setHighlightRefresh((file, entries) => ocrHighlightModule.refresh(file, entries));
+
         const deepseekCtx: ModuleContext = {
             ...ctx,
             getCurrentFileForUpload: () => pdfModule.getCurrentFileForUpload(),
@@ -51,6 +59,8 @@ export default class LiteratureReaderPlugin extends Plugin {
             pdfModule,
             highlightModule,
             screenshotModule,
+            ocrHighlightModule,
+            ocrModule,
             new DeepSeekModule(deepseekCtx),
         ];
 
