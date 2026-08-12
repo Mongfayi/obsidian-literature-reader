@@ -6,6 +6,7 @@ import { PdfHighlightModule } from './modules/PdfHighlightModule';
 import { ScreenshotModule } from './modules/ScreenshotModule';
 import { OcrModule } from './modules/OcrModule';
 import { OcrHighlightModule } from './modules/OcrHighlightModule';
+import { MainArticleModule } from './modules/MainArticleModule';
 import { UnifiedSettingTab } from './modules/SettingsTab';
 
 /**
@@ -49,6 +50,9 @@ export default class LiteratureReaderPlugin extends Plugin {
         const ocrModule = new OcrModule(ctx, pdfModule);
         ocrModule.setHighlightRefresh((file, entries) => ocrHighlightModule.refresh(file, entries));
 
+        // 主文献模块：工具条「主文献」按钮，开启后所有 PDF 批注汇集到主文献笔记
+        const mainArticleModule = new MainArticleModule(ctx, pdfModule);
+
         const deepseekCtx: ModuleContext = {
             ...ctx,
             getCurrentFileForUpload: () => pdfModule.getCurrentFileForUpload(),
@@ -57,6 +61,7 @@ export default class LiteratureReaderPlugin extends Plugin {
         // 注册功能模块
         this.modules = [
             pdfModule,
+            mainArticleModule,
             highlightModule,
             screenshotModule,
             ocrHighlightModule,

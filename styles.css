@@ -199,6 +199,12 @@
   background-color: var(--background-modifier-active-hover);
 }
 
+/* 工具条「主文献」按钮激活态（已设为主文献时高亮） */
+.pdfreader-main-article-button.is-active {
+  color: var(--interactive-accent);
+  background-color: var(--background-modifier-active-hover);
+}
+
 /* 截图模式：crosshair 光标，禁止文本选中（不遮滚动条、不拦截滚轮） */
 .ocr-selecting {
   cursor: crosshair;
