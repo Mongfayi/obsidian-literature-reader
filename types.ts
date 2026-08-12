@@ -3,17 +3,33 @@ import type { Plugin } from 'obsidian';
 /**
  * 合并插件的统一设置接口
  * 包含 PDF 阅读与 DeepSeek 浮动窗口两部分配置
+ * 以及截图 OCR 批注（LM Studio 视觉模型）配置
  */
 export interface PluginSettings {
     /** 阅读笔记存放文件夹（相对 vault 根目录） */
     readingNoteFolder: string;
     /** DeepSeek 嵌入网页地址 */
     deepseekUrl: string;
+    /** LM Studio 服务器地址（OpenAI 兼容接口） */
+    ocrServerUrl: string;
+    /** OCR 模型名（空 = 自动选择服务器列表内模型） */
+    ocrModel: string;
+    /** 单次 OCR 请求超时（秒） */
+    ocrRequestTimeoutSec: number;
+    /** 单次识别请求最大输出令牌 */
+    ocrMaxTokens: number;
+    /** OCR 提示词（PaddleOCR-VL 用任务词如 OCR:） */
+    ocrPrompt: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
     readingNoteFolder: 'ReadingNotes',
     deepseekUrl: 'https://chat.deepseek.com',
+    ocrServerUrl: 'http://127.0.0.1:1234',
+    ocrModel: 'paddleocr-vl-1.6',
+    ocrRequestTimeoutSec: 120,
+    ocrMaxTokens: 8192,
+    ocrPrompt: 'OCR:',
 };
 
 /**

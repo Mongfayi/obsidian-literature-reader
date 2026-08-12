@@ -189,3 +189,50 @@
   font-size: 13px;
   padding: 8px 12px;
 }
+
+
+/* ---------- 截图 OCR 批注 ---------- */
+
+/* 工具条「截图 OCR 批注」按钮激活态（截图模式开启时高亮） */
+.ocr-toolbar-button.is-active {
+  color: var(--interactive-accent);
+  background-color: var(--background-modifier-active-hover);
+}
+
+/* 截图模式：crosshair 光标，禁止文本选中（不遮滚动条、不拦截滚轮） */
+.ocr-selecting {
+  cursor: crosshair;
+}
+
+.ocr-selecting .textLayer {
+  user-select: none;
+}
+
+/* 框选矩形（挂页面 div 内，随页面滚动） */
+.ocr-crop-box {
+  position: absolute;
+  z-index: 1000;
+  border: 2px dashed var(--interactive-accent, #7c6cf0);
+  background: rgba(124, 108, 240, 0.12);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+}
+
+/* 已 OCR 批注区域持久高亮（笔记驱动，挂页面 div 内随页面滚动） */
+.ocr-highlight-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 900;
+}
+
+.ocr-crop-highlight {
+  position: absolute;
+  border: 1px solid rgba(var(--text-highlight-bg-rgb), 0.5);
+  background: rgba(var(--text-highlight-bg-rgb), 0.3);
+  border-radius: 2px;
+  pointer-events: none;
+}
