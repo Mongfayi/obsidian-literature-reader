@@ -1,6 +1,6 @@
 # 文献阅读助手 (Obsidian Literature Reader)
 
-一个面向科研文献阅读的 Obsidian 桌面端插件：PDF 一键阅读、批注到笔记、关键词自动提取、批注持久高亮，并集成 DeepSeek 浮动窗口。
+一个面向文献阅读的 Obsidian 桌面端插件：PDF 一键阅读、批注到笔记、关键词自动提取、批注持久高亮，并集成 DeepSeek 浮动窗口。
 
 > 插件 ID：`pdf-reader` · 仅桌面端（依赖 Electron / PDF.js）
 
