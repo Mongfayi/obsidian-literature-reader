@@ -1,4 +1,4 @@
-import { TFile, TFolder, Menu, WorkspaceLeaf, FileView, MarkdownView, Editor, normalizePath } from 'obsidian';
+import { TFile, TFolder, Menu, WorkspaceLeaf, FileView, MarkdownView, Editor, Notice, normalizePath } from 'obsidian';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type { ModuleContext, PluginModule, SavedSelectionInfo, FileUploadData } from '../types';
 
@@ -756,6 +756,72 @@ created: ${date}`;
 
     // ========== 批注写入笔记 ==========
 
+    // ========== 截图 OCR 批注入口（供 pdf-ocr 插件调用） ==========
+
+    /**
+     * 把外部传入的文本（如截图 OCR 识别结果）作为批注写入当前 PDF 的阅读笔记。
+     * 无文本层锚点（beginIndex=-1）：链接仅带页码，不生成 selection 锚点。
+     * ocrRect 提供时，链接附加 &ocr=x,y,w,h（归一化矩形），供 pdf-ocr 渲染持久高亮。
+     * @returns 是否成功写入（笔记创建失败返回 false）
+     */
+    async annotateOcrText(
+        pdfFile: TFile,
+        text: string,
+        page: number | null,
+        ocrRect?: { x: number; y: number; w: number; h: number }
+    ): Promise<boolean> {
+        const noteFile = await this.ensureNoteOpen(pdfFile);
+        if (!noteFile) return false;
+        const selections: SavedSelectionInfo[] = [{
+            text,
+            page,
+            beginIndex: -1,
+            beginOffset: 0,
+            endIndex: -1,
+            endOffset: 0,
+            ocrRect,
+        }];
+        try {
+            await this.appendAnnotationsToNote(noteFile, selections, pdfFile);
+            return true;
+        } catch (e) {
+            console.error('[PdfReader] OCR 批注写入失败:', e);
+            new Notice('OCR 批注写入失败');
+            return false;
+        }
+    }
+
+    /**
+     * 把截图区域作为批注写入当前 PDF 的阅读笔记：
+     * 不保存图片文件，插入 PDF 嵌入链接（![[file.pdf#page=N&rect=...]]），
+     * 由 ScreenshotModule 注册的自定义 EmbedCreator 实时渲染裁剪区域。
+     * @param rect PDF 空间坐标 [x1, y1, x2, y2]
+     * @returns 是否成功写入
+     */
+    async annotateScreenshot(pdfFile: TFile, page: number, rect: number[]): Promise<boolean> {
+        const noteFile = await this.ensureNoteOpen(pdfFile);
+        if (!noteFile) return false;
+        try {
+            const rectStr = rect.join(',');
+            const embedLink = `![[${pdfFile.path}#page=${page}&rect=${rectStr}]]`;
+            const pageLink = `[[${pdfFile.path}#page=${page}|${pdfFile.basename}, 页面 ${page}]]`;
+            const block = `> [!note] 批注\n> ${embedLink}\n> ${pageLink}\n> 笔记：`;
+            const annotation = '\n' + block + '\n';
+            const cursorPos = this.getNoteCursorEditorPos(noteFile);
+            if (cursorPos) {
+                cursorPos.editor.replaceRange(annotation, { line: cursorPos.line, ch: cursorPos.ch });
+            } else {
+                await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
+            }
+            await this.focusNotePrompt(noteFile, '> 笔记：');
+            return true;
+        } catch (e) {
+            console.error('[PdfReader] 截图批注写入失败:', e);
+            new Notice('截图批注写入失败');
+            return false;
+        }
+    }
+
     private async handleAnnotation() {
         if (this.savedSelections.length === 0) return;
 
@@ -775,8 +841,12 @@ created: ${date}`;
                 return;
             }
             await this.appendAnnotationsToNote(noteFile, selections, pdfFile);
-            // 批注写入后立即刷新 PDF 持久高亮（不依赖 pdf-plus）
-            this.refreshHighlights?.(pdfFile, selections);
+            // 批注写入后立即刷新 PDF 持久高亮（不依赖 pdf-plus）；
+            // OCR 批注无文本锚点（beginIndex < 0），跳过高亮
+            this.refreshHighlights?.(
+                pdfFile,
+                selections.filter((sel) => sel.beginIndex >= 0)
+            );
         } catch (e) {
             // 写入失败时恢复选区，避免数据丢失
             this.savedSelections = [...selections, ...this.savedSelections];
@@ -819,10 +889,27 @@ created: ${date}`;
         const notePrompt = '> 笔记：';
         // 多段选中合并为一个批注 callout，每段之间空行分隔并带独立页码引用
         const items = selections.map((sel) => {
-            const flatText = sel.text.replace(/\n/g, '');
+            // 拍平为单行：移除换行/回车/不可见控制字符、Unicode 换行符号，
+            // 以及 PDF 私有区字符（U+E000–U+F8FF，pdfjs 对无 ToUnicode 映射的字形
+            // 会回退为 PUA 码点，在编辑器中渲染为 □/⏎ 等占位符，常出现在换行处）
+            const flatText = sel.text.replace(
+                /[\r\n\u000B\u000C\u2028\u2029\u21B5\u23CE\u240D\u2424\u2937\u0000-\u0008\u000E-\u001F\u007F-\u009F\uE000-\uF8FF]/g,
+                ''
+            );
             if (sel.page === null) {
                 // 定位失败：仅写入文字，不生成可能跳转错误的链接
                 return `> ${flatText}`;
+            }
+            if (sel.beginIndex < 0) {
+                // 无文本锚点（如截图 OCR 批注）：仅附页码链接，不生成 selection 参数；
+                // 若带 ocrRect，附加 &ocr=x,y,w,h（归一化矩形）供 pdf-ocr 渲染持久高亮
+                const rectParam = sel.ocrRect
+                    ? `&ocr=${fmtRectNum(sel.ocrRect.x)},${fmtRectNum(sel.ocrRect.y)},`
+                    + `${fmtRectNum(sel.ocrRect.w)},${fmtRectNum(sel.ocrRect.h)}`
+                    : '';
+                const link =
+                    `[[${pdfFile.path}#page=${sel.page}${rectParam}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+                return `> ${flatText}\n> ${link}`;
             }
             const selectionParam =
                 `${sel.beginIndex},${sel.beginOffset},` +
@@ -905,4 +992,9 @@ created: ${date}`;
         });
         return result;
     }
+}
+
+/** 归一化矩形坐标格式化为 4 位小数（去尾零），用于写入批注链接的 &ocr= 参数 */
+function fmtRectNum(n: number): string {
+    return Number(n.toFixed(4)).toString();
 }

@@ -3,6 +3,7 @@ import { DEFAULT_SETTINGS, type PluginSettings, type PluginModule, type ModuleCo
 import { PdfReaderModule } from './modules/PdfReaderModule';
 import { DeepSeekModule } from './modules/DeepSeekModule';
 import { PdfHighlightModule } from './modules/PdfHighlightModule';
+import { ScreenshotModule } from './modules/ScreenshotModule';
 import { UnifiedSettingTab } from './modules/SettingsTab';
 
 /**
@@ -17,6 +18,8 @@ import { UnifiedSettingTab } from './modules/SettingsTab';
 export default class LiteratureReaderPlugin extends Plugin {
     private settings: PluginSettings = DEFAULT_SETTINGS;
     private modules: PluginModule[] = [];
+    /** 公开 PDF 模块实例，供 pdf-ocr 等插件调用批注 API */
+    pdfModule: PdfReaderModule | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -29,10 +32,14 @@ export default class LiteratureReaderPlugin extends Plugin {
 
         // PDF 模块先行创建，以便将其 getCurrentFileForUpload 注入 DeepSeek 模块上下文
         const pdfModule = new PdfReaderModule(ctx);
+        this.pdfModule = pdfModule;
 
         // PDF 高亮模块：批注后即时高亮 + 笔记链接驱动的高亮重建
         const highlightModule = new PdfHighlightModule(ctx);
         pdfModule.setRefreshHighlights((file, selections) => highlightModule.refresh(file, selections));
+
+        // 截图批注模块：框选 PDF 区域 → 截图保存为附件 → 嵌入阅读笔记
+        const screenshotModule = new ScreenshotModule(ctx, pdfModule);
 
         const deepseekCtx: ModuleContext = {
             ...ctx,
@@ -43,6 +50,7 @@ export default class LiteratureReaderPlugin extends Plugin {
         this.modules = [
             pdfModule,
             highlightModule,
+            screenshotModule,
             new DeepSeekModule(deepseekCtx),
         ];
 
