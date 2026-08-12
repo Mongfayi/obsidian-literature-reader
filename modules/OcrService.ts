@@ -64,7 +64,7 @@ export class OcrService {
                     prompt, imageDataUrl, model, timeoutSec, maxTokens, !isPaddleOcr
                 );
             } catch (e2) {
-                throw e;
+                throw new Error(`${(e as Error).message}（重试仍失败: ${(e2 as Error).message}）`);
             }
         }
     }

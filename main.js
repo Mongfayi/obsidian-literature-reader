@@ -27085,8 +27085,7 @@ var DeepSeekFloatingWindow = class {
       attr: {
         src: this.ctx.getSettings().deepseekUrl,
         style: "width: 100%; height: 100%; border: none;",
-        allowpopups: "",
-        nodeintegration: "false"
+        allowpopups: ""
       }
     });
     this.webview = wv;
@@ -27315,7 +27314,17 @@ var PdfHighlightModule = class {
       app.workspace.on("active-leaf-change", () => this.attachToPdfLeaves())
     );
     this.ctx.plugin.registerEvent(
-      app.metadataCache.on("changed", () => this.scheduleRebuild())
+      app.metadataCache.on("changed", (file) => {
+        const links = app.metadataCache.resolvedLinks[file.path];
+        if (!links)
+          return;
+        for (const target of Object.keys(links)) {
+          if (target.endsWith(".pdf")) {
+            this.scheduleRebuild();
+            return;
+          }
+        }
+      })
     );
     this.ctx.plugin.registerEvent(
       app.metadataCache.on("deleted", () => this.scheduleRebuild())
@@ -27951,7 +27960,7 @@ var ScreenshotModule = class {
           return new CropEmbed(ctx, file, pageNumber, rect);
         }
       }
-      return this.originalPdfEmbedCreator(ctx, file, subpath);
+      return this.originalPdfEmbedCreator ? this.originalPdfEmbedCreator(ctx, file, subpath) : null;
     });
   }
   /** 恢复原始 PDF EmbedCreator */
@@ -28167,7 +28176,7 @@ var OcrService = class {
           !isPaddleOcr
         );
       } catch (e2) {
-        throw e;
+        throw new Error(`${e.message}\uFF08\u91CD\u8BD5\u4ECD\u5931\u8D25: ${e2.message}\uFF09`);
       }
     }
   }
@@ -28546,6 +28555,7 @@ var OcrModule = class {
       return false;
     }
     const settings = this.ctx.getSettings();
+    this.service.setBaseUrl(settings.ocrServerUrl);
     let model;
     try {
       model = await this.service.resolveModel(settings.ocrModel);
@@ -28664,7 +28674,17 @@ var OcrHighlightModule = class {
       app.workspace.on("active-leaf-change", () => this.attachToPdfLeaves())
     );
     this.ctx.plugin.registerEvent(
-      app.metadataCache.on("changed", () => this.scheduleRebuild())
+      app.metadataCache.on("changed", (file) => {
+        const links = app.metadataCache.resolvedLinks[file.path];
+        if (!links)
+          return;
+        for (const target of Object.keys(links)) {
+          if (target.endsWith(".pdf")) {
+            this.scheduleRebuild();
+            return;
+          }
+        }
+      })
     );
     this.ctx.plugin.registerEvent(
       app.metadataCache.on("deleted", () => this.scheduleRebuild())

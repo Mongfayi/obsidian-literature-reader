@@ -325,7 +325,9 @@ export class ScreenshotModule implements PluginModule {
                     return new CropEmbed(ctx, file, pageNumber, rect);
                 }
             }
-            return this.originalPdfEmbedCreator(ctx, file, subpath);
+            return this.originalPdfEmbedCreator
+                ? this.originalPdfEmbedCreator(ctx, file, subpath)
+                : null;
         });
     }
 

@@ -104,7 +104,6 @@ class DeepSeekFloatingWindow {
                 src: this.ctx.getSettings().deepseekUrl,
                 style: 'width: 100%; height: 100%; border: none;',
                 allowpopups: '',
-                nodeintegration: 'false',
             },
         });
         this.webview = wv as any;
