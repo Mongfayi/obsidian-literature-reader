@@ -418,6 +418,8 @@ export class OcrModule implements PluginModule {
             return false;
         }
         const settings = this.ctx.getSettings();
+        // 每次请求前同步最新服务器地址，确保设置面板修改后立即生效
+        this.service.setBaseUrl(settings.ocrServerUrl);
 
         let model: string;
         try {

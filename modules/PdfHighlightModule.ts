@@ -42,8 +42,18 @@ export class PdfHighlightModule implements PluginModule {
         );
 
         // 笔记修改（批注写入、删除等）→ 防抖重建索引并刷新
+        // 仅当变更的笔记链接到 PDF 时才触发重建，避免无关笔记编辑导致全量索引扫描
         this.ctx.plugin.registerEvent(
-            app.metadataCache.on('changed', () => this.scheduleRebuild())
+            app.metadataCache.on('changed', (file: TFile) => {
+                const links = app.metadataCache.resolvedLinks[file.path];
+                if (!links) return;
+                for (const target of Object.keys(links)) {
+                    if (target.endsWith('.pdf')) {
+                        this.scheduleRebuild();
+                        return;
+                    }
+                }
+            })
         );
         this.ctx.plugin.registerEvent(
             app.metadataCache.on('deleted', () => this.scheduleRebuild())
