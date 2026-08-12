@@ -31,6 +31,8 @@ export class PdfReaderModule implements PluginModule {
     private currentPdfPath: string | null = null;
     /** 批注写入后回调（由主入口注入 PdfHighlightModule.refresh，用于即时渲染持久高亮） */
     private refreshHighlights: ((file: TFile, selections?: SavedSelectionInfo[]) => void) | null = null;
+    /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
+    private redirectResolver: (() => Promise<TFile | null>) | null = null;
 
     constructor(ctx: ModuleContext) {
         this.ctx = ctx;
@@ -39,6 +41,11 @@ export class PdfReaderModule implements PluginModule {
     /** 注入批注后的高亮刷新回调 */
     setRefreshHighlights(cb: (file: TFile, selections?: SavedSelectionInfo[]) => void): void {
         this.refreshHighlights = cb;
+    }
+
+    /** 注入批注目标笔记重定向解析器（主文献开启时批注写入主文献笔记而非源 PDF 对应笔记） */
+    setRedirectResolver(cb: () => Promise<TFile | null>): void {
+        this.redirectResolver = cb;
     }
 
     load(): void {
@@ -770,7 +777,7 @@ created: ${date}`;
         page: number | null,
         ocrRect?: { x: number; y: number; w: number; h: number }
     ): Promise<boolean> {
-        const noteFile = await this.ensureNoteOpen(pdfFile);
+        const noteFile = await this.resolveTargetNote(pdfFile);
         if (!noteFile) return false;
         const selections: SavedSelectionInfo[] = [{
             text,
@@ -799,7 +806,7 @@ created: ${date}`;
      * @returns 是否成功写入
      */
     async annotateScreenshot(pdfFile: TFile, page: number, rect: number[]): Promise<boolean> {
-        const noteFile = await this.ensureNoteOpen(pdfFile);
+        const noteFile = await this.resolveTargetNote(pdfFile);
         if (!noteFile) return false;
         try {
             const rectStr = rect.join(',');
@@ -835,7 +842,7 @@ created: ${date}`;
         this.savedSelections = [];
 
         try {
-            const noteFile = await this.ensureNoteOpen(pdfFile);
+            const noteFile = await this.resolveTargetNote(pdfFile);
             if (!noteFile) {
                 this.savedSelections = selections;
                 return;
@@ -857,7 +864,27 @@ created: ${date}`;
     private async ensureNoteOpen(pdfFile: TFile): Promise<TFile | null> {
         const noteFile = await this.createReadingNote(pdfFile);
         if (!noteFile) return null;
+        await this.focusOrOpenNote(noteFile);
+        return noteFile;
+    }
 
+    /**
+     * 解析批注目标笔记：
+     *  - 主文献开启时（redirectResolver 命中）→ 返回主文献笔记，聚焦其叶子
+     *  - 否则回退默认：按源 PDF 创建/打开其对应阅读笔记
+     * 批注 callout 内的原文链接仍由调用方用源 pdfFile 构造，跳转指向源 PDF。
+     */
+    private async resolveTargetNote(pdfFile: TFile): Promise<TFile | null> {
+        const redirect = this.redirectResolver ? await this.redirectResolver() : null;
+        if (redirect) {
+            await this.focusOrOpenNote(redirect);
+            return redirect;
+        }
+        return await this.ensureNoteOpen(pdfFile);
+    }
+
+    /** 聚焦已打开的笔记叶子；未打开则在当前活动叶右侧分屏打开 */
+    private async focusOrOpenNote(noteFile: TFile): Promise<void> {
         let existingLeaf: WorkspaceLeaf | null = null;
         this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
             if (leaf.view instanceof FileView && leaf.view.file && leaf.view.file.path === noteFile.path) {
@@ -868,17 +895,15 @@ created: ${date}`;
         if (existingLeaf) {
             this.ctx.plugin.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
         } else {
-            const pdfLeaf = this.ctx.plugin.app.workspace.activeLeaf;
-            if (pdfLeaf) {
+            const activeLeaf = this.ctx.plugin.app.workspace.activeLeaf;
+            if (activeLeaf) {
                 const rightLeaf = this.ctx.plugin.app.workspace.createLeafBySplit(
-                    pdfLeaf, 'vertical', false
+                    activeLeaf, 'vertical', false
                 );
                 await rightLeaf.openFile(noteFile);
                 this.ctx.plugin.app.workspace.setActiveLeaf(rightLeaf, { focus: true });
             }
         }
-
-        return noteFile;
     }
 
     private async appendAnnotationsToNote(
