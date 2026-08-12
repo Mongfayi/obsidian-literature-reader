@@ -54,4 +54,4 @@ npm run build   # 产出 main.js，并自动复制 cmaps/
 
 如果这个插件对你有帮助，欢迎请我喝杯咖啡 ☕
 
-![赞赏码](docs/sponsor.jpg)
+<img src="docs/sponsor.jpg" alt="赞赏码" width="295" />
