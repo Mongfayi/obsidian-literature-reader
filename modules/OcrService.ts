@@ -58,7 +58,9 @@ export class OcrService {
                 prompt, imageDataUrl, model, timeoutSec, maxTokens, isPaddleOcr
             );
         } catch (e) {
-            // 首次失败（模板/顺序问题）时换内容顺序重试一次
+            // 仅对 4xx 客户端错误重试一次（多为模型对内容顺序/格式的拒绝，交换
+            // image/text 顺序通常可解决）；超时/5xx/网络错误不重试，避免双倍等待
+            if (!isRetryableHttpError(e)) throw e;
             try {
                 return await this.requestChatWithImageUrl(
                     prompt, imageDataUrl, model, timeoutSec, maxTokens, !isPaddleOcr
@@ -104,10 +106,14 @@ export class OcrService {
         };
     }
 
+    /** 超时后仍在运行的底层请求（requestUrl 不支持中止，仅跟踪以防 unhandled rejection） */
+    private zombieRequest: Promise<unknown> | null = null;
+
     /** 基于 requestUrl 的请求；超过 timeoutMs 抛超时错误 */
     private async request(params: RequestUrlParam, timeoutMs: number) {
+        let timer: number | null = null;
         const timeoutPromise = new Promise<never>((_, reject) => {
-            window.setTimeout(() => {
+            timer = window.setTimeout(() => {
                 reject(new Error(`请求超时（${Math.round(timeoutMs / 1000)}s）`));
             }, timeoutMs);
         });
@@ -124,8 +130,43 @@ export class OcrService {
             return res;
         })();
 
-        return await Promise.race([requestPromise, timeoutPromise]);
+        try {
+            return await Promise.race([requestPromise, timeoutPromise]);
+        } catch (e) {
+            // 超时后底层 requestUrl 仍在运行（requestUrl 不支持 AbortController）。
+            // 跟踪该僵尸请求并附加 no-op catch，防止 settle 时产生 unhandled rejection；
+            // 用户重试时若僵尸仍在进行，记录警告以便排查
+            if (e instanceof Error && e.message.startsWith('请求超时')) {
+                this.trackZombie(requestPromise);
+            }
+            throw e;
+        } finally {
+            // 请求已结束（无论成败），清理超时定时器，避免句柄与闭包滞留到超时时刻
+            if (timer !== null) window.clearTimeout(timer);
+        }
     }
+
+    /** 跟踪超时后仍在进行的底层请求，附加 catch 防止 unhandled rejection */
+    private trackZombie(promise: Promise<unknown>): void {
+        if (this.zombieRequest && this.zombieRequest !== promise) {
+            console.warn('[OcrService] 检测到累积的僵尸请求（前一次超时请求仍在进行）');
+            // 旧僵尸附加 no-op catch，确保不会 unhandled
+            this.zombieRequest.catch(() => {});
+        }
+        this.zombieRequest = promise;
+        promise.finally(() => {
+            if (this.zombieRequest === promise) {
+                this.zombieRequest = null;
+            }
+        });
+        promise.catch(() => {});
+    }
+}
+
+/** 是否属于可重试的 HTTP 4xx 客户端错误（模板/内容顺序类问题，换顺序后重试可能成功） */
+function isRetryableHttpError(err: unknown): boolean {
+    const msg = (err as Error).message ?? '';
+    return msg.startsWith('HTTP 4');
 }
 
 /** 清洗 OCR 文本：去掉 HTML 标签、markdown 装饰、幻觉噪音，保留真实文字内容 */

@@ -149,13 +149,15 @@ class DeepSeekFloatingWindow {
 
     show() {
         if (!this.container) return;
+        // 先恢复显示，否则 display:none 下 getBoundingClientRect 恒为 0，
+        // 会误判为「已拖出视口」而清空上次拖拽位置（导致隐藏后再显示位置丢失）
+        this.container.style.display = 'flex';
         // 若面板已被完全拖出 Obsidian 可视区域，复位到默认位置，避免无法找回
         const rect = this.container.getBoundingClientRect();
         if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) {
             this.container.style.left = '';
             this.container.style.top = '';
         }
-        this.container.style.display = 'flex';
         this.isVisible = true;
     }
 
@@ -327,15 +329,21 @@ class DeepSeekFloatingWindow {
 }
 
 /**
- * ArrayBuffer 转 base64 字符串（分块处理避免栈溢出）
+ * ArrayBuffer 转 base64 字符串（分块处理避免栈溢出与内存峰值）
+ * 逐块 32KB 生成二进制串并立即 btoa 输出，避免整文件二进制字符串与
+ * base64 结果同时驻留内存（100MB 文件可省约一倍峰值）。
  */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     const bytes = new Uint8Array(buffer);
-    let binary = '';
     const chunkSize = 0x8000; // 32KB
+    let out = '';
     for (let i = 0; i < bytes.length; i += chunkSize) {
-        const end = Math.min(i + chunkSize, bytes.length);
-        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, end)));
+        const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+        let binary = '';
+        for (let j = 0; j < sub.length; j++) {
+            binary += String.fromCharCode(sub[j]);
+        }
+        out += btoa(binary);
     }
-    return btoa(binary);
+    return out;
 }

@@ -12,6 +12,8 @@ import { OcrService } from './OcrService';
 export class UnifiedSettingTab extends PluginSettingTab {
     private getSettings: () => PluginSettings;
     private saveSettings: () => Promise<void>;
+    /** 防抖保存定时器（连续输入时避免每字符一次全量写盘） */
+    private saveTimer: number | null = null;
 
     constructor(
         app: App,
@@ -22,6 +24,30 @@ export class UnifiedSettingTab extends PluginSettingTab {
         super(app, plugin);
         this.getSettings = getSettings;
         this.saveSettings = saveSettings;
+    }
+
+    /** 500ms 防抖后保存设置 */
+    private scheduleSave(): void {
+        if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+        this.saveTimer = window.setTimeout(async () => {
+            this.saveTimer = null;
+            try {
+                await this.saveSettings();
+            } catch (e) {
+                console.error('[pdf-reader] 保存设置失败:', e);
+            }
+        }, 500);
+    }
+
+    onClose(): void {
+        if (this.saveTimer !== null) {
+            window.clearTimeout(this.saveTimer);
+            this.saveTimer = null;
+            // 关闭面板时冲刷未落盘的防抖保存，避免最后 500ms 内的修改静默丢失
+            void this.saveSettings().catch((e) => {
+                console.error('[pdf-reader] 关闭设置页时保存失败:', e);
+            });
+        }
     }
 
     display(): void {
@@ -39,7 +65,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 .setValue(this.getSettings().readingNoteFolder)
                 .onChange(async (value) => {
                     this.getSettings().readingNoteFolder = value.trim() || DEFAULT_SETTINGS.readingNoteFolder;
-                    await this.saveSettings();
+                    this.scheduleSave();
                 }));
 
         // ===== DeepSeek 设置 =====
@@ -54,7 +80,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 .setValue(this.getSettings().deepseekUrl)
                 .onChange(async (value) => {
                     this.getSettings().deepseekUrl = value || DEFAULT_SETTINGS.deepseekUrl;
-                    await this.saveSettings();
+                    this.scheduleSave();
                 }));
 
         // ===== 截图 OCR 批注设置 =====
@@ -69,7 +95,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 .setValue(this.getSettings().ocrServerUrl)
                 .onChange(async (value) => {
                     this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
-                    await this.saveSettings();
+                    this.scheduleSave();
                 }));
 
         new Setting(containerEl)
@@ -80,7 +106,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 .setValue(this.getSettings().ocrModel)
                 .onChange(async (value) => {
                     this.getSettings().ocrModel = value.trim();
-                    await this.saveSettings();
+                    this.scheduleSave();
                 }));
 
         new Setting(containerEl)
@@ -93,7 +119,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                     const n = parseInt(value, 10);
                     if (!Number.isNaN(n) && n >= 10) {
                         this.getSettings().ocrRequestTimeoutSec = n;
-                        await this.saveSettings();
+                        this.scheduleSave();
                     }
                 }));
 
@@ -107,7 +133,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                     const n = parseInt(value, 10);
                     if (!Number.isNaN(n) && n >= 512) {
                         this.getSettings().ocrMaxTokens = n;
-                        await this.saveSettings();
+                        this.scheduleSave();
                     }
                 }));
 
@@ -119,7 +145,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 .setValue(this.getSettings().ocrPrompt)
                 .onChange(async (value) => {
                     this.getSettings().ocrPrompt = value || DEFAULT_SETTINGS.ocrPrompt;
-                    await this.saveSettings();
+                    this.scheduleSave();
                 }));
 
         new Setting(containerEl)

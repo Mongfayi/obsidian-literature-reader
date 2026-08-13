@@ -1,5 +1,6 @@
-import { TFile, WorkspaceLeaf, FileView, MarkdownView } from 'obsidian';
-import type { ModuleContext, PluginModule } from '../types';
+import { TFile } from 'obsidian';
+import type { ModuleContext } from '../types';
+import { BasePdfHighlightModule } from './HighlightBase';
 
 /**
  * 截图 OCR 区域持久高亮模块
@@ -40,62 +41,13 @@ type PageHighlights = Map<string, IndexedHighlight>;
 /** pdfPath → page → highlights */
 type PdfOcrIndex = Map<number, PageHighlights>;
 
-export class OcrHighlightModule implements PluginModule {
-    private ctx: ModuleContext;
-    /** pdfPath → 高亮索引 */
-    private indexCache = new Map<string, PdfOcrIndex>();
-    /** 已挂载事件监听的叶子 */
-    private attachedLeaves = new Set<WorkspaceLeaf>();
-    /** 重建索引的防抖定时器 */
-    private rebuildTimer: number | null = null;
-
+export class OcrHighlightModule extends BasePdfHighlightModule<PdfOcrIndex> {
     constructor(ctx: ModuleContext) {
-        this.ctx = ctx;
+        super(ctx);
     }
 
-    load(): void {
-        const app = this.ctx.plugin.app;
-
-        this.ctx.plugin.registerEvent(
-            app.workspace.on('layout-change', () => this.attachToPdfLeaves())
-        );
-        this.ctx.plugin.registerEvent(
-            app.workspace.on('active-leaf-change', () => this.attachToPdfLeaves())
-        );
-
-        // 笔记增删改 → 防抖重建索引并刷新（删除批注后高亮随即消失）
-        // 仅当变更的笔记链接到 PDF 时才触发重建，避免无关笔记编辑导致全量索引扫描
-        this.ctx.plugin.registerEvent(
-            app.metadataCache.on('changed', (file: TFile) => {
-                const links = app.metadataCache.resolvedLinks[file.path];
-                if (!links) return;
-                for (const target of Object.keys(links)) {
-                    if (target.endsWith('.pdf')) {
-                        this.scheduleRebuild();
-                        return;
-                    }
-                }
-            })
-        );
-        this.ctx.plugin.registerEvent(
-            app.metadataCache.on('deleted', () => this.scheduleRebuild())
-        );
-        this.ctx.plugin.registerEvent(
-            app.vault.on('rename', () => this.scheduleRebuild())
-        );
-
-        this.attachToPdfLeaves();
-        // 已打开视图的页面可能已渲染完毕（pagerendered 不再触发），主动重建并渲染
-        this.scheduleRebuild();
-    }
-
-    unload(): void {
-        this.attachedLeaves.clear();
-        this.indexCache.clear();
-        if (this.rebuildTimer !== null) {
-            window.clearTimeout(this.rebuildTimer);
-            this.rebuildTimer = null;
-        }
+    protected get renderEventName(): string {
+        return 'pagerendered';
     }
 
     /**
@@ -108,7 +60,7 @@ export class OcrHighlightModule implements PluginModule {
         const pdfPath = pdfFile.path;
         this.rebuildIndex(pdfPath).then(() => {
             if (explicit && explicit.length > 0) {
-                const index = this.getOrCreateIndex(pdfPath);
+                const index = this.getOrCreateIndex(pdfPath, () => new Map<number, PageHighlights>());
                 for (const e of explicit) {
                     const pageMap = index.get(e.page) ?? new Map<string, IndexedHighlight>();
                     pageMap.set(rectKey(e.rect), {
@@ -121,32 +73,12 @@ export class OcrHighlightModule implements PluginModule {
         });
     }
 
-    /** 全部（已打开视图的 PDF）重建并重渲染 */
-    private scheduleRebuild(): void {
-        if (this.rebuildTimer !== null) window.clearTimeout(this.rebuildTimer);
-        this.rebuildTimer = window.setTimeout(() => {
-            this.rebuildTimer = null;
-            this.rebuildAllIndexes().then(() => this.renderAllOpenPdfs());
-        }, 300);
-    }
-
-    // ========== 索引构建 ==========
-
-    private getOrCreateIndex(pdfPath: string): PdfOcrIndex {
-        let index = this.indexCache.get(pdfPath);
-        if (!index) {
-            index = new Map<number, PageHighlights>();
-            this.indexCache.set(pdfPath, index);
-        }
-        return index;
-    }
-
     /**
      * 重建单个 PDF 的索引。
      * 与 PdfHighlightModule 同：metadataCache 不记录指向 PDF 的正文链接，
      * 因此通过 resolvedLinks 反查链接到该 PDF 的笔记，再读取笔记原文提取 ocr 链接。
      */
-    private async rebuildIndex(pdfPath: string): Promise<void> {
+    protected async rebuildIndex(pdfPath: string): Promise<void> {
         const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
         if (!(pdfFile instanceof TFile)) return;
 
@@ -167,21 +99,6 @@ export class OcrHighlightModule implements PluginModule {
         }
 
         this.indexCache.set(pdfPath, newIndex);
-    }
-
-    /** 读取笔记内容：优先打开中的编辑器缓冲，其次磁盘 */
-    private async readNoteContent(sourceFile: TFile): Promise<string> {
-        const app = this.ctx.plugin.app;
-        let editorContent: string | null = null;
-        app.workspace.getLeavesOfType('markdown').forEach((leaf) => {
-            if (editorContent !== null) return;
-            const view = leaf.view as MarkdownView;
-            if (view.file?.path === sourceFile.path && view.editor) {
-                editorContent = view.editor.getValue();
-            }
-        });
-        if (editorContent !== null) return editorContent;
-        return await app.vault.read(sourceFile);
     }
 
     /** 从笔记原文中提取指向指定 PDF 的 ocr 链接并写入索引 */
@@ -211,78 +128,8 @@ export class OcrHighlightModule implements PluginModule {
         }
     }
 
-    /** 重建所有「当前有视图打开」的 PDF 索引 */
-    private async rebuildAllIndexes(): Promise<void> {
-        const openPdfPaths = this.getOpenPdfPaths();
-        for (const path of openPdfPaths) {
-            await this.rebuildIndex(path);
-        }
-        for (const path of [...this.indexCache.keys()]) {
-            if (!openPdfPaths.has(path) && !this.ctx.plugin.app.vault.getAbstractFileByPath(path)) {
-                this.indexCache.delete(path);
-            }
-        }
-    }
-
-    // ========== 视图挂载与渲染 ==========
-
-    private getOpenPdfPaths(): Set<string> {
-        const paths = new Set<string>();
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() === 'pdf') {
-                const file = (leaf.view as FileView).file;
-                if (file) paths.add(file.path);
-            }
-        });
-        return paths;
-    }
-
-    private attachToPdfLeaves(): void {
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() !== 'pdf') return;
-            if (this.attachedLeaves.has(leaf)) return;
-
-            const viewer = (leaf.view as any).viewer;
-            const eventBus = viewer?.child?.pdfViewer?.eventBus;
-            if (!eventBus) return;
-
-            this.attachedLeaves.add(leaf);
-            // pagerendered：页面（重新）渲染后放置高亮；覆盖首次渲染、翻页、缩放
-            const onPageRendered = (data: any) => {
-                const pdfFile = (leaf.view as FileView).file;
-                if (!pdfFile) return;
-                this.renderPageHighlights(pdfFile.path, data?.source);
-            };
-            eventBus.on('pagerendered', onPageRendered);
-            this.ctx.plugin.register(() => {
-                eventBus.off('pagerendered', onPageRendered);
-                this.attachedLeaves.delete(leaf);
-            });
-        });
-    }
-
-    private renderForPdf(pdfPath: string): void {
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() !== 'pdf') return;
-            const pdfFile = (leaf.view as FileView).file;
-            if (!pdfFile || pdfFile.path !== pdfPath) return;
-            const viewer = (leaf.view as any).viewer;
-            const pdfViewer = viewer?.child?.pdfViewer?.pdfViewer;
-            if (!pdfViewer) return;
-            for (const pageView of pdfViewer._pages ?? []) {
-                if (pageView?.div) this.renderPageHighlights(pdfPath, pageView);
-            }
-        });
-    }
-
-    private renderAllOpenPdfs(): void {
-        for (const path of this.getOpenPdfPaths()) {
-            this.renderForPdf(path);
-        }
-    }
-
     /** 渲染单页的高亮层（pagerendered 时调用，缩放/翻页会重发事件 → 自动重建） */
-    private renderPageHighlights(pdfPath: string, pageView: any): void {
+    protected renderPageHighlights(pdfPath: string, pageView: any): void {
         if (!pageView?.div) return;
         const pageDiv = pageView.div as HTMLElement;
         const pageNumber = parseInt(pageDiv.dataset.pageNumber ?? '0', 10) || 0;

@@ -5,10 +5,11 @@ import type { ModuleContext, PluginModule, SavedSelectionInfo, FileUploadData } 
 declare const WORKER_CODE: string;
 declare function require(name: string): any;
 
-// worker 仅需初始化一次，模块加载时执行
-pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(
+// worker 仅需初始化一次，模块加载时执行；卸载时 revoke，避免插件重载累积 blob URL
+const WORKER_BLOB_URL = URL.createObjectURL(
     new Blob([WORKER_CODE], { type: 'application/javascript' })
 );
+pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER_BLOB_URL;
 
 /** 相邻文本项 Y 坐标差超过该阈值视为换行 */
 const LINE_BREAK_THRESHOLD = 5;
@@ -84,6 +85,8 @@ export class PdfReaderModule implements PluginModule {
     }
 
     unload(): void {
+        // 释放 worker 代码的 blob URL（已创建的 worker 不受影响，仅阻止新建）
+        URL.revokeObjectURL(WORKER_BLOB_URL);
         this.removeFloatingButton();
         this.savedSelections = [];
         this.currentPdfPath = null;
@@ -188,11 +191,27 @@ export class PdfReaderModule implements PluginModule {
         const folderPath = this.ctx.getSettings().readingNoteFolder;
 
         const folder = this.ctx.plugin.app.vault.getAbstractFileByPath(folderPath);
+        // 目标路径被同名「文件」占用：无法创建文件夹，明确失败并提示
+        if (folder instanceof TFile) {
+            new Notice(`阅读笔记文件夹被同名文件占用：${folderPath}`);
+            return null;
+        }
         if (!folder) {
-            await this.ctx.plugin.app.vault.createFolder(folderPath);
+            try {
+                await this.ctx.plugin.app.vault.createFolder(folderPath);
+            } catch (e) {
+                console.error('[PdfReader] 创建阅读笔记文件夹失败:', e);
+                new Notice('创建阅读笔记文件夹失败，请检查设置');
+                return null;
+            }
         }
 
         const notePath = await this.resolveNotePath(pdfFile, folderPath);
+        // 全部候选路径均被其他同名 PDF 的笔记占用：终止并提示，避免批注写入错误笔记
+        if (!notePath) {
+            new Notice(`无法创建阅读笔记：${pdfFile.basename} 存在过多同名笔记冲突`);
+            return null;
+        }
         const noteFile = this.ctx.plugin.app.vault.getAbstractFileByPath(notePath);
         if (noteFile instanceof TFile) return noteFile;
         // 防御：目标路径被同名文件夹占用
@@ -207,8 +226,9 @@ export class PdfReaderModule implements PluginModule {
      *  - 优先 `{PDF文件名} 阅读.md`，不存在则返回
      *  - 已存在且属于同一 PDF（frontmatter pdf 字段一致或缺失）时复用
      *  - 属于其他 PDF（同名 PDF 冲突）时，按 `{文件名} 阅读 (n).md` 递增去重
+     *  - 所有候选都被其他 PDF 占用时返回 null（调用方应终止并提示，避免写错笔记）
      */
-    private async resolveNotePath(pdfFile: TFile, folderPath: string): Promise<string> {
+    private async resolveNotePath(pdfFile: TFile, folderPath: string): Promise<string | null> {
         const baseName = pdfFile.basename;
         const basePath = normalizePath(`${folderPath}/${baseName} 阅读.md`);
 
@@ -230,7 +250,7 @@ export class PdfReaderModule implements PluginModule {
                 return candidate;
             }
         }
-        return basePath;
+        return null;
     }
 
     /** 判断笔记是否属于指定 PDF（读取 frontmatter 的 pdf 字段） */
@@ -458,19 +478,23 @@ created: ${date}`;
                 for (const marker of stopMarkers) {
                     let idx = content.indexOf(marker);
                     if (idx < 0) {
+                        // 标记被 PDF 提取的空白打断时（如「中图 分类号」「Key words」），
+                        // 在紧凑文本中定位后映射回原始文本（含空白）的位置：
+                        // 跳过所有空白字符（与 \s+ 保持一致），第 idx 个非空白字符的位置即标记起点
                         idx = compactedContent.indexOf(marker);
                         if (idx >= 0) {
-                            // 将紧凑文本中的下标映射回原始文本（含空白）的位置
-                            let accumulated = 0;
+                            let nonWs = 0;
+                            let mapped = false;
                             for (let c = 0; c < content.length; c++) {
-                                if (content[c] !== ' ' && content[c] !== '\t' && content[c] !== '\n') {
-                                    if (accumulated >= idx) {
-                                        idx = c;
-                                        break;
-                                    }
-                                    accumulated++;
+                                if (/\s/.test(content[c])) continue;
+                                if (nonWs === idx) {
+                                    idx = c;
+                                    mapped = true;
+                                    break;
                                 }
+                                nonWs++;
                             }
+                            if (!mapped) idx = -1;
                         }
                     }
                     if (idx >= 0) {
