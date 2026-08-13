@@ -12,6 +12,8 @@ export interface PluginSettings {
     deepseekUrl: string;
     /** LM Studio 服务器地址（OpenAI 兼容接口） */
     ocrServerUrl: string;
+    /** LM Studio API Key（开启 Require Authentication 时必填） */
+    ocrApiKey: string;
     /** OCR 模型名（空 = 自动选择服务器列表内模型） */
     ocrModel: string;
     /** 单次 OCR 请求超时（秒） */
@@ -26,6 +28,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     readingNoteFolder: 'ReadingNotes',
     deepseekUrl: 'https://chat.deepseek.com',
     ocrServerUrl: 'http://127.0.0.1:1234',
+    ocrApiKey: '',
     ocrModel: 'paddleocr-vl-1.6',
     ocrRequestTimeoutSec: 120,
     ocrMaxTokens: 8192,

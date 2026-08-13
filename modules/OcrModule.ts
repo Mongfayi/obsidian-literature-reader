@@ -41,8 +41,8 @@ export class OcrModule extends BaseCropModeModule {
     constructor(ctx: ModuleContext, pdfModule: PdfReaderModule) {
         super(ctx);
         this.pdfModule = pdfModule;
-        // 从设置初始化服务器地址，避免与 DEFAULT_SETTINGS 字面量重复
-        this.service = new OcrService(this.ctx.getSettings().ocrServerUrl);
+        // 从设置初始化服务器地址和 API Key
+        this.service = new OcrService(this.ctx.getSettings().ocrServerUrl, this.ctx.getSettings().ocrApiKey);
     }
 
     setHighlightRefresh(cb: (file: TFile, entries: OcrHighlightEntry[]) => void): void {
@@ -154,8 +154,9 @@ export class OcrModule extends BaseCropModeModule {
             return false;
         }
         const settings = this.ctx.getSettings();
-        // 每次请求前同步最新服务器地址，确保设置面板修改后立即生效
+        // 每次请求前同步最新服务器地址和 API Key，确保设置面板修改后立即生效
         this.service.setBaseUrl(settings.ocrServerUrl);
+        this.service.setApiKey(settings.ocrApiKey);
 
         let model: string;
         try {

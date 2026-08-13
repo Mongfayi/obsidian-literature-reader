@@ -686,7 +686,13 @@ created: ${date}`;
 
             const startPageDiv = this.findPageDiv(range.startContainer);
             const endPageDiv = this.findPageDiv(range.endContainer);
+            // 无法定位所在页：无任何可生成链接的信息，返回 null
             if (!startPageDiv || !endPageDiv) return null;
+
+            // 跨页选区：pdfjs 的 data-idx 为每页局部编号，无法用单个 page=N&selection= 链接
+            // 表达；若强行用起始页基准计算 endIndex 会得到无意义值，导致高亮错位或缺失。
+            // 回退为纯文本批注（page=null，不附链接、不高亮），与上方注释承诺一致
+            if (startPageDiv !== endPageDiv) return null;
 
             const pageNumber = parseInt(startPageDiv.dataset.pageNumber || '1');
 
@@ -694,20 +700,26 @@ created: ${date}`;
             const endTextLayer = endPageDiv === startPageDiv
                 ? startTextLayer
                 : endPageDiv.querySelector('.textLayer');
-            if (!startTextLayer || !endTextLayer) return null;
 
-            const textSpans = startTextLayer.querySelectorAll('span[data-idx]');
-            if (textSpans.length === 0) return null;
+            const textSpans = startTextLayer?.querySelectorAll('span[data-idx]') ?? [];
+            const startSpan = startTextLayer
+                ? this.findParentTextSpan(range.startContainer, startTextLayer)
+                : null;
+            const endSpan = endTextLayer
+                ? this.findParentTextSpan(range.endContainer, endTextLayer)
+                : null;
+
+            // 文本层缺失/无 data-idx span/选区不在 data-idx span 内
+            // （常见于标题、图表标注等 pdfjs 不分配 data-idx 的文本）：
+            // 已拿到页码，回退为仅页码链接（beginIndex=-1 标记无文本锚点），
+            // 避免完全丢失引用链接
+            if (textSpans.length === 0 || !startSpan || !endSpan) {
+                return { page: pageNumber, beginIndex: -1, beginOffset: 0, endIndex: -1, endOffset: 0 };
+            }
 
             const textDivFirstIdx = parseInt(
                 textSpans[0].getAttribute('data-idx') || '0'
             );
-
-            const startSpan = this.findParentTextSpan(range.startContainer, startTextLayer);
-            if (!startSpan) return null;
-
-            const endSpan = this.findParentTextSpan(range.endContainer, endTextLayer);
-            if (!endSpan) return null;
 
             const beginIndex =
                 parseInt(startSpan.getAttribute('data-idx') || '0') - textDivFirstIdx;

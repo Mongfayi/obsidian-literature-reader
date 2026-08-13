@@ -65,6 +65,7 @@ var DEFAULT_SETTINGS = {
   readingNoteFolder: "ReadingNotes",
   deepseekUrl: "https://chat.deepseek.com",
   ocrServerUrl: "http://127.0.0.1:1234",
+  ocrApiKey: "",
   ocrModel: "paddleocr-vl-1.6",
   ocrRequestTimeoutSec: 120,
   ocrMaxTokens: 8192,
@@ -26734,23 +26735,20 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       const endPageDiv = this.findPageDiv(range.endContainer);
       if (!startPageDiv || !endPageDiv)
         return null;
+      if (startPageDiv !== endPageDiv)
+        return null;
       const pageNumber = parseInt(startPageDiv.dataset.pageNumber || "1");
       const startTextLayer = startPageDiv.querySelector(".textLayer");
       const endTextLayer = endPageDiv === startPageDiv ? startTextLayer : endPageDiv.querySelector(".textLayer");
-      if (!startTextLayer || !endTextLayer)
-        return null;
-      const textSpans = startTextLayer.querySelectorAll("span[data-idx]");
-      if (textSpans.length === 0)
-        return null;
+      const textSpans = startTextLayer?.querySelectorAll("span[data-idx]") ?? [];
+      const startSpan = startTextLayer ? this.findParentTextSpan(range.startContainer, startTextLayer) : null;
+      const endSpan = endTextLayer ? this.findParentTextSpan(range.endContainer, endTextLayer) : null;
+      if (textSpans.length === 0 || !startSpan || !endSpan) {
+        return { page: pageNumber, beginIndex: -1, beginOffset: 0, endIndex: -1, endOffset: 0 };
+      }
       const textDivFirstIdx = parseInt(
         textSpans[0].getAttribute("data-idx") || "0"
       );
-      const startSpan = this.findParentTextSpan(range.startContainer, startTextLayer);
-      if (!startSpan)
-        return null;
-      const endSpan = this.findParentTextSpan(range.endContainer, endTextLayer);
-      if (!endSpan)
-        return null;
       const beginIndex = parseInt(startSpan.getAttribute("data-idx") || "0") - textDivFirstIdx;
       const endIndex = parseInt(endSpan.getAttribute("data-idx") || "0") - textDivFirstIdx;
       const beginOffset = this.computeOffsetInSpan(
@@ -28359,13 +28357,17 @@ var import_obsidian7 = require("obsidian");
 // modules/OcrService.ts
 var import_obsidian6 = require("obsidian");
 var OcrService = class {
-  constructor(baseUrl) {
-    this.baseUrl = baseUrl;
+  constructor(baseUrl, apiKey) {
     /** 超时后仍在运行的底层请求（requestUrl 不支持中止，仅跟踪以防 unhandled rejection） */
     this.zombieRequest = null;
+    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.apiKey = apiKey ?? "";
   }
   setBaseUrl(url) {
     this.baseUrl = url.replace(/\/+$/, "");
+  }
+  setApiKey(key) {
+    this.apiKey = key;
   }
   /** 拉取服务器可用模型列表 */
   async listModels() {
@@ -28461,10 +28463,15 @@ var OcrService = class {
         reject(new Error(`\u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)}s\uFF09`));
       }, timeoutMs);
     });
+    const headers = { ...params.headers ?? {} };
+    if (this.apiKey) {
+      headers["Authorization"] = `Bearer ${this.apiKey}`;
+    }
     const requestPromise = (async () => {
       const res = await (0, import_obsidian6.requestUrl)({
         throw: false,
-        ...params
+        ...params,
+        headers
       });
       if (res.status < 200 || res.status >= 300) {
         const errText = typeof res.text === "string" ? res.text.slice(0, 300) : "";
@@ -28542,7 +28549,7 @@ var OcrModule = class extends BaseCropModeModule {
     /** 高亮模块刷新回调（批注成功后触发即时高亮），由 main.ts 注入 */
     this.refreshHighlights = null;
     this.pdfModule = pdfModule;
-    this.service = new OcrService(this.ctx.getSettings().ocrServerUrl);
+    this.service = new OcrService(this.ctx.getSettings().ocrServerUrl, this.ctx.getSettings().ocrApiKey);
   }
   setHighlightRefresh(cb) {
     this.refreshHighlights = cb;
@@ -28619,6 +28626,7 @@ var OcrModule = class extends BaseCropModeModule {
     }
     const settings = this.ctx.getSettings();
     this.service.setBaseUrl(settings.ocrServerUrl);
+    this.service.setApiKey(settings.ocrApiKey);
     let model;
     try {
       model = await this.service.resolveModel(settings.ocrModel);
@@ -29007,6 +29015,13 @@ var UnifiedSettingTab = class extends import_obsidian10.PluginSettingTab {
       this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
       this.scheduleSave();
     }));
+    new import_obsidian10.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("sk-lm-...").setValue(this.getSettings().ocrApiKey).onChange(async (value) => {
+        this.getSettings().ocrApiKey = value.trim();
+        this.scheduleSave();
+      });
+    });
     new import_obsidian10.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u7559\u7A7A = \u81EA\u52A8\u9009\u62E9\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u9009\u62E9").setValue(this.getSettings().ocrModel).onChange(async (value) => {
       this.getSettings().ocrModel = value.trim();
       this.scheduleSave();
@@ -29030,7 +29045,7 @@ var UnifiedSettingTab = class extends import_obsidian10.PluginSettingTab {
       this.scheduleSave();
     }));
     new import_obsidian10.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
-      const service = new OcrService(this.getSettings().ocrServerUrl);
+      const service = new OcrService(this.getSettings().ocrServerUrl, this.getSettings().ocrApiKey);
       btn.setButtonText("\u6D4B\u8BD5\u4E2D\u2026").setDisabled(true);
       try {
         const models = await service.listModels();

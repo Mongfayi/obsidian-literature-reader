@@ -9,10 +9,20 @@ import { requestUrl, RequestUrlParam } from 'obsidian';
  */
 
 export class OcrService {
-    constructor(private baseUrl: string) { }
+    private baseUrl: string;
+    private apiKey: string;
+
+    constructor(baseUrl: string, apiKey?: string) {
+        this.baseUrl = baseUrl.replace(/\/+$/, '');
+        this.apiKey = apiKey ?? '';
+    }
 
     setBaseUrl(url: string): void {
         this.baseUrl = url.replace(/\/+$/, '');
+    }
+
+    setApiKey(key: string): void {
+        this.apiKey = key;
     }
 
     /** 拉取服务器可用模型列表 */
@@ -118,10 +128,17 @@ export class OcrService {
             }, timeoutMs);
         });
 
+        // 如果配了 API Key，自动注入 Authorization 头（LM Studio 开启 Require Authentication 时必需）
+        const headers: Record<string, string> = { ...(params.headers as Record<string, string> ?? {}) };
+        if (this.apiKey) {
+            headers['Authorization'] = `Bearer ${this.apiKey}`;
+        }
+
         const requestPromise = (async () => {
             const res = await requestUrl({
                 throw: false,
                 ...params,
+                headers,
             });
             if (res.status < 200 || res.status >= 300) {
                 const errText = typeof res.text === 'string' ? res.text.slice(0, 300) : '';
