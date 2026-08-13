@@ -848,7 +848,7 @@ created: ${date}`;
             const rectStr = rect.join(',');
             const embedLink = `![[${pdfFile.path}#page=${page}&rect=${rectStr}]]`;
             const pageLink = `[[${pdfFile.path}#page=${page}|${pdfFile.basename}, 页面 ${page}]]`;
-            const block = `> [!note] 批注\n> ${embedLink}\n> ${pageLink}\n> 笔记：`;
+            const block = `> [!pdf-annotation]\n> ${embedLink}\n> ${pageLink}\n> 笔记：`;
             const annotation = '\n' + block + '\n';
             const cursorPos = this.getNoteCursorEditorPos(noteFile);
             if (cursorPos) {
@@ -982,7 +982,7 @@ created: ${date}`;
         if (selections.some((sel) => sel.page === null)) {
             console.warn('[PdfReader] 部分选区定位失败，批注未附原文链接');
         }
-        const block = `> [!note] 批注\n${items.join('\n> \n')}\n${notePrompt}`;
+        const block = `> [!pdf-annotation]\n${items.join('\n> \n')}\n${notePrompt}`;
         const annotation = '\n' + block + '\n';
 
         // 优先经编辑器缓冲插入（缓冲与光标偏移同源，无保存竞态）；

@@ -242,3 +242,27 @@
   border-radius: 2px;
   pointer-events: none;
 }
+
+
+/* ---------- 批注 callout：无标题栏，框紧密包裹内容 ---------- */
+
+.callout[data-callout="pdf-annotation"] {
+  --callout-color: 68, 138, 255;
+  background-color: rgba(var(--callout-color), 0.1);
+}
+
+.callout[data-callout="pdf-annotation"] .callout-title {
+  display: none;
+}
+
+.callout[data-callout="pdf-annotation"] .callout-content {
+  padding: 0 0;
+}
+
+/* 清掉内容首尾元素的 margin，让上下边框紧贴文字（中间段落间距保留） */
+.callout[data-callout="pdf-annotation"] .callout-content > :first-child {
+  margin-top: 0;
+}
+.callout[data-callout="pdf-annotation"] .callout-content > :last-child {
+  margin-bottom: 0;
+}
