@@ -26859,7 +26859,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       const rectStr = rect.join(",");
       const embedLink = `![[${pdfFile.path}#page=${page}&rect=${rectStr}]]`;
       const pageLink = `[[${pdfFile.path}#page=${page}|${pdfFile.basename}, \u9875\u9762 ${page}]]`;
-      const block = `> [!note] \u6279\u6CE8
+      const block = `> [!pdf-annotation]
 > ${embedLink}
 > ${pageLink}
 > \u7B14\u8BB0\uFF1A`;
@@ -26973,7 +26973,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     if (selections.some((sel) => sel.page === null)) {
       console.warn("[PdfReader] \u90E8\u5206\u9009\u533A\u5B9A\u4F4D\u5931\u8D25\uFF0C\u6279\u6CE8\u672A\u9644\u539F\u6587\u94FE\u63A5");
     }
-    const block = `> [!note] \u6279\u6CE8
+    const block = `> [!pdf-annotation]
 ${items.join("\n> \n")}
 ${notePrompt}`;
     const annotation = "\n" + block + "\n";
