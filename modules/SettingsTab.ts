@@ -99,6 +99,19 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
+            .setName('LM Studio API Key')
+            .setDesc('LM Studio 开启 Require Authentication 时必填，与 kdata 的 token 相同')
+            .addText((text) => {
+                text.inputEl.type = 'password';
+                text.setPlaceholder('sk-lm-...')
+                    .setValue(this.getSettings().ocrApiKey)
+                    .onChange(async (value) => {
+                        this.getSettings().ocrApiKey = value.trim();
+                        this.scheduleSave();
+                    });
+            });
+
+        new Setting(containerEl)
             .setName('OCR 模型')
             .setDesc('留空 = 自动选择服务器上的视觉模型')
             .addText((text) => text
@@ -154,7 +167,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
             .addButton((btn) => btn
                 .setButtonText('测试连接')
                 .onClick(async () => {
-                    const service = new OcrService(this.getSettings().ocrServerUrl);
+                    const service = new OcrService(this.getSettings().ocrServerUrl, this.getSettings().ocrApiKey);
                     btn.setButtonText('测试中…').setDisabled(true);
                     try {
                         const models = await service.listModels();
