@@ -1,6 +1,7 @@
 import { TFile, WorkspaceLeaf, FileView, setIcon, setTooltip } from 'obsidian';
 import type { ModuleContext, PluginModule } from '../types';
 import type { PdfReaderModule } from './PdfReaderModule';
+import { toolbarPoller, pruneStaleLeaves } from './toolbarPoller';
 
 /**
  * 主文献批注汇集模块
@@ -22,8 +23,8 @@ export class MainArticleModule implements PluginModule {
     private mainArticlePdfPath: string | null = null;
     /** 已注入按钮的叶子 → 按钮元素 */
     private toolbarButtons = new Map<WorkspaceLeaf, HTMLElement>();
-    /** 工具条注入轮询定时器 */
-    private injectionTimer: number | null = null;
+    /** 轮询任务移除函数（卸载时注销共享轮询） */
+    private removePollTask: (() => void) | null = null;
 
     constructor(ctx: ModuleContext, pdfModule: PdfReaderModule) {
         this.ctx = ctx;
@@ -49,8 +50,14 @@ export class MainArticleModule implements PluginModule {
             })
         );
 
-        // PDF 视图可能被重建，事件驱动注入不可靠，用轻量定时轮询兜底（幂等）
-        this.injectionTimer = window.setInterval(() => this.injectToolbarButtons(), 2000);
+        // PDF 视图可能被重建，事件驱动注入不可靠，用轻量定时轮询兜底（幂等）；
+        // 与截图/OCR 模块共享同一轮询器；同时刷新激活态（工具条重建后按钮的
+        // is-active 不依赖事件触发恢复）
+        this.removePollTask = toolbarPoller.add(() => {
+            this.injectToolbarButtons();
+            this.refreshAllButtonStates();
+        });
+        toolbarPoller.start();
 
         plugin.addCommand({
             id: 'toggle-main-article',
@@ -66,13 +73,19 @@ export class MainArticleModule implements PluginModule {
         });
 
         this.injectToolbarButtons();
+
+        // 卸载时统一移除所有已注入按钮（单次注册，避免每次注入都累积一个清理闭包）
+        plugin.register(() => {
+            for (const btn of this.toolbarButtons.values()) {
+                btn.remove();
+            }
+            this.toolbarButtons.clear();
+        });
     }
 
     unload(): void {
-        if (this.injectionTimer !== null) {
-            window.clearInterval(this.injectionTimer);
-            this.injectionTimer = null;
-        }
+        this.removePollTask?.();
+        this.removePollTask = null;
         this.toolbarButtons.clear();
         this.mainArticlePdfPath = null;
     }
@@ -103,6 +116,9 @@ export class MainArticleModule implements PluginModule {
     // ========== 工具条按钮 ==========
 
     private injectToolbarButtons(): void {
+        // 清理已关闭叶子的陈旧按钮缓存
+        pruneStaleLeaves(this.ctx.plugin.app, this.toolbarButtons);
+
         this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
             if (leaf.view.getViewType() !== 'pdf') return;
 
@@ -115,6 +131,13 @@ export class MainArticleModule implements PluginModule {
 
             // 以「当前工具条上是否已有按钮」为准，避免重建后重复注入
             if (pageNumberEl.parentElement.querySelector('.pdfreader-main-article-button')) return;
+
+            // 工具条重建后旧按钮已脱离 DOM：清掉缓存引用，避免闭包与脏引用累积
+            const stale = this.toolbarButtons.get(leaf);
+            if (stale && !stale.isConnected) {
+                stale.remove();
+                this.toolbarButtons.delete(leaf);
+            }
 
             const btn = document.createElement('div');
             btn.addClass('clickable-icon');
@@ -130,10 +153,6 @@ export class MainArticleModule implements PluginModule {
 
             this.toolbarButtons.set(leaf, btn);
             this.applyButtonState(leaf, btn);
-            this.ctx.plugin.register(() => {
-                btn.remove();
-                this.toolbarButtons.delete(leaf);
-            });
         });
     }
 

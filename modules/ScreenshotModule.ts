@@ -1,6 +1,7 @@
-import { TFile, Notice, WorkspaceLeaf, FileView, setIcon, setTooltip, Component } from 'obsidian';
-import type { ModuleContext, PluginModule } from '../types';
+import { TFile, Notice, WorkspaceLeaf, FileView, Component } from 'obsidian';
+import type { ModuleContext } from '../types';
 import type { PdfReaderModule } from './PdfReaderModule';
+import { BaseCropModeModule } from './BaseCropModeModule';
 
 /**
  * 截图批注模块
@@ -10,338 +11,63 @@ import type { PdfReaderModule } from './PdfReaderModule';
  *      → 在阅读笔记中插入嵌入链接 ![[file.pdf#page=N&rect=...]]（不产生图片文件）
  *      → 自定义 EmbedCreator 用 pdfjs 实时渲染裁剪区域
  *
- * 框选交互与 pdf-ocr 的 OCR 批注一致（不遮挡视图、框挂页面内随滚动移动）。
- * 通过 window.__pdfCropExit 与 pdf-ocr 互斥，避免两种截图模式同时激活导致一次拖拽触发两次。
+ * 框选交互继承 BaseCropModeModule（与 OCR 批注共享），本类只负责：
+ *  - 注册/恢复自定义 PDF EmbedCreator（rect 参数渲染裁剪区域）
+ *  - 框选完成后：屏幕坐标 → PDF 坐标 → 写入批注
  *
  * 注：PDF 裁剪嵌入的思路（EmbedCreator + pdfjs 渲染 rect 区域）受 pdf-plus 插件启发，
  */
 
-/** 最小框选尺寸（CSS px），过小视为误触 */
-const MIN_CROP_SIZE = 8;
-
-/** 跨插件截图模式互斥：当前激活者的退出函数 */
-interface PdfCropGlobal {
-    __pdfCropExit?: (() => void) | null;
-}
-
-export class ScreenshotModule implements PluginModule {
-    private ctx: ModuleContext;
+export class ScreenshotModule extends BaseCropModeModule {
     private pdfModule: PdfReaderModule;
 
-    /** 已注入工具条按钮的叶子 */
-    private toolbarLeaves = new Set<WorkspaceLeaf>();
-    /** 各叶子「截图批注」工具条按钮（激活态高亮用） */
-    private cropButtons = new Map<WorkspaceLeaf, HTMLElement>();
-    /** 工具条注入轮询定时器 */
-    private injectionTimer: number | null = null;
-    /** 截图模式激活的视图容器（非 null = 截图模式中） */
-    private cropRoot: HTMLElement | null = null;
-    /** 截图模式对应的叶子 */
-    private cropLeaf: WorkspaceLeaf | null = null;
-    /** 截图模式监听器（供取消时移除） */
-    private cropPointerDown: ((e: PointerEvent) => void) | null = null;
-    private cropKeyDown: ((e: KeyboardEvent) => void) | null = null;
-    /** 当前拖拽状态（非 null = 正在框选） */
-    private dragState: {
-        pageEl: HTMLElement;
-        boxEl: HTMLElement;
-        downPX: number;
-        downPY: number;
-        move: (e: PointerEvent) => void;
-        up: (e: PointerEvent) => void;
-    } | null = null;
     /** 原始 PDF EmbedCreator（注册自定义裁剪嵌入前保存，卸载时恢复） */
     private originalPdfEmbedCreator: any = null;
+    /** 本插件注册的包装创建器（用于卸载时校验注册表归属，避免覆盖其他插件） */
+    private wrappedPdfEmbedCreator: any = null;
+
+    protected readonly buttonClass = 'pdfreader-screenshot-button';
+    protected readonly selectingClass = 'pdf-screenshot-selecting';
+    protected readonly boxClass = 'pdf-screenshot-box';
+    protected readonly buttonIcon = 'image-plus';
+    protected readonly buttonTooltip = '截图批注到笔记';
+    protected readonly commandId = 'screenshot-annotate';
+    protected readonly commandName = '截图批注到笔记';
 
     constructor(ctx: ModuleContext, pdfModule: PdfReaderModule) {
-        this.ctx = ctx;
+        super(ctx);
         this.pdfModule = pdfModule;
     }
 
     load(): void {
-        const plugin = this.ctx.plugin;
-
-        plugin.registerEvent(
-            plugin.app.workspace.on('layout-change', () => this.injectToolbarButtons())
-        );
-        plugin.registerEvent(
-            plugin.app.workspace.on('active-leaf-change', () => this.injectToolbarButtons())
-        );
-
-        // PDF 视图可能被重建，事件驱动注入不可靠，用轻量定时轮询兜底（幂等）
-        this.injectionTimer = window.setInterval(() => this.injectToolbarButtons(), 2000);
-
-        plugin.addCommand({
-            id: 'screenshot-annotate',
-            name: '截图批注到笔记',
-            checkCallback: (checking) => {
-                const leaf = plugin.app.workspace.getLeavesOfType('pdf')[0];
-                if (!leaf) return false;
-                if (!checking) this.startCropMode(leaf);
-                return true;
-            },
-        });
-
-        this.injectToolbarButtons();
+        super.load();
         this.registerCropEmbedCreator();
     }
 
     unload(): void {
-        if (this.injectionTimer !== null) {
-            window.clearInterval(this.injectionTimer);
-            this.injectionTimer = null;
-        }
-        this.cancelCropMode();
+        super.unload();
         this.restoreCropEmbedCreator();
-        this.toolbarLeaves.clear();
-        this.cropButtons.clear();
+        pdfDocCache.clear();
     }
 
-    // ========== 工具条按钮 ==========
+    // ========== 框选完成 → 截图批注 ==========
 
-    private injectToolbarButtons(): void {
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() !== 'pdf') return;
-
-            const viewer = (leaf.view as any).viewer;
-            const toolbar = viewer?.child?.toolbar;
-            if (!toolbar) return; // 轮询会重试
-
-            // 页码显示元素：其右侧即为目标位置
-            const pageNumberEl = toolbar.pageNumberEl as HTMLElement | undefined;
-            if (!pageNumberEl || !pageNumberEl.parentElement) return;
-
-            // 以「当前工具条上是否已有按钮」为准，避免重建后重复注入
-            if (pageNumberEl.parentElement.querySelector('.pdfreader-screenshot-button')) return;
-
-            const btn = document.createElement('div');
-            btn.addClass('clickable-icon');
-            btn.addClass('pdfreader-screenshot-button');
-            setIcon(btn, 'image-plus');
-            setTooltip(btn, '截图批注到笔记');
-            btn.addEventListener('click', (evt: MouseEvent) => {
-                evt.stopPropagation();
-                this.startCropMode(leaf);
-            });
-
-            // 插到页码显示之后（与 OCR 批注按钮并排）
-            pageNumberEl.after(btn);
-
-            this.toolbarLeaves.add(leaf);
-            this.cropButtons.set(leaf, btn);
-            // 工具条可能被 Obsidian 重建：若该叶子正处于截图模式，恢复激活态
-            if (this.cropLeaf === leaf && this.cropRoot) {
-                btn.addClass('is-active');
-            }
-            this.ctx.plugin.register(() => {
-                btn.remove();
-                this.toolbarLeaves.delete(leaf);
-                this.cropButtons.delete(leaf);
-            });
-        });
-    }
-
-    // ========== 截图模式 ==========
-
-    /** 进入/退出截图模式：不遮挡视图，在页面上拖拽框选，可随时滚动页面 */
-    private startCropMode(leaf: WorkspaceLeaf): void {
-        // 已处于截图模式：同一视图 → 取消；另一视图 → 切换过去
-        if (this.cropRoot) {
-            if (this.cropLeaf === leaf) {
-                this.cancelCropMode();
-                return;
-            }
-            this.cancelCropMode();
-        }
-
-        // 跨插件互斥：退出其它插件（如 pdf-ocr）可能正在进行的截图模式
-        const g = window as unknown as PdfCropGlobal;
-        if (typeof g.__pdfCropExit === 'function') {
-            g.__pdfCropExit();
-            g.__pdfCropExit = null;
-        }
-
-        const root = (leaf.view as any).containerEl as HTMLElement;
-        if (!root) return;
-        const win = root.ownerDocument.defaultView;
-        if (!win) return;
-
-        root.addClass('pdf-screenshot-selecting');
-        this.cropButtons.get(leaf)?.addClass('is-active');
-        this.cropRoot = root;
-        this.cropLeaf = leaf;
-        // 注册本模式的退出函数，供其它截图模式进入时调用
-        g.__pdfCropExit = () => this.cancelCropMode();
-
-        // capture 阶段在 window 层监听，避免被 PDF 视图内部事件处理器拦截
-        const onPointerDown = (e: PointerEvent) => {
-            if (e.button !== 0) return;
-            if (this.dragState) return;
-            const target = e.target as HTMLElement;
-            const pageEl = target.closest?.('[data-page-number]') as HTMLElement | null;
-            if (!pageEl || !pageEl.isConnected) return;
-            e.preventDefault();
-            this.startDrag(win, e, pageEl);
-        };
-
-        const onKeyDown = (evt: KeyboardEvent) => {
-            if (evt.key === 'Escape') {
-                evt.preventDefault();
-                this.cancelCropMode();
-            }
-        };
-
-        this.cropPointerDown = onPointerDown;
-        this.cropKeyDown = onKeyDown;
-        win.addEventListener('pointerdown', onPointerDown, true);
-        win.addEventListener('keydown', onKeyDown, true);
-    }
-
-    /** 开始一次框选拖拽：框挂页面内，坐标全程锚定页面（页面滚动不漂移） */
-    private startDrag(win: Window, e: PointerEvent, pageEl: HTMLElement): void {
-        this.cancelDrag();
-
-        // 框选 div 是页面 div 的绝对定位子元素，left/top 相对「内边距框」，
-        // 而 clientX 减 getBoundingClientRect().left 得到的是「边框外缘」相对坐标。
-        // 页面 div 带边框时两者差一个边框宽度，会导致框整体偏到光标右下角，
-        // 因此统一换算到内边距框坐标系（原点 = 边框外缘 + clientLeft/Top）。
-        const pr0 = pageEl.getBoundingClientRect();
-        const ox0 = pr0.left + pageEl.clientLeft;
-        const oy0 = pr0.top + pageEl.clientTop;
-        const pw0 = pageEl.clientWidth;
-        const ph0 = pageEl.clientHeight;
-        const downPX = clampCoord(e.clientX - ox0, pw0);
-        const downPY = clampCoord(e.clientY - oy0, ph0);
-        const pointerId = e.pointerId;
-
-        const boxEl = pageEl.createDiv('pdf-screenshot-box');
-        Object.assign(boxEl.style, {
-            left: `${downPX}px`,
-            top: `${downPY}px`,
-            width: '0px',
-            height: '0px',
-        });
-
-        const move = (evt: PointerEvent) => {
-            if (evt.pointerId !== pointerId) return;
-            evt.preventDefault();
-            const pr = pageEl.getBoundingClientRect();
-            const ox = pr.left + pageEl.clientLeft;
-            const oy = pr.top + pageEl.clientTop;
-            const px = clampCoord(evt.clientX - ox, pageEl.clientWidth);
-            const py = clampCoord(evt.clientY - oy, pageEl.clientHeight);
-            Object.assign(boxEl.style, {
-                left: `${Math.min(downPX, px)}px`,
-                top: `${Math.min(downPY, py)}px`,
-                width: `${Math.abs(px - downPX)}px`,
-                height: `${Math.abs(py - downPY)}px`,
-            });
-        };
-
-        const up = (evt: PointerEvent) => {
-            if (evt.pointerId !== pointerId) return;
-            win.removeEventListener('pointermove', move, true);
-            win.removeEventListener('pointerup', up, true);
-            if (this.dragState) this.dragState = null;
-
-            const box = boxEl.getBoundingClientRect();
-            boxEl.remove();
-            const width = box.width;
-            const height = box.height;
-            if (width < MIN_CROP_SIZE || height < MIN_CROP_SIZE) {
-                new Notice('框选区域过小，已取消');
-                return;
-            }
-            const pr = pageEl.getBoundingClientRect();
-            const pageRect = {
-                x: box.left - pr.left,
-                y: box.top - pr.top,
-                width,
-                height,
-            };
-            const leaf = this.cropLeaf;
-            this.cancelCropMode();
-            void this.captureScreenshot(leaf, pageEl, pageRect);
-        };
-
-        this.dragState = { pageEl, boxEl, downPX, downPY, move, up };
-        win.addEventListener('pointermove', move, true);
-        win.addEventListener('pointerup', up, true);
-    }
-
-    /** 取消当前拖拽（保留截图模式） */
-    private cancelDrag(): void {
-        if (!this.dragState) return;
-        const { boxEl, move, up } = this.dragState;
-        this.dragState = null;
-        boxEl.remove();
-        const win = boxEl.ownerDocument.defaultView;
-        win?.removeEventListener('pointermove', move, true);
-        win?.removeEventListener('pointerup', up, true);
-    }
-
-    private cancelCropMode(): void {
-        this.cancelDrag();
-        if (this.cropRoot) {
-            const win = this.cropRoot.ownerDocument.defaultView;
-            this.cropRoot.removeClass('pdf-screenshot-selecting');
-            if (this.cropPointerDown) {
-                win?.removeEventListener('pointerdown', this.cropPointerDown, true);
-                this.cropPointerDown = null;
-            }
-            if (this.cropKeyDown) {
-                win?.removeEventListener('keydown', this.cropKeyDown, true);
-                this.cropKeyDown = null;
-            }
-            this.cropRoot = null;
-        }
-        if (this.cropLeaf) {
-            this.cropButtons.get(this.cropLeaf)?.removeClass('is-active');
-        }
-        this.cropLeaf = null;
-        // 清除跨插件互斥注册（仅当仍指向本模式时）
-        const g = window as unknown as PdfCropGlobal;
-        if (g.__pdfCropExit) {
-            g.__pdfCropExit = null;
+    protected async onCropComplete(
+        leaf: WorkspaceLeaf | null,
+        pageDiv: HTMLElement,
+        pageRect: { x: number; y: number; width: number; height: number }
+    ): Promise<void> {
+        // 外层兜底：基类 void 调用本方法，任何未捕获异常都会成为
+        // unhandled rejection 且用户无感知，统一转为 Notice
+        try {
+            await this.doCaptureScreenshot(leaf, pageDiv, pageRect);
+        } catch (e) {
+            console.error('[Screenshot] 截图批注失败:', e);
+            new Notice(`截图批注失败: ${(e as Error).message}`);
         }
     }
 
-    // ========== 图像截取 + 批注 ==========
-
-    /**
-     * 注册自定义 PDF EmbedCreator：当嵌入链接含 rect 参数时，用 pdfjs 实时渲染裁剪区域，
-     * 不产生图片文件。无 rect 参数时回退到原始创建器。
-     */
-    private registerCropEmbedCreator(): void {
-        const app = this.ctx.plugin.app as any;
-        this.originalPdfEmbedCreator = app.embedRegistry.embedByExtension['pdf'];
-        app.embedRegistry.unregisterExtension('pdf');
-        app.embedRegistry.registerExtension('pdf', (ctx: any, file: TFile, subpath: string) => {
-            const params = new URLSearchParams(subpath.startsWith('#') ? subpath.slice(1) : subpath);
-            if (params.has('rect') && params.has('page')) {
-                const pageNumber = parseInt(params.get('page')!);
-                const rect = params.get('rect')!.split(',').map((n) => parseFloat(n));
-                if (Number.isInteger(pageNumber) && rect.length === 4 && rect.every((n) => !isNaN(n))) {
-                    return new CropEmbed(ctx, file, pageNumber, rect);
-                }
-            }
-            return this.originalPdfEmbedCreator
-                ? this.originalPdfEmbedCreator(ctx, file, subpath)
-                : null;
-        });
-    }
-
-    /** 恢复原始 PDF EmbedCreator */
-    private restoreCropEmbedCreator(): void {
-        const app = this.ctx.plugin.app as any;
-        if (this.originalPdfEmbedCreator) {
-            app.embedRegistry.unregisterExtension('pdf');
-            app.embedRegistry.registerExtension('pdf', this.originalPdfEmbedCreator);
-            this.originalPdfEmbedCreator = null;
-        }
-    }
-
-    private async captureScreenshot(
+    private async doCaptureScreenshot(
         leaf: WorkspaceLeaf | null,
         pageDiv: HTMLElement,
         pageRect: { x: number; y: number; width: number; height: number }
@@ -360,7 +86,14 @@ export class ScreenshotModule implements PluginModule {
         }
 
         // 屏幕坐标 → PDF 空间坐标（供嵌入链接 &rect= 参数使用）
-        const rect = this.screenToPdfRect(leaf, pageDiv, pageRect);
+        // 依赖 Obsidian 内部结构（viewer.child.getPage、window.pdfjsLib），
+        // 结构变动/缺失时可能抛错，单独捕获并提示，不产生未处理 rejection
+        let rect: number[] | null = null;
+        try {
+            rect = this.screenToPdfRect(leaf, pageDiv, pageRect);
+        } catch (e) {
+            console.warn('[Screenshot] 坐标转换失败:', e);
+        }
         if (!rect) {
             new Notice('坐标转换失败，无法生成截图嵌入');
             return;
@@ -413,6 +146,59 @@ export class ScreenshotModule implements PluginModule {
         ]);
         return rect.map((n: number) => Math.round(n));
     }
+
+    // ========== 自定义 PDF 嵌入创建器（rect 参数渲染裁剪区域） ==========
+
+    /**
+     * 注册自定义 PDF EmbedCreator：当嵌入链接含 rect 参数时，用 pdfjs 实时渲染裁剪区域，
+     * 不产生图片文件。无 rect 参数时回退到原始创建器。
+     */
+    private registerCropEmbedCreator(): void {
+        const app = this.ctx.plugin.app as any;
+        // embedRegistry 为未公开内部 API：缺失/结构变化时降级跳过裁剪嵌入注册，
+        // 不影响其余功能（框选照常写入链接，仅嵌入渲染不可用）
+        try {
+            this.originalPdfEmbedCreator = app.embedRegistry?.embedByExtension?.['pdf'];
+        } catch (e) {
+            console.warn('[Screenshot] embedRegistry 不可用，跳过裁剪嵌入注册:', e);
+            return;
+        }
+        if (!this.originalPdfEmbedCreator) {
+            console.warn('[Screenshot] 未找到内置 PDF 嵌入创建器，跳过裁剪嵌入注册');
+            return;
+        }
+        this.wrappedPdfEmbedCreator = (ctx: any, file: TFile, subpath: string) => {
+            const params = new URLSearchParams(subpath.startsWith('#') ? subpath.slice(1) : subpath);
+            if (params.has('rect') && params.has('page')) {
+                const pageNumber = parseInt(params.get('page')!);
+                const rect = params.get('rect')!.split(',').map((n) => parseFloat(n));
+                if (Number.isInteger(pageNumber) && rect.length === 4 && rect.every((n) => !isNaN(n))) {
+                    return new CropEmbed(ctx, file, pageNumber, rect);
+                }
+            }
+            return this.originalPdfEmbedCreator
+                ? this.originalPdfEmbedCreator(ctx, file, subpath)
+                : null;
+        };
+        app.embedRegistry.unregisterExtension('pdf');
+        app.embedRegistry.registerExtension('pdf', this.wrappedPdfEmbedCreator);
+    }
+
+    /** 恢复原始 PDF EmbedCreator；仅当注册表中仍为本插件包装器时恢复，避免覆盖其他插件 */
+    private restoreCropEmbedCreator(): void {
+        const app = this.ctx.plugin.app as any;
+        if (!this.originalPdfEmbedCreator) return;
+        // 其他插件可能在之后注册了自己的 pdf 嵌入创建器，此时放弃恢复，保留对方的注册
+        if (app.embedRegistry.embedByExtension['pdf'] !== this.wrappedPdfEmbedCreator) {
+            this.originalPdfEmbedCreator = null;
+            this.wrappedPdfEmbedCreator = null;
+            return;
+        }
+        app.embedRegistry.unregisterExtension('pdf');
+        app.embedRegistry.registerExtension('pdf', this.originalPdfEmbedCreator);
+        this.originalPdfEmbedCreator = null;
+        this.wrappedPdfEmbedCreator = null;
+    }
 }
 
 /**
@@ -462,21 +248,12 @@ class CropEmbed extends Component {
 
     /** 加载 PDF → 渲染整页 → 裁剪目标区域 → 返回 PNG dataURL */
     private async renderCropRegion(): Promise<string> {
-        const buffer = await this.app.vault.readBinary(this.file);
+        // 复用文档缓存，避免同一 PDF 被多个裁剪嵌入重复加载
+        const doc = await pdfDocCache.get(this.file, this.app);
         const pdfjs = (window as any).pdfjsLib;
-        const task = pdfjs.getDocument({
-            data: buffer,
-            cMapPacked: true,
-            cMapUrl: '/lib/pdfjs/cmaps/',
-        });
-        const doc = await task.promise;
-        try {
-            const page = await doc.getPage(this.pageNumber);
-            const fullCanvas = await this.renderFullPage(page, pdfjs);
-            return this.cropToRect(fullCanvas, page, pdfjs);
-        } finally {
-            await doc.destroy();
-        }
+        const page = await doc.getPage(this.pageNumber);
+        const fullCanvas = await this.renderFullPage(page, pdfjs);
+        return this.cropToRect(fullCanvas, page, pdfjs);
     }
 
     /** 以 2x 缩放渲染整页到离屏 canvas */
@@ -515,8 +292,77 @@ class CropEmbed extends Component {
     }
 }
 
-/** 把坐标夹取到 [0, size] 区间（页面内坐标不越界） */
-function clampCoord(value: number, size: number): number {
-    if (size <= 0) return 0;
-    return Math.min(Math.max(value, 0), size);
+/**
+ * PDF 文档缓存（LRU + TTL 淘汰）
+ *
+ * 同一 PDF 的多个裁剪嵌入共享一个 PDFDocumentProxy，避免重复 readBinary + getDocument。
+ * 每次访问重置 TTL 计时器；TTL 到期后自动 destroy 并移除缓存。
+ * 并发请求同一文件时共享同一个加载 Promise，避免重复加载。
+ */
+class PdfDocCache {
+    /** 缓存条目：pdfPath → { doc, evictTimer } */
+    private cache = new Map<string, { doc: any; evictTimer: number }>();
+    /** 加载中的 Promise（防止并发重复加载同一文件） */
+    private pending = new Map<string, Promise<any>>();
+    /** 空闲后存活时长（ms），到期销毁释放内存 */
+    private readonly ttlMs: number;
+
+    constructor(ttlMs = 60000) {
+        this.ttlMs = ttlMs;
+    }
+
+    /** 获取或加载 PDF 文档代理；并发请求共享同一加载 Promise */
+    async get(file: TFile, app: import('obsidian').App): Promise<any> {
+        const path = file.path;
+        const cached = this.cache.get(path);
+        if (cached) {
+            // 命中：重置淘汰计时器
+            window.clearTimeout(cached.evictTimer);
+            cached.evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);
+            return cached.doc;
+        }
+
+        // 加载中：等待同一文件的在途 Promise
+        const loading = this.pending.get(path);
+        if (loading) return loading;
+
+        const promise = (async () => {
+            const buffer = await app.vault.readBinary(file);
+            const pdfjs = (window as any).pdfjsLib;
+            const task = pdfjs.getDocument({
+                data: buffer,
+                cMapPacked: true,
+                cMapUrl: '/lib/pdfjs/cmaps/',
+            });
+            const doc = await task.promise;
+            const evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);
+            this.cache.set(path, { doc, evictTimer });
+            this.pending.delete(path);
+            return doc;
+        })();
+
+        this.pending.set(path, promise);
+        return promise;
+    }
+
+    /** 淘汰并销毁指定 PDF 的缓存文档 */
+    private evict(path: string): void {
+        const entry = this.cache.get(path);
+        if (!entry) return;
+        this.cache.delete(path);
+        entry.doc.destroy().catch(() => {});
+    }
+
+    /** 清空全部缓存（插件卸载时调用） */
+    clear(): void {
+        for (const { doc, evictTimer } of this.cache.values()) {
+            window.clearTimeout(evictTimer);
+            doc.destroy().catch(() => {});
+        }
+        this.cache.clear();
+        this.pending.clear();
+    }
 }
+
+/** 插件级 PDF 文档缓存单例 */
+const pdfDocCache = new PdfDocCache();

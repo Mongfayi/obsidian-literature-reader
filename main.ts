@@ -70,7 +70,13 @@ export default class LiteratureReaderPlugin extends Plugin {
         ];
 
         for (const mod of this.modules) {
-            mod.load();
+            // 单个模块加载失败不拖垮其余模块（如依赖未公开 API 在个别版本缺失时），
+            // 失败由模块内或此处兜底，保证后续模块与设置面板仍可用
+            try {
+                mod.load();
+            } catch (e) {
+                console.error('[LiteratureReader] 模块加载失败:', e);
+            }
         }
 
         // 统一设置面板

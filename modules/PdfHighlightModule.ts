@@ -1,5 +1,6 @@
-import { TFile, WorkspaceLeaf, FileView, MarkdownView } from 'obsidian';
-import type { ModuleContext, PluginModule, SavedSelectionInfo } from '../types';
+import { TFile } from 'obsidian';
+import type { ModuleContext, SavedSelectionInfo } from '../types';
+import { BasePdfHighlightModule } from './HighlightBase';
 
 /**
  * PDF 文本持久高亮模块
@@ -16,65 +17,13 @@ type SelectionId = string;
 /** 每个 PDF 的索引：页码 → 去重后的选区集合 */
 type PdfHighlightIndex = Map<number, Set<SelectionId>>;
 
-export class PdfHighlightModule implements PluginModule {
-    private ctx: ModuleContext;
-
-    /** pdfPath → 高亮索引 */
-    private indexCache = new Map<string, PdfHighlightIndex>();
-    /** 已挂载事件监听的叶子（避免重复挂载） */
-    private attachedLeaves = new Set<WorkspaceLeaf>();
-    /** 重建索引的防抖定时器 */
-    private rebuildTimer: number | null = null;
-
+export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex> {
     constructor(ctx: ModuleContext) {
-        this.ctx = ctx;
+        super(ctx);
     }
 
-    load(): void {
-        const app = this.ctx.plugin.app;
-
-        // 叶子布局变化（PDF 视图打开/关闭/分屏）时挂载监听
-        this.ctx.plugin.registerEvent(
-            app.workspace.on('layout-change', () => this.attachToPdfLeaves())
-        );
-        this.ctx.plugin.registerEvent(
-            app.workspace.on('active-leaf-change', () => this.attachToPdfLeaves())
-        );
-
-        // 笔记修改（批注写入、删除等）→ 防抖重建索引并刷新
-        // 仅当变更的笔记链接到 PDF 时才触发重建，避免无关笔记编辑导致全量索引扫描
-        this.ctx.plugin.registerEvent(
-            app.metadataCache.on('changed', (file: TFile) => {
-                const links = app.metadataCache.resolvedLinks[file.path];
-                if (!links) return;
-                for (const target of Object.keys(links)) {
-                    if (target.endsWith('.pdf')) {
-                        this.scheduleRebuild();
-                        return;
-                    }
-                }
-            })
-        );
-        this.ctx.plugin.registerEvent(
-            app.metadataCache.on('deleted', () => this.scheduleRebuild())
-        );
-        this.ctx.plugin.registerEvent(
-            app.vault.on('rename', () => this.scheduleRebuild())
-        );
-
-        // 插件加载时对已打开的 PDF 视图立即挂载
-        this.attachToPdfLeaves();
-        // 已打开视图的页面可能已渲染完毕（textlayerrendered 不再触发），主动重建索引并渲染
-        this.scheduleRebuild();
-    }
-
-    unload(): void {
-        this.attachedLeaves.clear();
-        this.indexCache.clear();
-        if (this.rebuildTimer !== null) {
-            window.clearTimeout(this.rebuildTimer);
-            this.rebuildTimer = null;
-        }
+    protected get renderEventName(): string {
+        return 'textlayerrendered';
     }
 
     /**
@@ -87,7 +36,7 @@ export class PdfHighlightModule implements PluginModule {
         const pdfPath = pdfFile.path;
         this.rebuildIndex(pdfPath).then(() => {
             if (explicitSelections && explicitSelections.length > 0) {
-                const index = this.getOrCreateIndex(pdfPath);
+                const index = this.getOrCreateIndex(pdfPath, () => new Map<number, Set<SelectionId>>());
                 for (const sel of explicitSelections) {
                     if (sel.page === null) continue;
                     const selections = index.get(sel.page) ?? new Set<string>();
@@ -99,32 +48,12 @@ export class PdfHighlightModule implements PluginModule {
         });
     }
 
-    /** 全部（已打开视图的 PDF）重建并重渲染 */
-    private scheduleRebuild(): void {
-        if (this.rebuildTimer !== null) window.clearTimeout(this.rebuildTimer);
-        this.rebuildTimer = window.setTimeout(() => {
-            this.rebuildTimer = null;
-            this.rebuildAllIndexes().then(() => this.renderAllOpenPdfs());
-        }, 300);
-    }
-
-    // ========== 索引构建 ==========
-
-    private getOrCreateIndex(pdfPath: string): PdfHighlightIndex {
-        let index = this.indexCache.get(pdfPath);
-        if (!index) {
-            index = new Map<number, Set<SelectionId>>();
-            this.indexCache.set(pdfPath, index);
-        }
-        return index;
-    }
-
     /**
      * 重建单个 PDF 的索引。
      * 注意：Obsidian 的 metadataCache 不记录指向 PDF 的正文链接（cache.links 为空，getBacklinksForFile
      * 也不返回），因此通过 resolvedLinks 反查链接到该 PDF 的笔记，再直接读取笔记原文提取 selection 链接。
      */
-    private async rebuildIndex(pdfPath: string): Promise<void> {
+    protected async rebuildIndex(pdfPath: string): Promise<void> {
         const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
         if (!(pdfFile instanceof TFile)) return;
 
@@ -145,21 +74,6 @@ export class PdfHighlightModule implements PluginModule {
         }
 
         this.indexCache.set(pdfPath, newIndex);
-    }
-
-    /** 读取笔记内容：优先打开中的编辑器缓冲，其次磁盘 */
-    private async readNoteContent(sourceFile: TFile): Promise<string> {
-        const app = this.ctx.plugin.app;
-        let editorContent: string | null = null;
-        app.workspace.getLeavesOfType('markdown').forEach((leaf) => {
-            if (editorContent !== null) return;
-            const view = leaf.view as MarkdownView;
-            if (view.file?.path === sourceFile.path && view.editor) {
-                editorContent = view.editor.getValue();
-            }
-        });
-        if (editorContent !== null) return editorContent;
-        return await app.vault.read(sourceFile);
     }
 
     /** 从笔记原文中提取指向指定 PDF 的 selection 链接并写入索引 */
@@ -185,82 +99,12 @@ export class PdfHighlightModule implements PluginModule {
         }
     }
 
-    /** 重建所有「当前有视图打开」的 PDF 索引 */
-    private async rebuildAllIndexes(): Promise<void> {
-        const openPdfPaths = this.getOpenPdfPaths();
-        for (const path of openPdfPaths) {
-            await this.rebuildIndex(path);
-        }
-        // 清理已不再打开（或已删除）PDF 的缓存
-        for (const path of [...this.indexCache.keys()]) {
-            if (!openPdfPaths.has(path) && !this.ctx.plugin.app.vault.getAbstractFileByPath(path)) {
-                this.indexCache.delete(path);
-            }
-        }
-    }
-
     private selectionId(sel: SavedSelectionInfo): string {
         return `${sel.beginIndex},${sel.beginOffset},${sel.endIndex},${sel.endOffset}`;
     }
 
-    // ========== 视图挂载与渲染 ==========
-
-    private getOpenPdfPaths(): Set<string> {
-        const paths = new Set<string>();
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() === 'pdf') {
-                const file = (leaf.view as FileView).file;
-                if (file) paths.add(file.path);
-            }
-        });
-        return paths;
-    }
-
-    private attachToPdfLeaves(): void {
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() !== 'pdf') return;
-            if (this.attachedLeaves.has(leaf)) return;
-
-            const viewer = (leaf.view as any).viewer;
-            const eventBus = viewer?.child?.pdfViewer?.eventBus;
-            if (!eventBus) return;
-
-            this.attachedLeaves.add(leaf);
-            const onTextLayerRendered = (data: any) => {
-                const pdfFile = (leaf.view as FileView).file;
-                if (!pdfFile) return;
-                this.renderPageHighlights(pdfFile.path, data?.source);
-            };
-            eventBus.on('textlayerrendered', onTextLayerRendered);
-            this.ctx.plugin.register(() => {
-                eventBus.off('textlayerrendered', onTextLayerRendered);
-                this.attachedLeaves.delete(leaf);
-            });
-        });
-    }
-
-    private renderForPdf(pdfPath: string): void {
-        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() !== 'pdf') return;
-            const pdfFile = (leaf.view as FileView).file;
-            if (!pdfFile || pdfFile.path !== pdfPath) return;
-            const viewer = (leaf.view as any).viewer;
-            const pdfViewer = viewer?.child?.pdfViewer?.pdfViewer;
-            if (!pdfViewer) return;
-            for (const pageView of pdfViewer._pages ?? []) {
-                if (pageView?.div) this.renderPageHighlights(pdfPath, pageView);
-            }
-        });
-    }
-
-    private renderAllOpenPdfs(): void {
-        for (const path of this.getOpenPdfPaths()) {
-            this.renderForPdf(path);
-        }
-    }
-
     /** 渲染单页的高亮覆盖层（textlayerrendered 时调用，缩放/翻页会重发事件 → 自动重建） */
-    private renderPageHighlights(pdfPath: string, pageView: any): void {
+    protected renderPageHighlights(pdfPath: string, pageView: any): void {
         if (!pageView?.div) return;
         const pageNumber = parseInt(pageView.div.dataset.pageNumber, 10) || 0;
         const index = this.indexCache.get(pdfPath);
@@ -403,6 +247,9 @@ export class PdfHighlightModule implements PluginModule {
             }
             const rect = range.getBoundingClientRect();
             const parentRect = textDiv.getBoundingClientRect();
+            // 文本层 span 不可见（页面过渡/display:none）时 getBoundingClientRect 返回零宽零高，
+            // 作为除数会产生 NaN/Infinity 导致高亮定位异常，直接放弃该矩形
+            if (!parentRect.width || !parentRect.height) return null;
             return [
                 x1 + ((rect.left - parentRect.left) / parentRect.width) * w,
                 y1 + ((rect.bottom - parentRect.bottom) / parentRect.height) * h,
