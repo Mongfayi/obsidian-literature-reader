@@ -48,6 +48,12 @@ npm run build   # 产出 main.js，并自动复制 cmaps/
 | 最大输出令牌 | 单次识别请求最大输出长度（默认 8192） |
 | OCR 提示词 | PaddleOCR-VL 用任务词如 `OCR:` |
 
+## 安全说明
+
+- **OCR API Key 以明文存储**：LM Studio API Key 保存在插件目录的 `data.json`（即 vault 的 `.obsidian/plugins/pdf-reader/data.json`）中，Obsidian 插件 API 不提供加密存储。
+- 如果你的 vault 通过 iCloud / OneDrive / Syncthing / git 等同步，密钥会随之传播。建议：不使用 LM Studio 鉴权时留空该字段；使用鉴权时定期在 LM Studio 中轮换密钥，并考虑在同步配置中排除 `.obsidian/plugins/pdf-reader/data.json`（排除后需在本机重新填写一次）。
+- 插件依赖 Electron 专有 `webview` 标签与部分 Obsidian 内部 API，**仅支持桌面端**（`manifest.json` 已声明 `isDesktopOnly: true`）。
+
 ## 技术说明
 
 - 基于 [PDF.js](https://github.com/mozilla/pdf.js)（pdfjs-dist，Apache-2.0）、[pdf-lib](https://github.com/Hopding/pdf-lib)（MIT）、[fflate](https://github.com/101arrowz/fflate)（MIT）

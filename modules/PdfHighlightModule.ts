@@ -17,6 +17,16 @@ type SelectionId = string;
 /** 每个 PDF 的索引：页码 → 去重后的选区集合 */
 type PdfHighlightIndex = Map<number, Set<SelectionId>>;
 
+/**
+ * 页面几何信息：DOM 兜底路径做「屏幕盒 → PDF 坐标」映射所需。
+ * box 为页面 div 的 client 盒（getBoundingClientRect 加 clientLeft/Top 修正，
+ * 与高亮层 position:absolute 的定位盒一致）；viewBox 为 PDF 空间页面范围。
+ */
+interface PageGeometry {
+    box: { left: number; top: number; width: number; height: number };
+    viewBox: number[];
+}
+
 export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex> {
     constructor(ctx: ModuleContext) {
         super(ctx);
@@ -125,6 +135,20 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
         // 首个文本节点的 data-idx 可能非 0，批注索引是相对值，需换算回数组下标
         const firstIdx = parseInt(textDivs[0].getAttribute('data-idx') || '0', 10) || 0;
 
+        // DOM 兜底路径的屏幕→PDF 映射几何：高亮层（absolute; top/left:0）的定位盒
+        // = 页面 div 的 client 盒（content-box，与 pdf.js setLayerDimensions 的
+        // calc(var(--total-scale-factor)*pageWidth) 尺寸一致）
+        const pageDivRect = pageView.div.getBoundingClientRect();
+        const pageGeom: PageGeometry = {
+            box: {
+                left: pageDivRect.left + pageView.div.clientLeft,
+                top: pageDivRect.top + pageView.div.clientTop,
+                width: pageView.div.clientWidth,
+                height: pageView.div.clientHeight,
+            },
+            viewBox: pageView.pdfPage?.view ?? [0, 0, 0, 0],
+        };
+
         const layerEl = this.getOrCreateHighlightLayer(pageView);
         for (const selectionStr of selections) {
             const [bi, bo, ei, eo] = selectionStr.split(',').map((s) => parseInt(s, 10));
@@ -132,7 +156,8 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
 
             const rects = this.computeMergedHighlightRects(
                 textContentItems, textDivs,
-                bi + firstIdx, bo, ei + firstIdx, eo
+                bi + firstIdx, bo, ei + firstIdx, eo,
+                pageGeom
             );
             for (const rect of rects) {
                 this.placeRectInPage(rect, pageView, layerEl);
@@ -163,12 +188,13 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
 
     /**
      * 计算选区覆盖的矩形列表（PDF 坐标，Y 轴向上）。
-     * 优先使用文本项的逐字符包围盒（chars），缺失时回退文本层 DOM Range 计算。
+     * 优先使用文本项的逐字符包围盒（chars），缺失时回退文本层 div 的屏幕视觉盒。
      * 同行相邻项合并为一个矩形。
      */
     private computeMergedHighlightRects(
         items: any[], textDivs: HTMLElement[],
-        beginIndex: number, beginOffset: number, endIndex: number, endOffset: number
+        beginIndex: number, beginOffset: number, endIndex: number, endOffset: number,
+        pageGeom: PageGeometry
     ): number[][] {
         const results: number[][] = [];
         let merged: number[] | null = null;
@@ -184,7 +210,7 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
             const textDiv = textDivs[i];
             if (!item?.str) continue;
 
-            const rect = this.computeRectForItem(item, textDiv, i, beginIndex, beginOffset, endIndex, endOffset);
+            const rect = this.computeRectForItem(item, textDiv, i, beginIndex, beginOffset, endIndex, endOffset, pageGeom);
             if (!rect) continue;
 
             if (!merged) {
@@ -202,7 +228,8 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
 
     private computeRectForItem(
         item: any, textDiv: HTMLElement, index: number,
-        beginIndex: number, beginOffset: number, endIndex: number, endOffset: number
+        beginIndex: number, beginOffset: number, endIndex: number, endOffset: number,
+        pageGeom: PageGeometry
     ): number[] | null {
         // 逐字符路径：item.chars 的 r 为 [x0, y0, x1, y1]（PDF 坐标）
         const chars: any[] = item.chars;
@@ -225,40 +252,54 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
             ];
         }
 
-        // 兜底：文本层 DOM Range 换算回 PDF 坐标
+        // 兜底：文本层 div 的屏幕视觉盒（getBoundingClientRect 含 scale/rotate 等 CSS
+        // 变换）按页面 client 盒比例映射回 PDF 坐标。
+        // 不能用 item.transform/width/height 拼盒：transform[5] 是文本基线而 height
+        // 是字号，真实文本占据 [基线-descent, 基线+ascent]；且 pdf.js 文本 div 带
+        // 行高补偿 scale(1/Xa) 变换，视觉宽度 ≈ 0.83×item.width。用 item 盒会整体
+        // 偏下且偏宽（无 chars 的 PDF 全部命中此路径）。
         if (!textDiv) return null;
-        const x1 = item.transform?.[4] ?? 0;
-        const y1 = item.transform?.[5] ?? 0;
-        const w = item.width ?? 0;
-        const h = item.height ?? 0;
-        if (!w || !h) return null;
+        const pr = textDiv.getBoundingClientRect();
+        if (!pr.width || !pr.height) return null;
 
-        try {
-            const range = textDiv.ownerDocument.createRange();
-            if (index === beginIndex && beginOffset > 0) {
-                range.setStart(textDiv.firstChild ?? textDiv, Math.min(beginOffset, textDiv.textContent?.length ?? 0));
-            } else {
-                range.setStartBefore(textDiv);
+        // X 方向子选区用 DOM Range 的真实视觉盒（更精确）；整 div 时即 div 盒本身
+        let sx0 = pr.left, sx1 = pr.right;
+        const divLen = textDiv.textContent?.length ?? 0;
+        if ((index === beginIndex && beginOffset > 0) || (index === endIndex && endOffset < divLen)) {
+            try {
+                const range = textDiv.ownerDocument.createRange();
+                if (index === beginIndex && beginOffset > 0) {
+                    range.setStart(textDiv.firstChild ?? textDiv, Math.min(beginOffset, divLen));
+                } else {
+                    range.setStartBefore(textDiv);
+                }
+                if (index === endIndex && endOffset < divLen) {
+                    range.setEnd(textDiv.lastChild ?? textDiv, Math.min(endOffset, divLen));
+                } else {
+                    range.setEndAfter(textDiv);
+                }
+                const rr = range.getBoundingClientRect();
+                if (rr.width > 0) {
+                    sx0 = rr.left;
+                    sx1 = rr.right;
+                }
+            } catch (e) {
+                // Range 计算失败时退回整 div 盒
             }
-            if (index === endIndex && endOffset < (textDiv.textContent?.length ?? 0)) {
-                range.setEnd(textDiv.lastChild ?? textDiv, Math.min(endOffset, textDiv.textContent?.length ?? 0));
-            } else {
-                range.setEndAfter(textDiv);
-            }
-            const rect = range.getBoundingClientRect();
-            const parentRect = textDiv.getBoundingClientRect();
-            // 文本层 span 不可见（页面过渡/display:none）时 getBoundingClientRect 返回零宽零高，
-            // 作为除数会产生 NaN/Infinity 导致高亮定位异常，直接放弃该矩形
-            if (!parentRect.width || !parentRect.height) return null;
-            return [
-                x1 + ((rect.left - parentRect.left) / parentRect.width) * w,
-                y1 + ((rect.bottom - parentRect.bottom) / parentRect.height) * h,
-                x1 + ((rect.right - parentRect.left) / parentRect.width) * w,
-                y1 + ((rect.top - parentRect.bottom) / parentRect.height) * h,
-            ];
-        } catch (e) {
-            return null;
         }
+
+        const [pageX, pageY, pageMaxX, pageMaxY] = pageGeom.viewBox;
+        const pageWidth = pageMaxX - pageX;
+        const pageHeight = pageMaxY - pageY;
+        const { left: boxLeft, top: boxTop, width: boxW, height: boxH } = pageGeom.box;
+        if (!pageWidth || !pageHeight || !boxW || !boxH) return null;
+
+        return [
+            pageX + ((sx0 - boxLeft) / boxW) * pageWidth,
+            pageY + pageHeight - ((pr.bottom - boxTop) / boxH) * pageHeight,
+            pageX + ((sx1 - boxLeft) / boxW) * pageWidth,
+            pageY + pageHeight - ((pr.top - boxTop) / boxH) * pageHeight,
+        ];
     }
 
     /** 两个矩形中心 Y 接近（同一行）时视为可合并 */
@@ -296,8 +337,10 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
         rectEl.setCssStyles({
             left: `${100 * (rect[0] - pageX) / pageWidth}%`,
             top: `${100 * (viewBox[3] - rect[3] + viewBox[1] - pageY) / pageHeight}%`,
-            width: `${100 * (rect[2] - rect[0]) / pageWidth}%`,
-            height: `${100 * (rect[3] - rect[1]) / pageHeight}%`,
+            // 防御：任何路径产生反向/非法矩形时钳制为非负，避免 CSS 负高度
+            // 被丢弃后高亮塌缩成细线
+            width: `${Math.max(0, 100 * (rect[2] - rect[0]) / pageWidth)}%`,
+            height: `${Math.max(0, 100 * (rect[3] - rect[1]) / pageHeight)}%`,
         });
     }
 }

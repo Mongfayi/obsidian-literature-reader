@@ -337,11 +337,16 @@ class PdfDocCache {
             const doc = await task.promise;
             const evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);
             this.cache.set(path, { doc, evictTimer });
-            this.pending.delete(path);
             return doc;
         })();
 
         this.pending.set(path, promise);
+        // 无论加载成功或失败都清除在途标记：失败时若保留，后续所有 get() 都会复用
+        // 同一个 rejected Promise，该 PDF 的截图嵌入将永久失败（直到插件重载）
+        promise.then(
+            () => this.pending.delete(path),
+            () => this.pending.delete(path)
+        );
         return promise;
     }
 

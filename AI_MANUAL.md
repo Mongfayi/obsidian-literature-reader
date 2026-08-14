@@ -1,6 +1,6 @@
 # 文献阅读助手插件技术手册
 
-> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.3.0`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
+> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.3.1`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
 
 ---
 

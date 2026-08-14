@@ -41,6 +41,16 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
             app.workspace.on('active-leaf-change', () => this.attachToPdfLeaves())
         );
 
+        // PDF 打开（含 Obsidian 启动恢复工作区、会话中打开新 PDF）→ 精确重建该 PDF 索引。
+        // 否则首次打开的 PDF 页渲染事件触发时 indexCache 中尚无索引，既有批注高亮不显示。
+        this.ctx.plugin.registerEvent(
+            app.workspace.on('file-open', (file: TFile | null) => {
+                if (file && file.extension === 'pdf') {
+                    this.scheduleRebuildForPdfs([file.path]);
+                }
+            })
+        );
+
         // 笔记修改（批注写入、删除等）→ 防抖重建索引并刷新
         // 仅当变更的笔记链接到 PDF 时才触发重建，避免无关笔记编辑导致全量索引扫描；
         // 且只重建受影响的具体 PDF，而非全部已打开的 PDF
@@ -187,6 +197,14 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
                 eventBus.off(this.renderEventName, onRendered);
                 this.attachedLeaves.delete(leaf);
             });
+
+            // 兜底：新挂载叶子若已持有文件（file-open 事件可能早于插件加载触发），
+            // 立即调度该 PDF 的索引重建，确保打开即渲染既有批注高亮。
+            // （scheduleRebuildForPdfs 内部按路径合并 + 300ms 防抖，重复调度无副作用）
+            const pdfFile = (leaf.view as FileView).file;
+            if (pdfFile) {
+                this.scheduleRebuildForPdfs([pdfFile.path]);
+            }
         });
     }
 

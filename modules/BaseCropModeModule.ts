@@ -25,6 +25,7 @@ interface PdfCropGlobal {
 interface DragState {
     pageEl: HTMLElement;
     boxEl: HTMLElement;
+    pointerId: number;
     downPX: number;
     downPY: number;
     move: (e: PointerEvent) => void;
@@ -47,6 +48,10 @@ export abstract class BaseCropModeModule implements PluginModule {
     /** 截图模式监听器（供取消时移除） */
     private cropPointerDown: ((e: PointerEvent) => void) | null = null;
     private cropKeyDown: ((e: KeyboardEvent) => void) | null = null;
+    /** pointercancel 监听器（拖拽被系统打断时清理拖拽状态） */
+    private cropPointerCancel: ((e: PointerEvent) => void) | null = null;
+    /** window blur 监听器（窗口失焦时退出截图模式，避免光标/捕获悬挂） */
+    private cropWindowBlur: (() => void) | null = null;
     /** 当前拖拽状态（非 null = 正在框选） */
     private dragState: DragState | null = null;
 
@@ -220,10 +225,28 @@ export abstract class BaseCropModeModule implements PluginModule {
             }
         };
 
+        // 拖拽被系统打断（触摸手势抢占、窗口事件中断等）时清理拖拽状态，
+        // 避免 move/up 监听与框选 div 悬挂
+        const onPointerCancel = (evt: PointerEvent) => {
+            if (this.dragState && evt.pointerId === this.dragState.pointerId) {
+                this.cancelDrag();
+            }
+        };
+
+        // 窗口失焦（切换应用/Alt-Tab）时整体退出截图模式，避免 crosshair 光标
+        // 与捕获状态在用户离开后仍残留
+        const onWindowBlur = () => {
+            this.cancelCropMode();
+        };
+
         this.cropPointerDown = onPointerDown;
         this.cropKeyDown = onKeyDown;
+        this.cropPointerCancel = onPointerCancel;
+        this.cropWindowBlur = onWindowBlur;
         win.addEventListener('pointerdown', onPointerDown, true);
         win.addEventListener('keydown', onKeyDown, true);
+        win.addEventListener('pointercancel', onPointerCancel, true);
+        win.addEventListener('blur', onWindowBlur);
     }
 
     /** 开始一次框选拖拽：框挂页面内，坐标全程锚定页面（页面滚动不漂移） */
@@ -242,6 +265,14 @@ export abstract class BaseCropModeModule implements PluginModule {
         const downPX = clampCoord(e.clientX - ox0, pw0);
         const downPY = clampCoord(e.clientY - oy0, ph0);
         const pointerId = e.pointerId;
+
+        // 指针捕获：指针移出窗口后仍能持续收到 pointermove/pointerup，
+        // 避免在窗口外释放时拖拽状态悬挂；失败时静默退化为 window 级监听
+        try {
+            pageEl.setPointerCapture(pointerId);
+        } catch (e) {
+            // 忽略：无捕获时仍走 window 级监听（极端环境下退化为原行为）
+        }
 
         const boxEl = pageEl.createDiv(this.boxClass);
         Object.assign(boxEl.style, {
@@ -293,7 +324,7 @@ export abstract class BaseCropModeModule implements PluginModule {
             void this.onCropComplete(leaf, pageEl, pageRect);
         };
 
-        this.dragState = { pageEl, boxEl, downPX, downPY, move, up };
+        this.dragState = { pageEl, boxEl, pointerId, downPX, downPY, move, up };
         win.addEventListener('pointermove', move, true);
         win.addEventListener('pointerup', up, true);
     }
@@ -312,9 +343,14 @@ export abstract class BaseCropModeModule implements PluginModule {
     /** 取消当前拖拽（保留截图模式） */
     private cancelDrag(): void {
         if (!this.dragState) return;
-        const { boxEl, move, up } = this.dragState;
+        const { pageEl, boxEl, pointerId, move, up } = this.dragState;
         this.dragState = null;
         boxEl.remove();
+        try {
+            pageEl.releasePointerCapture(pointerId);
+        } catch (e) {
+            // 忽略：捕获可能已随 pointerup 自动释放
+        }
         const win = boxEl.ownerDocument.defaultView;
         win?.removeEventListener('pointermove', move, true);
         win?.removeEventListener('pointerup', up, true);
@@ -332,6 +368,14 @@ export abstract class BaseCropModeModule implements PluginModule {
             if (this.cropKeyDown) {
                 win?.removeEventListener('keydown', this.cropKeyDown, true);
                 this.cropKeyDown = null;
+            }
+            if (this.cropPointerCancel) {
+                win?.removeEventListener('pointercancel', this.cropPointerCancel, true);
+                this.cropPointerCancel = null;
+            }
+            if (this.cropWindowBlur) {
+                win?.removeEventListener('blur', this.cropWindowBlur);
+                this.cropWindowBlur = null;
             }
             this.cropRoot = null;
         }
