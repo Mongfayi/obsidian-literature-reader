@@ -34,6 +34,8 @@ export class PdfReaderModule implements PluginModule {
     private refreshHighlights: ((file: TFile, selections?: SavedSelectionInfo[]) => void) | null = null;
     /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
     private redirectResolver: (() => Promise<TFile | null>) | null = null;
+    /** 「开始阅读」进行中的 PDF 路径（防重复点击并发执行全量文本提取与重复分屏） */
+    private startingPdfs = new Set<string>();
 
     constructor(ctx: ModuleContext) {
         this.ctx = ctx;
@@ -149,6 +151,10 @@ export class PdfReaderModule implements PluginModule {
     // ========== 开始阅读主流程 ==========
 
     async startReading(pdfFile: TFile) {
+        // 防重入：首次调用会对大 PDF 做全量文本提取（可能耗时数秒），
+        // 期间重复点击会并发再跑一遍提取并触发笔记创建竞态，此处直接忽略
+        if (this.startingPdfs.has(pdfFile.path)) return;
+        this.startingPdfs.add(pdfFile.path);
         try {
             const noteFile = await this.createReadingNote(pdfFile);
             if (!noteFile) return;
@@ -171,6 +177,8 @@ export class PdfReaderModule implements PluginModule {
             }
         } catch (error) {
             console.error('[PdfReader] 开始阅读失败:', error);
+        } finally {
+            this.startingPdfs.delete(pdfFile.path);
         }
     }
 
@@ -814,7 +822,12 @@ created: ${date}`;
         ocrRect?: { x: number; y: number; w: number; h: number }
     ): Promise<boolean> {
         const noteFile = await this.resolveTargetNote(pdfFile);
-        if (!noteFile) return false;
+        if (!noteFile) {
+            // resolveTargetNote 失败（笔记文件夹被同名文件占用、同名笔记冲突等）
+            // 时用户无感知地丢失一次 OCR 批注，必须明确提示
+            new Notice('OCR 批注写入失败：无法创建/定位阅读笔记，请检查阅读笔记文件夹设置');
+            return false;
+        }
         const selections: SavedSelectionInfo[] = [{
             text,
             page,
@@ -851,12 +864,16 @@ created: ${date}`;
             const block = `> [!pdf-annotation]\n> ${embedLink}\n> ${pageLink}\n> 笔记：`;
             const annotation = '\n' + block + '\n';
             const cursorPos = this.getNoteCursorEditorPos(noteFile);
+            let promptLine: number | null = null;
             if (cursorPos) {
                 cursorPos.editor.replaceRange(annotation, { line: cursorPos.line, ch: cursorPos.ch });
+                // 提示行 = 插入起始行 + 提示行在插入文本内的行偏移
+                // （annotation 以 \n 开头、以 \n 结尾，split 后提示行位于倒数第 2 个元素）
+                promptLine = cursorPos.line + annotation.split('\n').length - 2;
             } else {
                 await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
             }
-            await this.focusNotePrompt(noteFile, '> 笔记：');
+            await this.focusNotePrompt(noteFile, '> 笔记：', promptLine);
             return true;
         } catch (e) {
             console.error('[PdfReader] 截图批注写入失败:', e);
@@ -988,19 +1005,30 @@ created: ${date}`;
         // 优先经编辑器缓冲插入（缓冲与光标偏移同源，无保存竞态）；
         // 无编辑器（阅读模式/笔记未打开）时回退为追加到文末
         const cursorPos = this.getNoteCursorEditorPos(noteFile);
+        let promptLine: number | null = null;
         if (cursorPos) {
             cursorPos.editor.replaceRange(annotation, {
                 line: cursorPos.line,
                 ch: cursorPos.ch,
             });
+            // 提示行 = 插入起始行 + 提示行在插入文本内的行偏移
+            // （annotation 以 \n 开头、以 \n 结尾，split 后提示行位于倒数第 2 个元素）
+            promptLine = cursorPos.line + annotation.split('\n').length - 2;
         } else {
             await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
         }
 
-        await this.focusNotePrompt(noteFile, notePrompt);
+        await this.focusNotePrompt(noteFile, notePrompt, promptLine);
     }
 
-    private async focusNotePrompt(noteFile: TFile, prompt: string) {
+    /**
+     * 聚焦笔记中刚写入批注的提示行（如「> 笔记：」）。
+     * @param exactLine 编辑器插入路径下提示行的精确行号（replaceRange 后缓冲已同步）；
+     *                  null = vault.process 追加路径，需等编辑器刷新后从底部向上搜索。
+     * 精确行定位避免了旧实现的缺陷：从文末向上找「最后一个」提示行，
+     * 当批注插入在文件中部时会把光标带到文档末尾的旧批注上，导致后续输入写错位置。
+     */
+    private async focusNotePrompt(noteFile: TFile, prompt: string, exactLine: number | null = null) {
         let targetLeaf: WorkspaceLeaf | null = null;
         this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
             if (
@@ -1018,8 +1046,17 @@ created: ${date}`;
         const editor = (leaf.view as MarkdownView).editor;
         if (!editor) return;
 
-        // 编辑器插入路径下内容已同步；vault.process 路径需等待编辑器刷新，
-        // 轮询查找提示行（最多 250ms，命中即返回）
+        // 精确行路径：行号已知且内容命中提示行则直接定位；
+        // 未命中（极端并发编辑导致行号漂移）时回退到底部向上搜索
+        if (exactLine !== null && exactLine >= 0 && exactLine <= editor.lastLine()) {
+            const text = editor.getLine(exactLine);
+            if (text.includes(prompt)) {
+                editor.setCursor({ line: exactLine, ch: text.length });
+                return;
+            }
+        }
+
+        // 追加路径：刚追加的块位于文末，底部向上搜索命中的最后一个提示行即本次批注的
         for (let attempt = 0; attempt < 10; attempt++) {
             const lastLine = editor.lastLine();
             for (let line = lastLine; line >= 0; line--) {

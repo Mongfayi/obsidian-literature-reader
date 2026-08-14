@@ -100,7 +100,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('LM Studio API Key')
-            .setDesc('LM Studio 开启 Require Authentication 时必填，与 kdata 的 token 相同')
+            .setDesc('LM Studio 开启 Require Authentication 时必填，与 kdata 的 token 相同。⚠️ 安全提示：密钥以明文保存在 vault 内插件目录的 data.json 中，请勿将 vault 同步/共享到不受信任的位置，并建议定期在 LM Studio 中轮换密钥；不使用鉴权时可留空。')
             .addText((text) => {
                 text.inputEl.type = 'password';
                 text.setPlaceholder('sk-lm-...')

@@ -65,7 +65,8 @@ class DeepSeekFloatingWindow {
 
     constructor(ctx: ModuleContext) {
         this.ctx = ctx;
-        this.createWindow();
+        // 注意：不在构造时创建窗口——webview 一旦创建就会加载完整 DeepSeek 网页
+        // （独立渲染进程 + 网络开销）。改为首次 show()/上传文件时懒创建。
     }
 
     private createWindow() {
@@ -148,6 +149,7 @@ class DeepSeekFloatingWindow {
     }
 
     show() {
+        if (!this.container) this.createWindow();
         if (!this.container) return;
         // 先恢复显示，否则 display:none 下 getBoundingClientRect 恒为 0，
         // 会误判为「已拖出视口」而清空上次拖拽位置（导致隐藏后再显示位置丢失）
@@ -184,6 +186,12 @@ class DeepSeekFloatingWindow {
     // ========== 上传当前文件到聊天框 ==========
 
     async addCurrentFileToChat() {
+        // 懒创建：窗口从未打开过时先创建并显示（webview 页面加载需要时间，
+        // 若页面尚未就绪，下方 uploadViaWebview 会返回 not-found 并给出提示）
+        if (!this.container) {
+            this.createWindow();
+            this.show();
+        }
         if (!this.webview) {
             new Notice('DeepSeek 窗口未就绪');
             return;

@@ -26183,6 +26183,8 @@ var PdfReaderModule = class {
     this.refreshHighlights = null;
     /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
     this.redirectResolver = null;
+    /** 「开始阅读」进行中的 PDF 路径（防重复点击并发执行全量文本提取与重复分屏） */
+    this.startingPdfs = /* @__PURE__ */ new Set();
     this.ctx = ctx;
   }
   /** 注入批注后的高亮刷新回调 */
@@ -26272,6 +26274,9 @@ var PdfReaderModule = class {
   }
   // ========== 开始阅读主流程 ==========
   async startReading(pdfFile) {
+    if (this.startingPdfs.has(pdfFile.path))
+      return;
+    this.startingPdfs.add(pdfFile.path);
     try {
       const noteFile = await this.createReadingNote(pdfFile);
       if (!noteFile)
@@ -26291,6 +26296,8 @@ var PdfReaderModule = class {
       }
     } catch (error) {
       console.error("[PdfReader] \u5F00\u59CB\u9605\u8BFB\u5931\u8D25:", error);
+    } finally {
+      this.startingPdfs.delete(pdfFile.path);
     }
   }
   /** 查找已打开指定文件的叶子，未打开返回 null */
@@ -26824,8 +26831,10 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
    */
   async annotateOcrText(pdfFile, text, page, ocrRect) {
     const noteFile = await this.resolveTargetNote(pdfFile);
-    if (!noteFile)
+    if (!noteFile) {
+      new import_obsidian.Notice("OCR \u6279\u6CE8\u5199\u5165\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA/\u5B9A\u4F4D\u9605\u8BFB\u7B14\u8BB0\uFF0C\u8BF7\u68C0\u67E5\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939\u8BBE\u7F6E");
       return false;
+    }
     const selections = [{
       text,
       page,
@@ -26865,12 +26874,14 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
 > \u7B14\u8BB0\uFF1A`;
       const annotation = "\n" + block + "\n";
       const cursorPos = this.getNoteCursorEditorPos(noteFile);
+      let promptLine = null;
       if (cursorPos) {
         cursorPos.editor.replaceRange(annotation, { line: cursorPos.line, ch: cursorPos.ch });
+        promptLine = cursorPos.line + annotation.split("\n").length - 2;
       } else {
         await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
       }
-      await this.focusNotePrompt(noteFile, "> \u7B14\u8BB0\uFF1A");
+      await this.focusNotePrompt(noteFile, "> \u7B14\u8BB0\uFF1A", promptLine);
       return true;
     } catch (e) {
       console.error("[PdfReader] \u622A\u56FE\u6279\u6CE8\u5199\u5165\u5931\u8D25:", e);
@@ -26978,17 +26989,26 @@ ${items.join("\n> \n")}
 ${notePrompt}`;
     const annotation = "\n" + block + "\n";
     const cursorPos = this.getNoteCursorEditorPos(noteFile);
+    let promptLine = null;
     if (cursorPos) {
       cursorPos.editor.replaceRange(annotation, {
         line: cursorPos.line,
         ch: cursorPos.ch
       });
+      promptLine = cursorPos.line + annotation.split("\n").length - 2;
     } else {
       await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
     }
-    await this.focusNotePrompt(noteFile, notePrompt);
+    await this.focusNotePrompt(noteFile, notePrompt, promptLine);
   }
-  async focusNotePrompt(noteFile, prompt) {
+  /**
+   * 聚焦笔记中刚写入批注的提示行（如「> 笔记：」）。
+   * @param exactLine 编辑器插入路径下提示行的精确行号（replaceRange 后缓冲已同步）；
+   *                  null = vault.process 追加路径，需等编辑器刷新后从底部向上搜索。
+   * 精确行定位避免了旧实现的缺陷：从文末向上找「最后一个」提示行，
+   * 当批注插入在文件中部时会把光标带到文档末尾的旧批注上，导致后续输入写错位置。
+   */
+  async focusNotePrompt(noteFile, prompt, exactLine = null) {
     let targetLeaf = null;
     this.ctx.plugin.app.workspace.iterateAllLeaves((leaf2) => {
       if (leaf2.view instanceof import_obsidian.MarkdownView && leaf2.view.file?.path === noteFile.path) {
@@ -27002,6 +27022,13 @@ ${notePrompt}`;
     const editor = leaf.view.editor;
     if (!editor)
       return;
+    if (exactLine !== null && exactLine >= 0 && exactLine <= editor.lastLine()) {
+      const text = editor.getLine(exactLine);
+      if (text.includes(prompt)) {
+        editor.setCursor({ line: exactLine, ch: text.length });
+        return;
+      }
+    }
     for (let attempt = 0; attempt < 10; attempt++) {
       const lastLine = editor.lastLine();
       for (let line = lastLine; line >= 0; line--) {
@@ -27076,7 +27103,6 @@ var DeepSeekFloatingWindow = class {
     this.isDragging = false;
     this.dragOffset = { x: 0, y: 0 };
     this.ctx = ctx;
-    this.createWindow();
   }
   createWindow() {
     const container = document.body.createDiv({ cls: "deepseek-float-container" });
@@ -27143,6 +27169,8 @@ var DeepSeekFloatingWindow = class {
   }
   show() {
     if (!this.container)
+      this.createWindow();
+    if (!this.container)
       return;
     this.container.style.display = "flex";
     const rect = this.container.getBoundingClientRect();
@@ -27172,6 +27200,10 @@ var DeepSeekFloatingWindow = class {
   }
   // ========== 上传当前文件到聊天框 ==========
   async addCurrentFileToChat() {
+    if (!this.container) {
+      this.createWindow();
+      this.show();
+    }
     if (!this.webview) {
       new import_obsidian2.Notice("DeepSeek \u7A97\u53E3\u672A\u5C31\u7EEA");
       return;
@@ -27392,6 +27424,13 @@ var BasePdfHighlightModule = class {
       app.workspace.on("active-leaf-change", () => this.attachToPdfLeaves())
     );
     this.ctx.plugin.registerEvent(
+      app.workspace.on("file-open", (file) => {
+        if (file && file.extension === "pdf") {
+          this.scheduleRebuildForPdfs([file.path]);
+        }
+      })
+    );
+    this.ctx.plugin.registerEvent(
       app.metadataCache.on("changed", (file) => {
         const links = app.metadataCache.resolvedLinks[file.path];
         if (!links)
@@ -27509,16 +27548,20 @@ var BasePdfHighlightModule = class {
         return;
       this.attachedLeaves.add(leaf);
       const onRendered = (data) => {
-        const pdfFile = leaf.view.file;
-        if (!pdfFile)
+        const pdfFile2 = leaf.view.file;
+        if (!pdfFile2)
           return;
-        this.renderPageHighlights(pdfFile.path, data?.source);
+        this.renderPageHighlights(pdfFile2.path, data?.source);
       };
       eventBus.on(this.renderEventName, onRendered);
       this.ctx.plugin.register(() => {
         eventBus.off(this.renderEventName, onRendered);
         this.attachedLeaves.delete(leaf);
       });
+      const pdfFile = leaf.view.file;
+      if (pdfFile) {
+        this.scheduleRebuildForPdfs([pdfFile.path]);
+      }
     });
   }
   renderForPdf(pdfPath) {
@@ -27658,6 +27701,16 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
     if (textDivs.length === 0)
       return;
     const firstIdx = parseInt(textDivs[0].getAttribute("data-idx") || "0", 10) || 0;
+    const pageDivRect = pageView.div.getBoundingClientRect();
+    const pageGeom = {
+      box: {
+        left: pageDivRect.left + pageView.div.clientLeft,
+        top: pageDivRect.top + pageView.div.clientTop,
+        width: pageView.div.clientWidth,
+        height: pageView.div.clientHeight
+      },
+      viewBox: pageView.pdfPage?.view ?? [0, 0, 0, 0]
+    };
     const layerEl = this.getOrCreateHighlightLayer(pageView);
     for (const selectionStr of selections) {
       const [bi, bo, ei, eo] = selectionStr.split(",").map((s) => parseInt(s, 10));
@@ -27669,7 +27722,8 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
         bi + firstIdx,
         bo,
         ei + firstIdx,
-        eo
+        eo,
+        pageGeom
       );
       for (const rect of rects) {
         this.placeRectInPage(rect, pageView, layerEl);
@@ -27697,10 +27751,10 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
   }
   /**
    * 计算选区覆盖的矩形列表（PDF 坐标，Y 轴向上）。
-   * 优先使用文本项的逐字符包围盒（chars），缺失时回退文本层 DOM Range 计算。
+   * 优先使用文本项的逐字符包围盒（chars），缺失时回退文本层 div 的屏幕视觉盒。
    * 同行相邻项合并为一个矩形。
    */
-  computeMergedHighlightRects(items, textDivs, beginIndex, beginOffset, endIndex, endOffset) {
+  computeMergedHighlightRects(items, textDivs, beginIndex, beginOffset, endIndex, endOffset, pageGeom) {
     const results = [];
     let merged = null;
     if (endOffset === 0 && endIndex > beginIndex) {
@@ -27712,7 +27766,7 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
       const textDiv = textDivs[i];
       if (!item?.str)
         continue;
-      const rect = this.computeRectForItem(item, textDiv, i, beginIndex, beginOffset, endIndex, endOffset);
+      const rect = this.computeRectForItem(item, textDiv, i, beginIndex, beginOffset, endIndex, endOffset, pageGeom);
       if (!rect)
         continue;
       if (!merged) {
@@ -27728,7 +27782,7 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
       results.push(merged);
     return results;
   }
-  computeRectForItem(item, textDiv, index, beginIndex, beginOffset, endIndex, endOffset) {
+  computeRectForItem(item, textDiv, index, beginIndex, beginOffset, endIndex, endOffset, pageGeom) {
     const chars = item.chars;
     if (chars && chars.length >= item.str.length) {
       const firstCharIdx = chars.findIndex((c) => c?.c === item.str.charAt(0));
@@ -27751,37 +27805,44 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
     }
     if (!textDiv)
       return null;
-    const x1 = item.transform?.[4] ?? 0;
-    const y1 = item.transform?.[5] ?? 0;
-    const w = item.width ?? 0;
-    const h = item.height ?? 0;
-    if (!w || !h)
+    const pr = textDiv.getBoundingClientRect();
+    if (!pr.width || !pr.height)
       return null;
-    try {
-      const range = textDiv.ownerDocument.createRange();
-      if (index === beginIndex && beginOffset > 0) {
-        range.setStart(textDiv.firstChild ?? textDiv, Math.min(beginOffset, textDiv.textContent?.length ?? 0));
-      } else {
-        range.setStartBefore(textDiv);
+    let sx0 = pr.left, sx1 = pr.right;
+    const divLen = textDiv.textContent?.length ?? 0;
+    if (index === beginIndex && beginOffset > 0 || index === endIndex && endOffset < divLen) {
+      try {
+        const range = textDiv.ownerDocument.createRange();
+        if (index === beginIndex && beginOffset > 0) {
+          range.setStart(textDiv.firstChild ?? textDiv, Math.min(beginOffset, divLen));
+        } else {
+          range.setStartBefore(textDiv);
+        }
+        if (index === endIndex && endOffset < divLen) {
+          range.setEnd(textDiv.lastChild ?? textDiv, Math.min(endOffset, divLen));
+        } else {
+          range.setEndAfter(textDiv);
+        }
+        const rr = range.getBoundingClientRect();
+        if (rr.width > 0) {
+          sx0 = rr.left;
+          sx1 = rr.right;
+        }
+      } catch (e) {
       }
-      if (index === endIndex && endOffset < (textDiv.textContent?.length ?? 0)) {
-        range.setEnd(textDiv.lastChild ?? textDiv, Math.min(endOffset, textDiv.textContent?.length ?? 0));
-      } else {
-        range.setEndAfter(textDiv);
-      }
-      const rect = range.getBoundingClientRect();
-      const parentRect = textDiv.getBoundingClientRect();
-      if (!parentRect.width || !parentRect.height)
-        return null;
-      return [
-        x1 + (rect.left - parentRect.left) / parentRect.width * w,
-        y1 + (rect.bottom - parentRect.bottom) / parentRect.height * h,
-        x1 + (rect.right - parentRect.left) / parentRect.width * w,
-        y1 + (rect.top - parentRect.bottom) / parentRect.height * h
-      ];
-    } catch (e) {
-      return null;
     }
+    const [pageX, pageY, pageMaxX, pageMaxY] = pageGeom.viewBox;
+    const pageWidth = pageMaxX - pageX;
+    const pageHeight = pageMaxY - pageY;
+    const { left: boxLeft, top: boxTop, width: boxW, height: boxH } = pageGeom.box;
+    if (!pageWidth || !pageHeight || !boxW || !boxH)
+      return null;
+    return [
+      pageX + (sx0 - boxLeft) / boxW * pageWidth,
+      pageY + pageHeight - (pr.bottom - boxTop) / boxH * pageHeight,
+      pageX + (sx1 - boxLeft) / boxW * pageWidth,
+      pageY + pageHeight - (pr.top - boxTop) / boxH * pageHeight
+    ];
   }
   /** 两个矩形中心 Y 接近（同一行）时视为可合并 */
   areRectsMergeable(rect1, rect2) {
@@ -27817,8 +27878,10 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
     rectEl.setCssStyles({
       left: `${100 * (rect[0] - pageX) / pageWidth}%`,
       top: `${100 * (viewBox[3] - rect[3] + viewBox[1] - pageY) / pageHeight}%`,
-      width: `${100 * (rect[2] - rect[0]) / pageWidth}%`,
-      height: `${100 * (rect[3] - rect[1]) / pageHeight}%`
+      // 防御：任何路径产生反向/非法矩形时钳制为非负，避免 CSS 负高度
+      // 被丢弃后高亮塌缩成细线
+      width: `${Math.max(0, 100 * (rect[2] - rect[0]) / pageWidth)}%`,
+      height: `${Math.max(0, 100 * (rect[3] - rect[1]) / pageHeight)}%`
     });
   }
 };
@@ -27844,6 +27907,10 @@ var BaseCropModeModule = class {
     /** 截图模式监听器（供取消时移除） */
     this.cropPointerDown = null;
     this.cropKeyDown = null;
+    /** pointercancel 监听器（拖拽被系统打断时清理拖拽状态） */
+    this.cropPointerCancel = null;
+    /** window blur 监听器（窗口失焦时退出截图模式，避免光标/捕获悬挂） */
+    this.cropWindowBlur = null;
     /** 当前拖拽状态（非 null = 正在框选） */
     this.dragState = null;
     this.ctx = ctx;
@@ -27972,10 +28039,22 @@ var BaseCropModeModule = class {
         this.cancelCropMode();
       }
     };
+    const onPointerCancel = (evt) => {
+      if (this.dragState && evt.pointerId === this.dragState.pointerId) {
+        this.cancelDrag();
+      }
+    };
+    const onWindowBlur = () => {
+      this.cancelCropMode();
+    };
     this.cropPointerDown = onPointerDown;
     this.cropKeyDown = onKeyDown;
+    this.cropPointerCancel = onPointerCancel;
+    this.cropWindowBlur = onWindowBlur;
     win.addEventListener("pointerdown", onPointerDown, true);
     win.addEventListener("keydown", onKeyDown, true);
+    win.addEventListener("pointercancel", onPointerCancel, true);
+    win.addEventListener("blur", onWindowBlur);
   }
   /** 开始一次框选拖拽：框挂页面内，坐标全程锚定页面（页面滚动不漂移） */
   startDrag(win, e, pageEl) {
@@ -27988,6 +28067,10 @@ var BaseCropModeModule = class {
     const downPX = clampCoord(e.clientX - ox0, pw0);
     const downPY = clampCoord(e.clientY - oy0, ph0);
     const pointerId = e.pointerId;
+    try {
+      pageEl.setPointerCapture(pointerId);
+    } catch (e2) {
+    }
     const boxEl = pageEl.createDiv(this.boxClass);
     Object.assign(boxEl.style, {
       left: `${downPX}px`,
@@ -28037,7 +28120,7 @@ var BaseCropModeModule = class {
       this.cancelCropMode();
       void this.onCropComplete(leaf, pageEl, pageRect);
     };
-    this.dragState = { pageEl, boxEl, downPX, downPY, move, up };
+    this.dragState = { pageEl, boxEl, pointerId, downPX, downPY, move, up };
     win.addEventListener("pointermove", move, true);
     win.addEventListener("pointerup", up, true);
   }
@@ -28045,9 +28128,13 @@ var BaseCropModeModule = class {
   cancelDrag() {
     if (!this.dragState)
       return;
-    const { boxEl, move, up } = this.dragState;
+    const { pageEl, boxEl, pointerId, move, up } = this.dragState;
     this.dragState = null;
     boxEl.remove();
+    try {
+      pageEl.releasePointerCapture(pointerId);
+    } catch (e) {
+    }
     const win = boxEl.ownerDocument.defaultView;
     win?.removeEventListener("pointermove", move, true);
     win?.removeEventListener("pointerup", up, true);
@@ -28064,6 +28151,14 @@ var BaseCropModeModule = class {
       if (this.cropKeyDown) {
         win?.removeEventListener("keydown", this.cropKeyDown, true);
         this.cropKeyDown = null;
+      }
+      if (this.cropPointerCancel) {
+        win?.removeEventListener("pointercancel", this.cropPointerCancel, true);
+        this.cropPointerCancel = null;
+      }
+      if (this.cropWindowBlur) {
+        win?.removeEventListener("blur", this.cropWindowBlur);
+        this.cropWindowBlur = null;
       }
       this.cropRoot = null;
     }
@@ -28323,10 +28418,13 @@ var PdfDocCache = class {
       const doc = await task.promise;
       const evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);
       this.cache.set(path, { doc, evictTimer });
-      this.pending.delete(path);
       return doc;
     })();
     this.pending.set(path, promise);
+    promise.then(
+      () => this.pending.delete(path),
+      () => this.pending.delete(path)
+    );
     return promise;
   }
   /** 淘汰并销毁指定 PDF 的缓存文档 */
@@ -29015,7 +29113,7 @@ var UnifiedSettingTab = class extends import_obsidian10.PluginSettingTab {
       this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
       this.scheduleSave();
     }));
-    new import_obsidian10.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C").addText((text) => {
+    new import_obsidian10.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("sk-lm-...").setValue(this.getSettings().ocrApiKey).onChange(async (value) => {
         this.getSettings().ocrApiKey = value.trim();
