@@ -7,6 +7,8 @@ import { ScreenshotModule } from './modules/ScreenshotModule';
 import { OcrModule } from './modules/OcrModule';
 import { OcrHighlightModule } from './modules/OcrHighlightModule';
 import { MainArticleModule } from './modules/MainArticleModule';
+import { AnnotationModeModule } from './modules/AnnotationModeModule';
+import { PdfJumpModule } from './modules/PdfJumpModule';
 import { UnifiedSettingTab } from './modules/SettingsTab';
 
 /**
@@ -53,6 +55,14 @@ export default class LiteratureReaderPlugin extends Plugin {
         // 主文献模块：工具条「主文献」按钮，开启后所有 PDF 批注汇集到主文献笔记
         const mainArticleModule = new MainArticleModule(ctx, pdfModule);
 
+        // 批注原文附带模式模块（测试功能，以后可能删除）：工具条「附带原文」按钮，
+        // 默认关闭 = 文字选中批注只写 PDF 链接不附带原文；不影响 OCR / 截图批注
+        const annotationModeModule = new AnnotationModeModule(ctx, pdfModule);
+
+        // 双向跳转模块：点击 PDF 高亮 → 笔记对应批注；点击笔记 PDF 链接 → PDF 对应位置
+        // （目标未打开时在笔记左侧 / PDF 右侧分屏打开，不在焦点叶子直接打开）
+        const jumpModule = new PdfJumpModule(ctx);
+
         const deepseekCtx: ModuleContext = {
             ...ctx,
             getCurrentFileForUpload: () => pdfModule.getCurrentFileForUpload(),
@@ -61,11 +71,13 @@ export default class LiteratureReaderPlugin extends Plugin {
         // 注册功能模块
         this.modules = [
             pdfModule,
+            annotationModeModule,
             mainArticleModule,
             highlightModule,
             screenshotModule,
             ocrHighlightModule,
             ocrModule,
+            jumpModule,
             new DeepSeekModule(deepseekCtx),
         ];
 

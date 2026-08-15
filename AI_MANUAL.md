@@ -1,6 +1,6 @@
 # 文献阅读助手插件技术手册
 
-> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.3.1`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
+> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.4.0`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
 
 ---
 
@@ -20,6 +20,8 @@
 | PdfHighlightModule | `modules/PdfHighlightModule.ts` | 文字选区持久高亮（笔记 `&selection=` 链接驱动） |
 | OcrHighlightModule | `modules/OcrHighlightModule.ts` | OCR 区域持久高亮（笔记 `&ocr=` 链接驱动，不可交互） |
 | MainArticleModule | `modules/MainArticleModule.ts` | 主文献批注汇集：开启后所有批注写入主文献笔记 |
+| PdfJumpModule | `modules/PdfJumpModule.ts` | 双向跳转：点击 PDF 高亮 → 笔记对应批注；点击笔记 PDF 链接 → PDF 对应位置（目标未打开时自动分屏） |
+| AnnotationModeModule | `modules/AnnotationModeModule.ts` | 批注原文附带模式（测试功能）：工具条「附带原文」开关，默认关闭=文字批注只写链接 |
 | SettingsTab | `modules/SettingsTab.ts` | 统一设置面板（PDF / DeepSeek / OCR 三段） |
 | BaseCropModeModule | `modules/BaseCropModeModule.ts` | 截图模式公共基类（框选交互、工具条按钮注入） |
 | HighlightBase | `modules/HighlightBase.ts` | 持久高亮公共基类（事件挂载、防抖重建、渲染调度） |
@@ -107,6 +109,8 @@
 - 写入优先经 CM6 编辑器 `replaceRange`（光标位置），无编辑器（阅读模式）回退文末追加
 - 写入后光标自动定位到「笔记：」行尾；写入失败选区自动恢复
 - 文本清洗：移除换行/控制字符/Unicode 换行符号，以及 PDF 私有区字符（U+E000–U+F8FF，无 ToUnicode 映射的字形占位符）
+
+**「附带原文」关闭时的链接-only 格式**（AnnotationModeModule 注入 `includeOriginalTextProvider`，默认关闭；测试功能，以后可能删除）：文字选中批注只写链接、无 callout、无「笔记：」提示行；插入锚点默认在笔记光标处，光标行/其后两行内存在链接-only 链接行时改在该链接之后插入（避免插进上一条批注的文字与链接之间）；链接上方留空行放光标（文字在上、链接在下）。OCR（`beginIndex<0`）与截图批注不受该开关影响。
 
 ### 4.4 `getCurrentFileForUpload(): Promise<FileUploadData | null>`
 供 DeepSeek 上传：

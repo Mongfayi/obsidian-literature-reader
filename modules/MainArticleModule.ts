@@ -23,6 +23,8 @@ export class MainArticleModule implements PluginModule {
     private mainArticlePdfPath: string | null = null;
     /** 已注入按钮的叶子 → 按钮元素 */
     private toolbarButtons = new Map<WorkspaceLeaf, HTMLElement>();
+    /** 本模块创建过的全部按钮（含多标签页下未进 map 的隐藏按钮），用于卸载清理 */
+    private createdButtons = new Set<HTMLElement>();
     /** 轮询任务移除函数（卸载时注销共享轮询） */
     private removePollTask: (() => void) | null = null;
 
@@ -74,11 +76,13 @@ export class MainArticleModule implements PluginModule {
 
         this.injectToolbarButtons();
 
-        // 卸载时统一移除所有已注入按钮（单次注册，避免每次注入都累积一个清理闭包）
+        // 卸载时统一移除所有已注入按钮（单次注册，避免每次注入都累积一个清理闭包）；
+        // 用 createdButtons 覆盖多标签页下未进 map 的隐藏按钮
         plugin.register(() => {
-            for (const btn of this.toolbarButtons.values()) {
+            for (const btn of this.createdButtons) {
                 btn.remove();
             }
+            this.createdButtons.clear();
             this.toolbarButtons.clear();
         });
     }
@@ -87,6 +91,7 @@ export class MainArticleModule implements PluginModule {
         this.removePollTask?.();
         this.removePollTask = null;
         this.toolbarButtons.clear();
+        this.createdButtons.clear();
         this.mainArticlePdfPath = null;
     }
 
@@ -129,8 +134,15 @@ export class MainArticleModule implements PluginModule {
             const pageNumberEl = toolbar.pageNumberEl as HTMLElement | undefined;
             if (!pageNumberEl || !pageNumberEl.parentElement) return;
 
-            // 以「当前工具条上是否已有按钮」为准，避免重建后重复注入
-            if (pageNumberEl.parentElement.querySelector('.pdfreader-main-article-button')) return;
+            // 以「当前工具条上是否已有按钮」为准，避免重建后重复注入。
+            // 注意：同一叶子可含多个 PDF 标签页、各自有工具条按钮；命中已有按钮时
+            // 必须把 map 重指到当前可见按钮，否则状态刷新会作用到隐藏标签页的按钮上
+            // （点击功能正常但外观不更新）
+            const existing = pageNumberEl.parentElement.querySelector<HTMLElement>('.pdfreader-main-article-button');
+            if (existing) {
+                this.toolbarButtons.set(leaf, existing);
+                return;
+            }
 
             // 工具条重建后旧按钮已脱离 DOM：清掉缓存引用，避免闭包与脏引用累积
             const stale = this.toolbarButtons.get(leaf);
@@ -152,14 +164,24 @@ export class MainArticleModule implements PluginModule {
             pageNumberEl.after(btn);
 
             this.toolbarButtons.set(leaf, btn);
+            this.createdButtons.add(btn);
             this.applyButtonState(leaf, btn);
         });
     }
 
-    /** 切换主文献 / 叶子文件切换后重算所有按钮激活态 */
+    /**
+     * 切换主文献 / 叶子文件切换后重算所有按钮激活态：
+     * 直接扫描各叶子当前可见工具条上的按钮，不依赖可能指向隐藏标签页按钮的 map。
+     */
     private refreshAllButtonStates(): void {
-        this.toolbarButtons.forEach((btn, leaf) => {
-            this.applyButtonState(leaf, btn);
+        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view.getViewType() !== 'pdf') return;
+            const viewer = (leaf.view as any).viewer;
+            const toolbar = viewer?.child?.toolbar;
+            const pageNumberEl = toolbar?.pageNumberEl as HTMLElement | undefined;
+            if (!pageNumberEl?.parentElement) return;
+            const btn = pageNumberEl.parentElement.querySelector<HTMLElement>('.pdfreader-main-article-button');
+            if (btn) this.applyButtonState(leaf, btn);
         });
     }
 

@@ -58,7 +58,7 @@ __export(main_exports, {
   default: () => LiteratureReaderPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian11 = require("obsidian");
+var import_obsidian13 = require("obsidian");
 
 // types.ts
 var DEFAULT_SETTINGS = {
@@ -26183,6 +26183,8 @@ var PdfReaderModule = class {
     this.refreshHighlights = null;
     /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
     this.redirectResolver = null;
+    /** 批注是否附带原文的模式提供者（由 AnnotationModeModule 注入；默认关闭=不附带原文） */
+    this.includeOriginalTextProvider = null;
     /** 「开始阅读」进行中的 PDF 路径（防重复点击并发执行全量文本提取与重复分屏） */
     this.startingPdfs = /* @__PURE__ */ new Set();
     this.ctx = ctx;
@@ -26194,6 +26196,10 @@ var PdfReaderModule = class {
   /** 注入批注目标笔记重定向解析器（主文献开启时批注写入主文献笔记而非源 PDF 对应笔记） */
   setRedirectResolver(cb) {
     this.redirectResolver = cb;
+  }
+  /** 注入批注原文附带模式提供者（工具栏「附带原文」切换；默认关闭=不附带原文） */
+  setIncludeOriginalTextProvider(provider) {
+    this.includeOriginalTextProvider = provider;
   }
   load() {
     const plugin = this.ctx.plugin;
@@ -26906,7 +26912,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
         this.savedSelections = selections;
         return;
       }
-      await this.appendAnnotationsToNote(noteFile, selections, pdfFile);
+      await this.appendAnnotationsToNote(noteFile, selections, pdfFile, this.shouldIncludeOriginalText());
       this.refreshHighlights?.(
         pdfFile,
         selections.filter((sel) => sel.beginIndex >= 0)
@@ -26960,7 +26966,15 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       }
     }
   }
-  async appendAnnotationsToNote(noteFile, selections, pdfFile) {
+  /** 当前文字批注是否附带原文（工具栏「附带原文」关闭时不附带，只写链接） */
+  shouldIncludeOriginalText() {
+    return this.includeOriginalTextProvider ? this.includeOriginalTextProvider() : false;
+  }
+  async appendAnnotationsToNote(noteFile, selections, pdfFile, includeOriginalText = true) {
+    if (!includeOriginalText) {
+      await this.appendLinksOnly(noteFile, selections, pdfFile);
+      return;
+    }
     const notePrompt = "> \u7B14\u8BB0\uFF1A";
     const items = selections.map((sel) => {
       const flatText = sel.text.replace(
@@ -27000,6 +27014,61 @@ ${notePrompt}`;
       await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
     }
     await this.focusNotePrompt(noteFile, notePrompt, promptLine);
+  }
+  /**
+   * 「附带原文」关闭时的批注形式（测试功能，以后可能删除）：
+   * 只写 PDF 链接（多段选中每段一行），无 callout 包围框、无「> 笔记：」提示行。
+   * 定位失败（page=null）的选区无链接可写，保留拍平文字行兜底，避免批注静默丢失。
+   * 该路径只被文字选中批注（handleAnnotation）调用；OCR / 截图批注不受影响。
+   *
+   * 写入策略：默认插入在笔记光标所在行末尾（支持从笔记中间批注，后面的内容不动）；
+   * 若光标行或其后两行内存在链接-only 批注的链接行（典型场景：光标停在上一条批注的
+   * 文字末尾或链接上方的空行），则改在该链接行之后插入，避免新链接插进上一条批注的
+   * 「批注文字」与「链接」之间。链接上方保留一个空行放光标，批注后直接输入的文字
+   * 写在链接上方（版式：文字在上、链接在下）。无编辑器时回退追加到文末。
+   */
+  async appendLinksOnly(noteFile, selections, pdfFile) {
+    const flatten = (text) => text.replace(
+      /[\r\n\u000B\u000C\u2028\u2029\u21B5\u23CE\u240D\u2424\u2937\u0000-\u0008\u000E-\u001F\u007F-\u009F\uE000-\uF8FF]/g,
+      ""
+    );
+    const lines = selections.map((sel) => {
+      if (sel.page === null) {
+        return flatten(sel.text);
+      }
+      if (sel.beginIndex < 0) {
+        return `[[${pdfFile.path}#page=${sel.page}|${pdfFile.basename}, \u9875\u9762 ${sel.page}]]`;
+      }
+      const selectionParam = `${sel.beginIndex},${sel.beginOffset},${sel.endIndex},${sel.endOffset}`;
+      return `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${pdfFile.basename}, \u9875\u9762 ${sel.page}]]`;
+    });
+    if (lines.length === 0)
+      return;
+    const cursorPos = this.getNoteCursorEditorPos(noteFile);
+    if (cursorPos) {
+      const editor = cursorPos.editor;
+      const lastLine = editor.lastLine();
+      const linkLineRegex = /^\[\[[^\]]*#page=\d+[^\]]*\]\]$/;
+      const isLinkLine = (line) => line >= 0 && line <= lastLine && linkLineRegex.test(editor.getLine(line));
+      let anchor = cursorPos.line;
+      for (let i = 0; i < 3; i++) {
+        if (isLinkLine(anchor + i)) {
+          anchor = anchor + i;
+          break;
+        }
+      }
+      const anchorText = editor.getLine(anchor);
+      const prefix = anchorText.length === 0 ? "\n" : "\n\n";
+      const annotation = prefix + lines.join("\n") + "\n";
+      editor.replaceRange(annotation, { line: anchor, ch: anchorText.length });
+      const firstLinkLine = anchor + (anchorText.length === 0 ? 1 : 2);
+      editor.setCursor({ line: firstLinkLine - 1, ch: 0 });
+    } else {
+      await this.ctx.plugin.app.vault.process(noteFile, (data) => {
+        const endsWithNewline = data.endsWith("\n");
+        return data + (endsWithNewline ? "\n" : "\n\n") + lines.join("\n") + "\n";
+      });
+    }
   }
   /**
    * 聚焦笔记中刚写入批注的提示行（如「> 笔记：」）。
@@ -27726,7 +27795,7 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
         pageGeom
       );
       for (const rect of rects) {
-        this.placeRectInPage(rect, pageView, layerEl);
+        this.placeRectInPage(rect, pageView, layerEl, pageNumber, selectionStr);
       }
     }
   }
@@ -27863,8 +27932,9 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
   /**
    * 将 PDF 坐标矩形放置到页面的高亮层中（百分比定位，Y 轴翻转）。
    * rect: [left, bottom, right, top]（PDF 坐标，Y 向上）
+   * 附带 data-pdf-jump-* 属性供 PdfJumpModule 识别点击目标（跳回笔记对应批注）。
    */
-  placeRectInPage(rect, pageView, layerEl) {
+  placeRectInPage(rect, pageView, layerEl, pageNumber, selectionStr) {
     const viewBox = pageView.pdfPage?.view;
     if (!viewBox || viewBox.length < 4)
       return;
@@ -27875,6 +27945,8 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
     if (!pageWidth || !pageHeight)
       return;
     const rectEl = layerEl.createDiv("pdf-reader-selection-highlight");
+    rectEl.setAttr("data-pdf-jump-page", String(pageNumber));
+    rectEl.setAttr("data-pdf-jump-selection", selectionStr);
     rectEl.setCssStyles({
       left: `${100 * (rect[0] - pageX) / pageWidth}%`,
       top: `${100 * (viewBox[3] - rect[3] + viewBox[1] - pageY) / pageHeight}%`,
@@ -27970,8 +28042,12 @@ var BaseCropModeModule = class {
       const pageNumberEl = toolbar.pageNumberEl;
       if (!pageNumberEl || !pageNumberEl.parentElement)
         return;
-      if (pageNumberEl.parentElement.querySelector("." + this.buttonClass))
+      const existing = pageNumberEl.parentElement.querySelector("." + this.buttonClass);
+      if (existing) {
+        this.cropButtons.set(leaf, existing);
+        this.toolbarLeaves.add(leaf);
         return;
+      }
       const stale = this.cropButtons.get(leaf);
       if (stale && !stale.isConnected) {
         stale.remove();
@@ -27985,6 +28061,7 @@ var BaseCropModeModule = class {
       (0, import_obsidian4.setTooltip)(btn, this.buttonTooltip);
       btn.addEventListener("click", (evt) => {
         evt.stopPropagation();
+        this.cropButtons.set(leaf, btn);
         this.startCropMode(leaf);
       });
       pageNumberEl.after(btn);
@@ -28910,6 +28987,8 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
     const layerEl = pageDiv.createDiv("ocr-highlight-layer");
     for (const h of pageMap.values()) {
       const rectEl = layerEl.createDiv("ocr-crop-highlight");
+      rectEl.setAttr("data-pdf-jump-page", String(pageNumber));
+      rectEl.setAttr("data-pdf-jump-ocr", rectKey({ x: h.nx, y: h.ny, w: h.nw, h: h.nh }));
       Object.assign(rectEl.style, {
         left: `${(h.nx * 100).toFixed(3)}%`,
         top: `${(h.ny * 100).toFixed(3)}%`,
@@ -28931,6 +29010,8 @@ var MainArticleModule = class {
     this.mainArticlePdfPath = null;
     /** 已注入按钮的叶子 → 按钮元素 */
     this.toolbarButtons = /* @__PURE__ */ new Map();
+    /** 本模块创建过的全部按钮（含多标签页下未进 map 的隐藏按钮），用于卸载清理 */
+    this.createdButtons = /* @__PURE__ */ new Set();
     /** 轮询任务移除函数（卸载时注销共享轮询） */
     this.removePollTask = null;
     this.ctx = ctx;
@@ -28973,9 +29054,10 @@ var MainArticleModule = class {
     });
     this.injectToolbarButtons();
     plugin.register(() => {
-      for (const btn of this.toolbarButtons.values()) {
+      for (const btn of this.createdButtons) {
         btn.remove();
       }
+      this.createdButtons.clear();
       this.toolbarButtons.clear();
     });
   }
@@ -28983,6 +29065,7 @@ var MainArticleModule = class {
     this.removePollTask?.();
     this.removePollTask = null;
     this.toolbarButtons.clear();
+    this.createdButtons.clear();
     this.mainArticlePdfPath = null;
   }
   // ========== 主文献状态 ==========
@@ -29020,8 +29103,11 @@ var MainArticleModule = class {
       const pageNumberEl = toolbar.pageNumberEl;
       if (!pageNumberEl || !pageNumberEl.parentElement)
         return;
-      if (pageNumberEl.parentElement.querySelector(".pdfreader-main-article-button"))
+      const existing = pageNumberEl.parentElement.querySelector(".pdfreader-main-article-button");
+      if (existing) {
+        this.toolbarButtons.set(leaf, existing);
         return;
+      }
       const stale = this.toolbarButtons.get(leaf);
       if (stale && !stale.isConnected) {
         stale.remove();
@@ -29039,13 +29125,26 @@ var MainArticleModule = class {
       });
       pageNumberEl.after(btn);
       this.toolbarButtons.set(leaf, btn);
+      this.createdButtons.add(btn);
       this.applyButtonState(leaf, btn);
     });
   }
-  /** 切换主文献 / 叶子文件切换后重算所有按钮激活态 */
+  /**
+   * 切换主文献 / 叶子文件切换后重算所有按钮激活态：
+   * 直接扫描各叶子当前可见工具条上的按钮，不依赖可能指向隐藏标签页按钮的 map。
+   */
   refreshAllButtonStates() {
-    this.toolbarButtons.forEach((btn, leaf) => {
-      this.applyButtonState(leaf, btn);
+    this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view.getViewType() !== "pdf")
+        return;
+      const viewer = leaf.view.viewer;
+      const toolbar = viewer?.child?.toolbar;
+      const pageNumberEl = toolbar?.pageNumberEl;
+      if (!pageNumberEl?.parentElement)
+        return;
+      const btn = pageNumberEl.parentElement.querySelector(".pdfreader-main-article-button");
+      if (btn)
+        this.applyButtonState(leaf, btn);
     });
   }
   /** 按「该叶子当前 PDF 是否为主文献」切换激活态与提示文案 */
@@ -29061,9 +29160,624 @@ var MainArticleModule = class {
   }
 };
 
-// modules/SettingsTab.ts
+// modules/AnnotationModeModule.ts
 var import_obsidian10 = require("obsidian");
-var UnifiedSettingTab = class extends import_obsidian10.PluginSettingTab {
+var AnnotationModeModule = class {
+  constructor(ctx, pdfModule) {
+    /** 「附带原文」开关：true = 批注附带原文；false（默认）= 批注只写链接 */
+    this.includeOriginalText = false;
+    /** 已注入按钮的叶子 → 按钮元素 */
+    this.toolbarButtons = /* @__PURE__ */ new Map();
+    /** 本模块创建过的全部按钮（含多标签页下未进 map 的隐藏按钮），用于卸载清理 */
+    this.createdButtons = /* @__PURE__ */ new Set();
+    /** 轮询任务移除函数（卸载时注销共享轮询） */
+    this.removePollTask = null;
+    this.ctx = ctx;
+    this.pdfModule = pdfModule;
+  }
+  load() {
+    const plugin = this.ctx.plugin;
+    this.pdfModule.setIncludeOriginalTextProvider(() => this.includeOriginalText);
+    plugin.registerEvent(
+      plugin.app.workspace.on("layout-change", () => {
+        this.injectToolbarButtons();
+        this.refreshAllButtonStates();
+      })
+    );
+    plugin.registerEvent(
+      plugin.app.workspace.on("active-leaf-change", () => {
+        this.injectToolbarButtons();
+        this.refreshAllButtonStates();
+      })
+    );
+    this.removePollTask = toolbarPoller.add(() => {
+      this.injectToolbarButtons();
+      this.refreshAllButtonStates();
+    });
+    toolbarPoller.start();
+    plugin.addCommand({
+      id: "toggle-include-original-text",
+      name: "\u5207\u6362\u300C\u9644\u5E26\u539F\u6587\u300D\u6279\u6CE8\u6A21\u5F0F\uFF08\u9ED8\u8BA4\u5173\u95ED\uFF1B\u5173\u95ED\u65F6\u6279\u6CE8\u53EA\u5199 PDF \u94FE\u63A5\uFF09",
+      checkCallback: (checking) => {
+        const leaf = plugin.app.workspace.activeLeaf;
+        if (!leaf || leaf.view.getViewType() !== "pdf")
+          return false;
+        if (!checking)
+          this.toggleMode();
+        return true;
+      }
+    });
+    this.injectToolbarButtons();
+    plugin.register(() => {
+      for (const btn of this.createdButtons) {
+        btn.remove();
+      }
+      this.createdButtons.clear();
+      this.toolbarButtons.clear();
+    });
+  }
+  unload() {
+    this.removePollTask?.();
+    this.removePollTask = null;
+    this.toolbarButtons.clear();
+    this.createdButtons.clear();
+    this.includeOriginalText = false;
+  }
+  // ========== 模式状态 ==========
+  /** 切换「附带原文」开关并刷新所有按钮激活态 */
+  toggleMode() {
+    this.includeOriginalText = !this.includeOriginalText;
+    this.refreshAllButtonStates();
+  }
+  // ========== 工具条按钮 ==========
+  injectToolbarButtons() {
+    pruneStaleLeaves(this.ctx.plugin.app, this.toolbarButtons);
+    this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view.getViewType() !== "pdf")
+        return;
+      const viewer = leaf.view.viewer;
+      const toolbar = viewer?.child?.toolbar;
+      if (!toolbar)
+        return;
+      const pageNumberEl = toolbar.pageNumberEl;
+      if (!pageNumberEl || !pageNumberEl.parentElement)
+        return;
+      const existing = pageNumberEl.parentElement.querySelector(".pdfreader-annotation-mode-button");
+      if (existing) {
+        this.toolbarButtons.set(leaf, existing);
+        return;
+      }
+      const stale = this.toolbarButtons.get(leaf);
+      if (stale && !stale.isConnected) {
+        stale.remove();
+        this.toolbarButtons.delete(leaf);
+      }
+      const btn = document.createElement("div");
+      btn.addClass("clickable-icon");
+      btn.addClass("pdfreader-annotation-mode-button");
+      (0, import_obsidian10.setIcon)(btn, "link");
+      btn.createSpan({ text: "\u9644\u5E26\u539F\u6587" });
+      btn.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        this.toggleMode();
+      });
+      pageNumberEl.after(btn);
+      this.toolbarButtons.set(leaf, btn);
+      this.createdButtons.add(btn);
+      this.applyButtonState(btn);
+    });
+  }
+  /**
+   * 重算所有按钮激活态（开关切换 / 工具条重建后）：
+   * 直接扫描各叶子当前可见工具条上的按钮，不依赖可能指向隐藏标签页按钮的 map。
+   */
+  refreshAllButtonStates() {
+    this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view.getViewType() !== "pdf")
+        return;
+      const viewer = leaf.view.viewer;
+      const toolbar = viewer?.child?.toolbar;
+      const pageNumberEl = toolbar?.pageNumberEl;
+      if (!pageNumberEl?.parentElement)
+        return;
+      const btn = pageNumberEl.parentElement.querySelector(".pdfreader-annotation-mode-button");
+      if (btn)
+        this.applyButtonState(btn);
+    });
+  }
+  /** 按当前开关切换激活态与提示文案 */
+  applyButtonState(btn) {
+    const on = this.includeOriginalText;
+    btn.toggleClass("is-active", on);
+    if (on) {
+      (0, import_obsidian10.setTooltip)(btn, "\u9644\u5E26\u539F\u6587\u5DF2\u5F00\u542F\uFF08\u70B9\u51FB\u5173\u95ED\uFF09\n\u6279\u6CE8\u5C06\u5305\u542B\u539F\u6587\u6587\u5B57");
+    } else {
+      (0, import_obsidian10.setTooltip)(btn, "\u9644\u5E26\u539F\u6587\u5DF2\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF0C\u70B9\u51FB\u5F00\u542F\uFF09\n\u6279\u6CE8\u53EA\u5199 PDF \u94FE\u63A5\uFF0C\u4E0D\u9644\u5E26\u539F\u6587");
+    }
+  }
+};
+
+// modules/PdfJumpModule.ts
+var import_obsidian11 = require("obsidian");
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var PdfJumpModule = class {
+  constructor(ctx) {
+    /** pdfPath → 跳转索引 */
+    this.indexCache = /* @__PURE__ */ new Map();
+    /** 索引重建防抖定时器 */
+    this.rebuildTimer = null;
+    /** 防抖窗口内待重建的 PDF：'full' = 全量，string[] = 局部路径集，null = 无待办 */
+    this.pendingRebuild = null;
+    // ========== 笔记链接 → PDF ==========
+    /**
+     * 笔记链接点击拦截（document 捕获阶段）：
+     *  - 阅读模式/渲染视图：`a.internal-link` 的 data-href 含完整链接目标（path#subpath）
+     *  - Live Preview：经编辑器内部 token API 取点击位置的链接文本
+     * 仅接管目标为 PDF 的链接；Mod/右键等交还 Obsidian 默认行为。
+     */
+    this.handleNoteLinkClick = (evt) => {
+      if (evt.button !== 0)
+        return;
+      if (evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey)
+        return;
+      const target = evt.target;
+      if (!target || !(target instanceof Element))
+        return;
+      let linktext = null;
+      let sourcePath = "";
+      const anchor = target.closest("a.internal-link");
+      if (anchor) {
+        linktext = anchor.getAttribute("data-href") ?? anchor.getAttribute("href") ?? "";
+        const leaf = this.findLeafContaining(anchor);
+        sourcePath = leaf?.view instanceof import_obsidian11.MarkdownView ? leaf.view.file?.path ?? "" : this.ctx.plugin.app.workspace.getActiveFile()?.path ?? "";
+      } else {
+        const inEditorLink = target.closest(".cm-hmd-internal-link, .cm-link");
+        if (!inEditorLink)
+          return;
+        const leaf = this.findLeafContaining(target);
+        if (!leaf || !(leaf.view instanceof import_obsidian11.MarkdownView))
+          return;
+        const editMode = leaf.view.editMode;
+        if (editMode?.sourceMode)
+          return;
+        const editor = leaf.view.editor;
+        if (!editor || typeof editor.getClickableTokenAt !== "function")
+          return;
+        try {
+          const pos = editor.posAtMouse(evt);
+          const token = pos != null ? editor.getClickableTokenAt(pos) : null;
+          if (!token || token.type !== "internal-link")
+            return;
+          linktext = token.text;
+          sourcePath = leaf.view.file?.path ?? "";
+        } catch (e) {
+          console.warn("[PdfJump] \u8BFB\u53D6\u7F16\u8F91\u5668\u94FE\u63A5 token \u5931\u8D25:", e);
+          return;
+        }
+      }
+      if (!linktext)
+        return;
+      const hashIdx = linktext.indexOf("#");
+      const pathPart = (hashIdx >= 0 ? linktext.slice(0, hashIdx) : linktext).trim();
+      const fragment = hashIdx >= 0 ? linktext.slice(hashIdx) : "";
+      const pdfFile = this.ctx.plugin.app.metadataCache.getFirstLinkpathDest(pathPart, sourcePath);
+      if (!(pdfFile instanceof import_obsidian11.TFile) || pdfFile.extension !== "pdf")
+        return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      evt.stopImmediatePropagation();
+      const sourceLeaf = this.findLeafContaining(target) ?? this.ctx.plugin.app.workspace.activeLeaf;
+      this.jumpToPdf(pdfFile, fragment, sourceLeaf);
+    };
+    // ========== PDF 高亮 → 笔记 ==========
+    /**
+     * PDF 高亮点击（document 冒泡阶段委托）：
+     * 高亮矩形（文本选区 / OCR 区域）带 data-pdf-jump-page 与
+     * data-pdf-jump-selection / data-pdf-jump-ocr 属性，点击后经索引
+     * 找到笔记中的批注位置并跳转；多个笔记命中时弹出菜单选择。
+     */
+    this.handleHighlightClick = (evt) => {
+      if (evt.button !== 0)
+        return;
+      if (evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey)
+        return;
+      const target = evt.target;
+      if (!target || !(target instanceof Element))
+        return;
+      const jumpEl = target.closest("[data-pdf-jump-page]");
+      if (!jumpEl)
+        return;
+      const leaf = this.findLeafContaining(jumpEl);
+      if (!leaf || leaf.view.getViewType() !== "pdf")
+        return;
+      const pdfFile = leaf.view.file;
+      if (!pdfFile)
+        return;
+      const page = parseInt(jumpEl.getAttribute("data-pdf-jump-page") || "", 10);
+      const sel = jumpEl.getAttribute("data-pdf-jump-selection");
+      const ocr = jumpEl.getAttribute("data-pdf-jump-ocr");
+      const key = sel ? `s:${sel}` : ocr ? `o:${this.normalizeOcrKey(ocr)}` : null;
+      if (!Number.isInteger(page) || !key)
+        return;
+      const occurrences = this.indexCache.get(pdfFile.path)?.get(page)?.get(key);
+      if (!occurrences || occurrences.length === 0) {
+        new import_obsidian11.Notice("\u672A\u5728\u7B14\u8BB0\u4E2D\u627E\u5230\u5BF9\u5E94\u7684\u6279\u6CE8\u94FE\u63A5");
+        return;
+      }
+      const byNote = /* @__PURE__ */ new Map();
+      for (const occ of occurrences) {
+        if (!byNote.has(occ.notePath))
+          byNote.set(occ.notePath, occ);
+      }
+      const notes = [...byNote.values()];
+      if (notes.length === 1) {
+        this.jumpToNoteOccurrence(pdfFile, leaf, notes[0]);
+      } else {
+        const menu = new import_obsidian11.Menu();
+        for (const occ of notes) {
+          const noteFile = this.ctx.plugin.app.vault.getAbstractFileByPath(occ.notePath);
+          menu.addItem(
+            (item) => item.setTitle(noteFile instanceof import_obsidian11.TFile ? noteFile.basename : occ.notePath).onClick(() => this.jumpToNoteOccurrence(pdfFile, leaf, occ))
+          );
+        }
+        menu.showAtMouseEvent(evt);
+      }
+    };
+    this.ctx = ctx;
+  }
+  load() {
+    const app = this.ctx.plugin.app;
+    this.ctx.plugin.registerEvent(
+      app.workspace.on("file-open", (file) => {
+        if (file && file.extension === "pdf") {
+          this.scheduleRebuildForPdfs([file.path]);
+        }
+      })
+    );
+    this.ctx.plugin.registerEvent(
+      app.metadataCache.on("changed", (file) => {
+        const links = app.metadataCache.resolvedLinks[file.path];
+        if (!links)
+          return;
+        const affected = Object.keys(links).filter((t) => t.endsWith(".pdf"));
+        if (affected.length > 0) {
+          this.scheduleRebuildForPdfs(affected);
+        }
+      })
+    );
+    this.ctx.plugin.registerEvent(
+      app.metadataCache.on("deleted", () => this.scheduleRebuild())
+    );
+    this.ctx.plugin.registerEvent(
+      app.vault.on("rename", () => this.scheduleRebuild())
+    );
+    this.ctx.plugin.registerDomEvent(document, "click", this.handleNoteLinkClick, true);
+    this.ctx.plugin.registerDomEvent(document, "click", this.handleHighlightClick);
+    this.scheduleRebuild();
+  }
+  unload() {
+    this.indexCache.clear();
+    this.pendingRebuild = null;
+    if (this.rebuildTimer !== null) {
+      window.clearTimeout(this.rebuildTimer);
+      this.rebuildTimer = null;
+    }
+  }
+  // ========== 索引维护 ==========
+  /** 全部重建（删除/重命名等路径级变更） */
+  scheduleRebuild() {
+    this.scheduleTimer("full");
+  }
+  /** 精确重建指定 PDF（笔记编辑的常规路径），防抖合并 */
+  scheduleRebuildForPdfs(pdfPaths) {
+    if (pdfPaths.length === 0)
+      return;
+    this.scheduleTimer(pdfPaths);
+  }
+  scheduleTimer(request) {
+    if (this.rebuildTimer !== null)
+      window.clearTimeout(this.rebuildTimer);
+    if (request === "full" || this.pendingRebuild === "full") {
+      this.pendingRebuild = "full";
+    } else if (this.pendingRebuild === null) {
+      this.pendingRebuild = request;
+    } else {
+      this.pendingRebuild = [.../* @__PURE__ */ new Set([...this.pendingRebuild, ...request])];
+    }
+    this.rebuildTimer = window.setTimeout(() => {
+      this.rebuildTimer = null;
+      const pending = this.pendingRebuild;
+      this.pendingRebuild = null;
+      if (pending === "full" || !pending) {
+        this.rebuildAllIndexes();
+      } else {
+        this.rebuildIndexes(pending);
+      }
+    }, 300);
+  }
+  async rebuildAllIndexes() {
+    const paths = /* @__PURE__ */ new Set();
+    this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view.getViewType() === "pdf") {
+        const file = leaf.view.file;
+        if (file)
+          paths.add(file.path);
+      }
+    });
+    for (const path of paths) {
+      await this.rebuildIndex(path);
+    }
+    for (const path of [...this.indexCache.keys()]) {
+      if (!paths.has(path) && !this.ctx.plugin.app.vault.getAbstractFileByPath(path)) {
+        this.indexCache.delete(path);
+      }
+    }
+  }
+  async rebuildIndexes(pdfPaths) {
+    for (const path of pdfPaths) {
+      await this.rebuildIndex(path);
+    }
+  }
+  /**
+   * 重建单个 PDF 的跳转索引。
+   * metadataCache 不记录指向 PDF 的正文链接，因此通过 resolvedLinks 反查
+   * 链接到该 PDF 的笔记，再读取笔记原文提取带页码/锚点的链接并记录行号。
+   */
+  async rebuildIndex(pdfPath) {
+    const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
+    if (!(pdfFile instanceof import_obsidian11.TFile))
+      return;
+    const newIndex = /* @__PURE__ */ new Map();
+    const app = this.ctx.plugin.app;
+    for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
+      if (!links[pdfPath])
+        continue;
+      const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
+      if (!(sourceFile instanceof import_obsidian11.TFile))
+        continue;
+      try {
+        const content = await this.readNoteContent(sourceFile);
+        this.extractOccurrences(content, pdfFile, sourcePath, newIndex);
+      } catch (e) {
+        console.warn("[PdfJump] \u8BFB\u53D6\u7B14\u8BB0\u5931\u8D25:", sourcePath, e);
+      }
+    }
+    this.indexCache.set(pdfPath, newIndex);
+  }
+  /** 从笔记原文提取指向指定 PDF 的批注链接并写入索引 */
+  extractOccurrences(content, pdfFile, sourcePath, index) {
+    const app = this.ctx.plugin.app;
+    const selRegex = /\[\[([^\]#|]+?)#page=(\d+)&selection=([\d,\s-]+)/g;
+    const ocrRegex = /\[\[([^\]#|]+?)#page=(\d+)&ocr=([\d.,\s-]+?)(?:\|[^\]]*)?\]\]/g;
+    this.scanMatches(content, selRegex, pdfFile, sourcePath, index, (m) => {
+      const sel = this.normalizeSelectionKey(m[3]);
+      if (!sel)
+        return null;
+      const linktext = `${m[1].trim()}#page=${m[2]}&selection=${sel}`;
+      return { page: parseInt(m[2], 10), key: `s:${sel}`, linktext };
+    });
+    this.scanMatches(content, ocrRegex, pdfFile, sourcePath, index, (m) => {
+      const ocr = this.normalizeOcrKey(m[3]);
+      if (!ocr)
+        return null;
+      const linktext = `${m[1].trim()}#page=${m[2]}&ocr=${ocr}`;
+      return { page: parseInt(m[2], 10), key: `o:${ocr}`, linktext };
+    });
+  }
+  /** 通用扫描：解析链接、校验目标 PDF、计算行/列并写入索引 */
+  scanMatches(content, regex, pdfFile, sourcePath, index, makeEntry) {
+    const app = this.ctx.plugin.app;
+    let m;
+    while ((m = regex.exec(content)) !== null) {
+      const linkpath = m[1].trim();
+      const target = app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+      if (target !== pdfFile)
+        continue;
+      const entry = makeEntry(m);
+      if (!entry || !Number.isInteger(entry.page))
+        continue;
+      const line = content.slice(0, m.index).split("\n").length - 1;
+      const lineStart = content.lastIndexOf("\n", m.index - 1) + 1;
+      const ch = m.index - lineStart;
+      const pageIndex = index.get(entry.page) ?? /* @__PURE__ */ new Map();
+      const list = pageIndex.get(entry.key) ?? [];
+      list.push({ notePath: sourcePath, line, ch, linktext: entry.linktext });
+      pageIndex.set(entry.key, list);
+      index.set(entry.page, pageIndex);
+    }
+  }
+  /** 读取笔记内容：优先打开中的编辑器缓冲（仅编辑模式，缓冲与磁盘一致），其次磁盘 */
+  async readNoteContent(sourceFile) {
+    const app = this.ctx.plugin.app;
+    let editorContent = null;
+    app.workspace.getLeavesOfType("markdown").forEach((leaf) => {
+      if (editorContent !== null)
+        return;
+      const view = leaf.view;
+      if (view.file?.path === sourceFile.path && view.getMode() === "source" && view.editor) {
+        editorContent = view.editor.getValue();
+      }
+    });
+    if (editorContent !== null)
+      return editorContent;
+    return await app.vault.read(sourceFile);
+  }
+  /**
+   * 跳转到 PDF 的指定位置：
+   *  - PDF 已打开 → 聚焦现有叶子并应用 subpath（原生页码/选区高亮）
+   *  - 未打开 → 在来源叶子（笔记）的左侧分屏打开
+   *  - 打开后轮询持久高亮层，滚动到具体锚点并闪烁提示
+   */
+  async jumpToPdf(pdfFile, fragment, sourceLeaf) {
+    const app = this.ctx.plugin.app;
+    const existingLeaf = this.findLeafByPath(pdfFile.path);
+    let leaf;
+    if (existingLeaf) {
+      leaf = existingLeaf;
+    } else if (sourceLeaf) {
+      leaf = app.workspace.createLeafBySplit(sourceLeaf, "vertical", true);
+    } else {
+      leaf = app.workspace.getLeaf(false);
+    }
+    app.workspace.setActiveLeaf(leaf, { focus: true });
+    await leaf.openFile(pdfFile, { eState: { subpath: fragment }, active: true });
+    const parsed = this.parseFragment(fragment);
+    if (parsed) {
+      this.scrollToPdfAnchor(leaf, parsed);
+    }
+  }
+  /** 解析 #page=N&selection=… / #page=N&ocr=… 片段 */
+  parseFragment(fragment) {
+    const m = fragment.match(/^#page=(\d+)(?:&(selection|ocr)=([\d.,\s-]+))?/);
+    if (!m)
+      return null;
+    const page = parseInt(m[1], 10);
+    if (!Number.isInteger(page))
+      return null;
+    let key = null;
+    if (m[2] === "selection") {
+      const sel = this.normalizeSelectionKey(m[3] ?? "");
+      if (!sel)
+        return null;
+      key = `s:${sel}`;
+    } else if (m[2] === "ocr") {
+      const ocr = this.normalizeOcrKey(m[3] ?? "");
+      if (!ocr)
+        return null;
+      key = `o:${ocr}`;
+    }
+    return { page, key };
+  }
+  /**
+   * 等待目标页面的持久高亮渲染后滚动到锚点并闪烁提示。
+   * 轮询 8 秒：PDF 首次打开时索引/高亮层需要时间构建。
+   */
+  async scrollToPdfAnchor(leaf, parsed) {
+    if (!parsed.key)
+      return;
+    const selAttr = parsed.key.startsWith("s:") ? parsed.key.slice(2) : null;
+    const ocrAttr = parsed.key.startsWith("o:") ? parsed.key.slice(2) : null;
+    const deadline = Date.now() + 8e3;
+    while (Date.now() < deadline) {
+      if (leaf.view.getViewType() !== "pdf")
+        return;
+      const pageEl = leaf.view.containerEl.querySelector(
+        `[data-page-number="${parsed.page}"]`
+      );
+      const targetEl = pageEl?.querySelector(
+        selAttr ? `[data-pdf-jump-selection="${selAttr}"]` : ocrAttr ? `[data-pdf-jump-ocr="${ocrAttr}"]` : ""
+      ) ?? null;
+      if (targetEl) {
+        targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+        this.flashElement(targetEl);
+        return;
+      }
+      await sleep(120);
+    }
+  }
+  /** 跳转到笔记中的批注位置：未打开时在 PDF 叶子右侧分屏打开 */
+  async jumpToNoteOccurrence(pdfFile, pdfLeaf, occ) {
+    const app = this.ctx.plugin.app;
+    const noteFile = app.vault.getAbstractFileByPath(occ.notePath);
+    if (!(noteFile instanceof import_obsidian11.TFile))
+      return;
+    let noteLeaf = this.findLeafByPath(occ.notePath);
+    if (!noteLeaf) {
+      noteLeaf = app.workspace.createLeafBySplit(pdfLeaf, "vertical", false);
+      await noteLeaf.openFile(noteFile);
+    }
+    app.workspace.setActiveLeaf(noteLeaf, { focus: true });
+    await this.scrollNoteToOccurrence(noteLeaf, occ);
+  }
+  /** 滚动笔记到批注行：编辑模式经编辑器，阅读模式定位渲染出的链接锚点 */
+  async scrollNoteToOccurrence(noteLeaf, occ) {
+    const view = noteLeaf.view;
+    if (!(view instanceof import_obsidian11.MarkdownView))
+      return;
+    const editor = view.getMode() === "source" ? view.editor : null;
+    if (editor) {
+      for (let i = 0; i < 30 && editor.lastLine() < occ.line; i++) {
+        await sleep(100);
+      }
+      if (editor.lastLine() >= occ.line) {
+        const lineText = editor.getLine(occ.line);
+        editor.setCursor({ line: occ.line, ch: Math.min(occ.ch, lineText.length) });
+        editor.scrollIntoView(
+          { from: { line: occ.line, ch: 0 }, to: { line: occ.line, ch: 1 } },
+          true
+        );
+        editor.focus();
+      }
+      return;
+    }
+    const container = view.previewMode?.containerEl ?? view.contentEl;
+    for (let i = 0; i < 30; i++) {
+      const el = this.findRenderedNoteLink(container, occ);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        this.flashElement(el.closest(".callout") ?? el);
+        return;
+      }
+      await sleep(100);
+    }
+  }
+  /** 在阅读模式渲染内容中查找与批注链接匹配的锚点 */
+  findRenderedNoteLink(container, occ) {
+    const expect = occ.linktext.replace(/\s+/g, "");
+    const anchors = container.querySelectorAll("a.internal-link");
+    for (const a of Array.from(anchors)) {
+      const href = a.getAttribute("data-href") ?? a.getAttribute("href") ?? "";
+      if (href.split("|")[0].replace(/\s+/g, "") === expect) {
+        return a;
+      }
+    }
+    return null;
+  }
+  // ========== 工具 ==========
+  /** 选区 key 规范化：parseInt 后拼接，与高亮层 data-pdf-jump-selection 一致 */
+  normalizeSelectionKey(s) {
+    const parts = s.split(",").map((p) => parseInt(p.trim(), 10));
+    if (parts.length !== 4 || parts.some((p) => Number.isNaN(p)))
+      return "";
+    return parts.join(",");
+  }
+  /** OCR 矩形 key 规范化：4 位小数去尾零，与笔记写入的 fmtRectNum 及高亮层一致 */
+  normalizeOcrKey(s) {
+    const parts = s.split(",").map((p) => Number(Number(p.trim()).toFixed(4)));
+    if (parts.length !== 4 || parts.some((p) => Number.isNaN(p)))
+      return "";
+    return parts.join(",");
+  }
+  /** 闪烁提示元素 */
+  flashElement(el) {
+    el.addClass("pdf-reader-jump-flash");
+    window.setTimeout(() => el.removeClass("pdf-reader-jump-flash"), 2400);
+  }
+  /** 查找包含指定节点的叶子 */
+  findLeafContaining(node) {
+    let result = null;
+    this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+      if (!result && leaf.view.containerEl.contains(node)) {
+        result = leaf;
+      }
+    });
+    return result;
+  }
+  /** 查找已打开指定文件的叶子 */
+  findLeafByPath(path) {
+    let result = null;
+    this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+      if (!result && leaf.view instanceof import_obsidian11.FileView && leaf.view.file?.path === path) {
+        result = leaf;
+      }
+    });
+    return result;
+  }
+};
+
+// modules/SettingsTab.ts
+var import_obsidian12 = require("obsidian");
+var UnifiedSettingTab = class extends import_obsidian12.PluginSettingTab {
   constructor(app, plugin, getSettings, saveSettings) {
     super(app, plugin);
     /** 防抖保存定时器（连续输入时避免每字符一次全量写盘） */
@@ -29097,60 +29811,60 @@ var UnifiedSettingTab = class extends import_obsidian10.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "PDF \u9605\u8BFB\u8BBE\u7F6E" });
-    new import_obsidian10.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939").setDesc("\u65B0\u521B\u5EFA\u7684\u9605\u8BFB\u7B14\u8BB0\u5C06\u5B58\u653E\u5728\u6B64\u6587\u4EF6\u5939\u4E2D\uFF08\u76F8\u5BF9 vault \u6839\u76EE\u5F55\uFF09").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.readingNoteFolder).setValue(this.getSettings().readingNoteFolder).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939").setDesc("\u65B0\u521B\u5EFA\u7684\u9605\u8BFB\u7B14\u8BB0\u5C06\u5B58\u653E\u5728\u6B64\u6587\u4EF6\u5939\u4E2D\uFF08\u76F8\u5BF9 vault \u6839\u76EE\u5F55\uFF09").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.readingNoteFolder).setValue(this.getSettings().readingNoteFolder).onChange(async (value) => {
       this.getSettings().readingNoteFolder = value.trim() || DEFAULT_SETTINGS.readingNoteFolder;
       this.scheduleSave();
     }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "DeepSeek \u6D6E\u52A8\u7A97\u53E3\u8BBE\u7F6E" });
-    new import_obsidian10.Setting(containerEl).setName("DeepSeek URL").setDesc("\u5D4C\u5165\u6D6E\u52A8\u7A97\u53E3\u7684 DeepSeek \u7F51\u9875\u5730\u5740\uFF0C\u4FEE\u6539\u540E\u9700\u91CD\u542F\u63D2\u4EF6\u6216\u91CD\u65B0\u6253\u5F00\u7A97\u53E3\u751F\u6548").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.deepseekUrl).setValue(this.getSettings().deepseekUrl).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("DeepSeek URL").setDesc("\u5D4C\u5165\u6D6E\u52A8\u7A97\u53E3\u7684 DeepSeek \u7F51\u9875\u5730\u5740\uFF0C\u4FEE\u6539\u540E\u9700\u91CD\u542F\u63D2\u4EF6\u6216\u91CD\u65B0\u6253\u5F00\u7A97\u53E3\u751F\u6548").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.deepseekUrl).setValue(this.getSettings().deepseekUrl).onChange(async (value) => {
       this.getSettings().deepseekUrl = value || DEFAULT_SETTINGS.deepseekUrl;
       this.scheduleSave();
     }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "\u622A\u56FE OCR \u6279\u6CE8\u8BBE\u7F6E" });
-    new import_obsidian10.Setting(containerEl).setName("LM Studio \u670D\u52A1\u5668\u5730\u5740").setDesc("OpenAI \u517C\u5BB9\u63A5\u53E3\u5730\u5740\uFF0C\u9700\u5148\u542F\u52A8 LM Studio \u5E76\u52A0\u8F7D\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl).setValue(this.getSettings().ocrServerUrl).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("LM Studio \u670D\u52A1\u5668\u5730\u5740").setDesc("OpenAI \u517C\u5BB9\u63A5\u53E3\u5730\u5740\uFF0C\u9700\u5148\u542F\u52A8 LM Studio \u5E76\u52A0\u8F7D\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl).setValue(this.getSettings().ocrServerUrl).onChange(async (value) => {
       this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
       this.scheduleSave();
     }));
-    new import_obsidian10.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
+    new import_obsidian12.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("sk-lm-...").setValue(this.getSettings().ocrApiKey).onChange(async (value) => {
         this.getSettings().ocrApiKey = value.trim();
         this.scheduleSave();
       });
     });
-    new import_obsidian10.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u7559\u7A7A = \u81EA\u52A8\u9009\u62E9\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u9009\u62E9").setValue(this.getSettings().ocrModel).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u7559\u7A7A = \u81EA\u52A8\u9009\u62E9\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u9009\u62E9").setValue(this.getSettings().ocrModel).onChange(async (value) => {
       this.getSettings().ocrModel = value.trim();
       this.scheduleSave();
     }));
-    new import_obsidian10.Setting(containerEl).setName("\u8BF7\u6C42\u8D85\u65F6\uFF08\u79D2\uFF09").setDesc("\u5355\u6B21 OCR \u8BF7\u6C42\u8D85\u65F6\u65F6\u95F4").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec)).setValue(String(this.getSettings().ocrRequestTimeoutSec)).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("\u8BF7\u6C42\u8D85\u65F6\uFF08\u79D2\uFF09").setDesc("\u5355\u6B21 OCR \u8BF7\u6C42\u8D85\u65F6\u65F6\u95F4").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec)).setValue(String(this.getSettings().ocrRequestTimeoutSec)).onChange(async (value) => {
       const n = parseInt(value, 10);
       if (!Number.isNaN(n) && n >= 10) {
         this.getSettings().ocrRequestTimeoutSec = n;
         this.scheduleSave();
       }
     }));
-    new import_obsidian10.Setting(containerEl).setName("\u6700\u5927\u8F93\u51FA\u4EE4\u724C").setDesc("\u5355\u6B21\u8BC6\u522B\u8BF7\u6C42\u5141\u8BB8\u7684\u6700\u5927\u8F93\u51FA\u957F\u5EA6\uFF08token\uFF09\uFF0C\u6846\u9009\u533A\u57DF\u6587\u672C\u8F83\u591A\u65F6\u53EF\u8C03\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens)).setValue(String(this.getSettings().ocrMaxTokens)).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("\u6700\u5927\u8F93\u51FA\u4EE4\u724C").setDesc("\u5355\u6B21\u8BC6\u522B\u8BF7\u6C42\u5141\u8BB8\u7684\u6700\u5927\u8F93\u51FA\u957F\u5EA6\uFF08token\uFF09\uFF0C\u6846\u9009\u533A\u57DF\u6587\u672C\u8F83\u591A\u65F6\u53EF\u8C03\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens)).setValue(String(this.getSettings().ocrMaxTokens)).onChange(async (value) => {
       const n = parseInt(value, 10);
       if (!Number.isNaN(n) && n >= 512) {
         this.getSettings().ocrMaxTokens = n;
         this.scheduleSave();
       }
     }));
-    new import_obsidian10.Setting(containerEl).setName("OCR \u63D0\u793A\u8BCD").setDesc("PaddleOCR-VL \u4F7F\u7528\u5B98\u65B9\u4EFB\u52A1\u8BCD\uFF08\u5982 OCR:\uFF09").addTextArea((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrPrompt).setValue(this.getSettings().ocrPrompt).onChange(async (value) => {
+    new import_obsidian12.Setting(containerEl).setName("OCR \u63D0\u793A\u8BCD").setDesc("PaddleOCR-VL \u4F7F\u7528\u5B98\u65B9\u4EFB\u52A1\u8BCD\uFF08\u5982 OCR:\uFF09").addTextArea((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrPrompt).setValue(this.getSettings().ocrPrompt).onChange(async (value) => {
       this.getSettings().ocrPrompt = value || DEFAULT_SETTINGS.ocrPrompt;
       this.scheduleSave();
     }));
-    new import_obsidian10.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
+    new import_obsidian12.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
       const service = new OcrService(this.getSettings().ocrServerUrl, this.getSettings().ocrApiKey);
       btn.setButtonText("\u6D4B\u8BD5\u4E2D\u2026").setDisabled(true);
       try {
         const models = await service.listModels();
-        new import_obsidian10.Notice(`\u8FDE\u63A5\u6210\u529F\uFF0C\u53EF\u7528\u6A21\u578B\uFF1A
+        new import_obsidian12.Notice(`\u8FDE\u63A5\u6210\u529F\uFF0C\u53EF\u7528\u6A21\u578B\uFF1A
 ${models.join("\n")}`, 8e3);
       } catch (e) {
-        new import_obsidian10.Notice(`\u8FDE\u63A5\u5931\u8D25: ${e.message}`);
+        new import_obsidian12.Notice(`\u8FDE\u63A5\u5931\u8D25: ${e.message}`);
       } finally {
         btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").setDisabled(false);
       }
@@ -29198,7 +29912,7 @@ ${models.join("\n")}`, 8e3);
 };
 
 // main.ts
-var LiteratureReaderPlugin = class extends import_obsidian11.Plugin {
+var LiteratureReaderPlugin = class extends import_obsidian13.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -29222,17 +29936,21 @@ var LiteratureReaderPlugin = class extends import_obsidian11.Plugin {
     const ocrModule = new OcrModule(ctx, pdfModule);
     ocrModule.setHighlightRefresh((file, entries) => ocrHighlightModule.refresh(file, entries));
     const mainArticleModule = new MainArticleModule(ctx, pdfModule);
+    const annotationModeModule = new AnnotationModeModule(ctx, pdfModule);
+    const jumpModule = new PdfJumpModule(ctx);
     const deepseekCtx = {
       ...ctx,
       getCurrentFileForUpload: () => pdfModule.getCurrentFileForUpload()
     };
     this.modules = [
       pdfModule,
+      annotationModeModule,
       mainArticleModule,
       highlightModule,
       screenshotModule,
       ocrHighlightModule,
       ocrModule,
+      jumpModule,
       new DeepSeekModule(deepseekCtx)
     ];
     for (const mod of this.modules) {

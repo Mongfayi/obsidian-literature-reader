@@ -160,7 +160,7 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
                 pageGeom
             );
             for (const rect of rects) {
-                this.placeRectInPage(rect, pageView, layerEl);
+                this.placeRectInPage(rect, pageView, layerEl, pageNumber, selectionStr);
             }
         }
     }
@@ -323,8 +323,12 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
     /**
      * 将 PDF 坐标矩形放置到页面的高亮层中（百分比定位，Y 轴翻转）。
      * rect: [left, bottom, right, top]（PDF 坐标，Y 向上）
+     * 附带 data-pdf-jump-* 属性供 PdfJumpModule 识别点击目标（跳回笔记对应批注）。
      */
-    private placeRectInPage(rect: number[], pageView: any, layerEl: HTMLElement): void {
+    private placeRectInPage(
+        rect: number[], pageView: any, layerEl: HTMLElement,
+        pageNumber: number, selectionStr: string
+    ): void {
         const viewBox: number[] = pageView.pdfPage?.view;
         if (!viewBox || viewBox.length < 4) return;
         const pageX = viewBox[0];
@@ -334,6 +338,8 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
         if (!pageWidth || !pageHeight) return;
 
         const rectEl = layerEl.createDiv('pdf-reader-selection-highlight');
+        rectEl.setAttr('data-pdf-jump-page', String(pageNumber));
+        rectEl.setAttr('data-pdf-jump-selection', selectionStr);
         rectEl.setCssStyles({
             left: `${100 * (rect[0] - pageX) / pageWidth}%`,
             top: `${100 * (viewBox[3] - rect[3] + viewBox[1] - pageY) / pageHeight}%`,

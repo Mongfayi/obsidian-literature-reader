@@ -142,8 +142,16 @@ export abstract class BaseCropModeModule implements PluginModule {
             const pageNumberEl = toolbar.pageNumberEl as HTMLElement | undefined;
             if (!pageNumberEl || !pageNumberEl.parentElement) return;
 
-            // 以「当前工具条上是否已有按钮」为准，避免重建后重复注入
-            if (pageNumberEl.parentElement.querySelector('.' + this.buttonClass)) return;
+            // 以「当前工具条上是否已有按钮」为准，避免重建后重复注入。
+            // 注意：同一叶子可含多个 PDF 标签页、各自有工具条按钮；命中已有按钮时
+            // 必须把缓存重指到当前可见按钮，否则激活态会加到隐藏标签页的按钮上
+            // （点击功能正常但外观不更新）
+            const existing = pageNumberEl.parentElement.querySelector('.' + this.buttonClass);
+            if (existing) {
+                this.cropButtons.set(leaf, existing as HTMLElement);
+                this.toolbarLeaves.add(leaf);
+                return;
+            }
 
             // 工具条重建后旧按钮已脱离 DOM：清掉缓存引用，避免闭包与脏引用累积
             const stale = this.cropButtons.get(leaf);
@@ -160,6 +168,8 @@ export abstract class BaseCropModeModule implements PluginModule {
             setTooltip(btn, this.buttonTooltip);
             btn.addEventListener('click', (evt: MouseEvent) => {
                 evt.stopPropagation();
+                // 确保缓存指向当前可见按钮（多标签页场景下 map 可能指到隐藏标签页）
+                this.cropButtons.set(leaf, btn);
                 this.startCropMode(leaf);
             });
 
