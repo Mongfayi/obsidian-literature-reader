@@ -27,6 +27,27 @@
   border-radius: 0.1em;
 }
 
+/* 高亮区域可点击：跳转到笔记中对应批注（指针事件仅开在矩形本身，高亮外文本选择不受影响） */
+.pdf-reader-highlight-layer .pdf-reader-selection-highlight {
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 跳转定位后的闪烁提示（PDF 高亮 / 笔记 callout 通用） */
+@keyframes pdf-reader-jump-flash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(124, 108, 240, 0.9);
+  }
+  100% {
+    box-shadow: 0 0 0 16px rgba(124, 108, 240, 0);
+  }
+}
+.pdf-reader-jump-flash {
+  animation: pdf-reader-jump-flash 1.2s ease-out 2;
+}
+
 
 /* ---------- DeepSeek 浮动窗口 ---------- */
 
@@ -205,6 +226,23 @@
   background-color: var(--background-modifier-active-hover);
 }
 
+/* ---------- 批注原文附带模式（测试功能，以后可能删除） ---------- */
+
+/* 工具条「附带原文」按钮：图标 + 文字标签；开启（附带原文）时高亮 */
+.pdfreader-annotation-mode-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pdfreader-annotation-mode-button.is-active {
+  color: var(--interactive-accent);
+  background-color: var(--background-modifier-active-hover);
+}
+
 /* 截图模式：crosshair 光标，禁止文本选中（不遮滚动条、不拦截滚轮） */
 .ocr-selecting {
   cursor: crosshair;
@@ -241,6 +279,14 @@
   background: rgba(var(--text-highlight-bg-rgb), 0.3);
   border-radius: 2px;
   pointer-events: none;
+}
+
+/* OCR 高亮区域可点击：跳转到笔记中对应批注 */
+.ocr-highlight-layer .ocr-crop-highlight {
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 

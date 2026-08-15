@@ -144,6 +144,9 @@ export class OcrHighlightModule extends BasePdfHighlightModule<PdfOcrIndex> {
         const layerEl = pageDiv.createDiv('ocr-highlight-layer');
         for (const h of pageMap.values()) {
             const rectEl = layerEl.createDiv('ocr-crop-highlight');
+            // data-pdf-jump-* 属性供 PdfJumpModule 识别点击目标（跳回笔记对应批注）
+            rectEl.setAttr('data-pdf-jump-page', String(pageNumber));
+            rectEl.setAttr('data-pdf-jump-ocr', rectKey({ x: h.nx, y: h.ny, w: h.nw, h: h.nh }));
             Object.assign(rectEl.style, {
                 left: `${(h.nx * 100).toFixed(3)}%`,
                 top: `${(h.ny * 100).toFixed(3)}%`,

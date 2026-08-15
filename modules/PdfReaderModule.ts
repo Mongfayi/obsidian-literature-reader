@@ -34,6 +34,8 @@ export class PdfReaderModule implements PluginModule {
     private refreshHighlights: ((file: TFile, selections?: SavedSelectionInfo[]) => void) | null = null;
     /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
     private redirectResolver: (() => Promise<TFile | null>) | null = null;
+    /** 批注是否附带原文的模式提供者（由 AnnotationModeModule 注入；默认关闭=不附带原文） */
+    private includeOriginalTextProvider: (() => boolean) | null = null;
     /** 「开始阅读」进行中的 PDF 路径（防重复点击并发执行全量文本提取与重复分屏） */
     private startingPdfs = new Set<string>();
 
@@ -49,6 +51,11 @@ export class PdfReaderModule implements PluginModule {
     /** 注入批注目标笔记重定向解析器（主文献开启时批注写入主文献笔记而非源 PDF 对应笔记） */
     setRedirectResolver(cb: () => Promise<TFile | null>): void {
         this.redirectResolver = cb;
+    }
+
+    /** 注入批注原文附带模式提供者（工具栏「附带原文」切换；默认关闭=不附带原文） */
+    setIncludeOriginalTextProvider(provider: () => boolean): void {
+        this.includeOriginalTextProvider = provider;
     }
 
     load(): void {
@@ -900,7 +907,7 @@ created: ${date}`;
                 this.savedSelections = selections;
                 return;
             }
-            await this.appendAnnotationsToNote(noteFile, selections, pdfFile);
+            await this.appendAnnotationsToNote(noteFile, selections, pdfFile, this.shouldIncludeOriginalText());
             // 批注写入后立即刷新 PDF 持久高亮（不依赖 pdf-plus）；
             // OCR 批注无文本锚点（beginIndex < 0），跳过高亮
             this.refreshHighlights?.(
@@ -959,11 +966,22 @@ created: ${date}`;
         }
     }
 
+    /** 当前文字批注是否附带原文（工具栏「附带原文」关闭时不附带，只写链接） */
+    private shouldIncludeOriginalText(): boolean {
+        return this.includeOriginalTextProvider ? this.includeOriginalTextProvider() : false;
+    }
+
     private async appendAnnotationsToNote(
         noteFile: TFile,
         selections: SavedSelectionInfo[],
-        pdfFile: TFile
+        pdfFile: TFile,
+        includeOriginalText = true
     ) {
+        // 「附带原文」关闭（默认，测试功能）：只写链接，无 callout 包围框、无「笔记：」提示行
+        if (!includeOriginalText) {
+            await this.appendLinksOnly(noteFile, selections, pdfFile);
+            return;
+        }
         const notePrompt = '> 笔记：';
         // 多段选中合并为一个批注 callout，每段之间空行分隔并带独立页码引用
         const items = selections.map((sel) => {
@@ -980,7 +998,8 @@ created: ${date}`;
             }
             if (sel.beginIndex < 0) {
                 // 无文本锚点（如截图 OCR 批注）：仅附页码链接，不生成 selection 参数；
-                // 若带 ocrRect，附加 &ocr=x,y,w,h（归一化矩形）供 pdf-ocr 渲染持久高亮
+                // 若带 ocrRect，附加 &ocr=x,y,w,h（归一化矩形）供 pdf-ocr 渲染持久高亮。
+                // 该格式不受「附带原文」开关影响（测试功能只作用于文字选中批注）
                 const rectParam = sel.ocrRect
                     ? `&ocr=${fmtRectNum(sel.ocrRect.x)},${fmtRectNum(sel.ocrRect.y)},`
                     + `${fmtRectNum(sel.ocrRect.w)},${fmtRectNum(sel.ocrRect.h)}`
@@ -1019,6 +1038,81 @@ created: ${date}`;
         }
 
         await this.focusNotePrompt(noteFile, notePrompt, promptLine);
+    }
+
+    /**
+     * 「附带原文」关闭时的批注形式（测试功能，以后可能删除）：
+     * 只写 PDF 链接（多段选中每段一行），无 callout 包围框、无「> 笔记：」提示行。
+     * 定位失败（page=null）的选区无链接可写，保留拍平文字行兜底，避免批注静默丢失。
+     * 该路径只被文字选中批注（handleAnnotation）调用；OCR / 截图批注不受影响。
+     *
+     * 写入策略：默认插入在笔记光标所在行末尾（支持从笔记中间批注，后面的内容不动）；
+     * 若光标行或其后两行内存在链接-only 批注的链接行（典型场景：光标停在上一条批注的
+     * 文字末尾或链接上方的空行），则改在该链接行之后插入，避免新链接插进上一条批注的
+     * 「批注文字」与「链接」之间。链接上方保留一个空行放光标，批注后直接输入的文字
+     * 写在链接上方（版式：文字在上、链接在下）。无编辑器时回退追加到文末。
+     */
+    private async appendLinksOnly(
+        noteFile: TFile,
+        selections: SavedSelectionInfo[],
+        pdfFile: TFile
+    ): Promise<void> {
+        const flatten = (text: string) => text.replace(
+            /[\r\n\u000B\u000C\u2028\u2029\u21B5\u23CE\u240D\u2424\u2937\u0000-\u0008\u000E-\u001F\u007F-\u009F\uE000-\uF8FF]/g,
+            ''
+        );
+        const lines = selections.map((sel) => {
+            if (sel.page === null) {
+                // 定位失败：无链接可写，保留文字兜底
+                return flatten(sel.text);
+            }
+            if (sel.beginIndex < 0) {
+                // 无文本锚点（防御分支，文字批注路径通常不会出现）：仅附页码链接
+                return `[[${pdfFile.path}#page=${sel.page}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+            }
+            const selectionParam =
+                `${sel.beginIndex},${sel.beginOffset},` +
+                `${sel.endIndex},${sel.endOffset}`;
+            return `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+        });
+        if (lines.length === 0) return;
+
+        const cursorPos = this.getNoteCursorEditorPos(noteFile);
+        if (cursorPos) {
+            const editor = cursorPos.editor;
+            const lastLine = editor.lastLine();
+            // 链接-only 批注的链接行（如 [[xxx.pdf#page=45&selection=...|别名]]；
+            // 不含 callout 的 > 前缀与嵌入的 ![[ 前缀）
+            const linkLineRegex = /^\[\[[^\]]*#page=\d+[^\]]*\]\]$/;
+            const isLinkLine = (line: number) =>
+                line >= 0 && line <= lastLine && linkLineRegex.test(editor.getLine(line));
+
+            // 插入锚点：默认光标所在行；若光标行或其后两行内是链接行（光标停在上一条
+            // 批注的文字末尾 / 链接上方空行 / 链接行上），改在该链接行之后插入
+            let anchor = cursorPos.line;
+            for (let i = 0; i < 3; i++) {
+                if (isLinkLine(anchor + i)) {
+                    anchor = anchor + i;
+                    break;
+                }
+            }
+
+            const anchorText = editor.getLine(anchor);
+            // 锚点行非空时多补一个空行，保证链接上方恰好有一个空行放光标
+            const prefix = anchorText.length === 0 ? '\n' : '\n\n';
+            const annotation = prefix + lines.join('\n') + '\n';
+            editor.replaceRange(annotation, { line: anchor, ch: anchorText.length });
+
+            // 光标落在链接上方的空行（首个链接行 = 锚点行 + 前缀空行数 + 1）
+            const firstLinkLine = anchor + (anchorText.length === 0 ? 1 : 2);
+            editor.setCursor({ line: firstLinkLine - 1, ch: 0 });
+        } else {
+            // 无编辑器（阅读模式/笔记未打开）：追加到文末
+            await this.ctx.plugin.app.vault.process(noteFile, (data) => {
+                const endsWithNewline = data.endsWith('\n');
+                return data + (endsWithNewline ? '\n' : '\n\n') + lines.join('\n') + '\n';
+            });
+        }
     }
 
     /**

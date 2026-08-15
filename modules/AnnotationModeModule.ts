@@ -1,26 +1,30 @@
-import { TFile, WorkspaceLeaf, FileView, setIcon, setTooltip } from 'obsidian';
+import { WorkspaceLeaf, FileView, setIcon, setTooltip } from 'obsidian';
 import type { ModuleContext, PluginModule } from '../types';
 import type { PdfReaderModule } from './PdfReaderModule';
 import { toolbarPoller, pruneStaleLeaves } from './toolbarPoller';
 
 /**
- * 主文献批注汇集模块
+ * 批注原文附带模式模块（测试功能，以后可能删除）
  *
- * 在每个 PDF 视图工具条注入「主文献」切换按钮。将某篇 PDF 设为主文献后，
- * 无论从哪篇 PDF 批注（文字选中 / 截图 / OCR），批注内容都写入主文献对应的阅读笔记；
- * 批注 callout 内的原文链接仍指向被批注的源 PDF（由 PdfReaderModule 构造），点击可跳回源页。
+ * 在每个 PDF 视图工具条注入「附带原文」切换按钮，默认关闭：
+ *  - 关闭（默认）：文字选中批注只写 PDF 链接，不附带原文，如
+ *    [[essay/xxx.pdf#page=45&selection=1903,0,1940,0|xxx, 页面 45]]
+ *  - 开启：批注附带原文（历史行为）
  *
- * 状态为会话级（内存），重载插件自动清除。
+ * 该开关只影响「文字选中批注」（有文本层锚点 beginIndex>=0 的选区）；
+ * OCR 批注（beginIndex<0）与截图批注的写入格式不受影响。
  *
- * 工具条按钮注入范式与 ScreenshotModule / OcrModule 一致：
+ * 状态为会话级（内存），重载插件自动复位为默认关闭。
+ *
+ * 工具条按钮注入范式与 MainArticleModule 一致：
  *  监听 layout-change / active-leaf-change + 2s 轮询兜底，经 viewer.child.toolbar.pageNumberEl.after(btn) 插入。
  */
-export class MainArticleModule implements PluginModule {
+export class AnnotationModeModule implements PluginModule {
     private ctx: ModuleContext;
     private pdfModule: PdfReaderModule;
 
-    /** 当前主文献 PDF 路径（null = 未设置，批注走默认逻辑写入源 PDF 对应笔记） */
-    private mainArticlePdfPath: string | null = null;
+    /** 「附带原文」开关：true = 批注附带原文；false（默认）= 批注只写链接 */
+    private includeOriginalText = false;
     /** 已注入按钮的叶子 → 按钮元素 */
     private toolbarButtons = new Map<WorkspaceLeaf, HTMLElement>();
     /** 本模块创建过的全部按钮（含多标签页下未进 map 的隐藏按钮），用于卸载清理 */
@@ -36,8 +40,8 @@ export class MainArticleModule implements PluginModule {
     load(): void {
         const plugin = this.ctx.plugin;
 
-        // 向 PdfReaderModule 注入重定向解析器：批注入口询问主文献笔记
-        this.pdfModule.setRedirectResolver(() => this.resolveMainArticleNote());
+        // 向 PdfReaderModule 注入原文附带模式提供者：批注入口按当前开关决定是否写原文
+        this.pdfModule.setIncludeOriginalTextProvider(() => this.includeOriginalText);
 
         plugin.registerEvent(
             plugin.app.workspace.on('layout-change', () => {
@@ -53,8 +57,7 @@ export class MainArticleModule implements PluginModule {
         );
 
         // PDF 视图可能被重建，事件驱动注入不可靠，用轻量定时轮询兜底（幂等）；
-        // 与截图/OCR 模块共享同一轮询器；同时刷新激活态（工具条重建后按钮的
-        // is-active 不依赖事件触发恢复）
+        // 与截图/OCR/主文献模块共享同一轮询器
         this.removePollTask = toolbarPoller.add(() => {
             this.injectToolbarButtons();
             this.refreshAllButtonStates();
@@ -62,14 +65,12 @@ export class MainArticleModule implements PluginModule {
         toolbarPoller.start();
 
         plugin.addCommand({
-            id: 'toggle-main-article',
-            name: '设为/取消主文献（批注汇集到本篇笔记）',
+            id: 'toggle-include-original-text',
+            name: '切换「附带原文」批注模式（默认关闭；关闭时批注只写 PDF 链接）',
             checkCallback: (checking) => {
                 const leaf = plugin.app.workspace.activeLeaf;
                 if (!leaf || leaf.view.getViewType() !== 'pdf') return false;
-                const file = (leaf.view as FileView).file;
-                if (!file) return false;
-                if (!checking) this.toggleMainArticle(file);
+                if (!checking) this.toggleMode();
                 return true;
             },
         });
@@ -92,29 +93,14 @@ export class MainArticleModule implements PluginModule {
         this.removePollTask = null;
         this.toolbarButtons.clear();
         this.createdButtons.clear();
-        this.mainArticlePdfPath = null;
+        this.includeOriginalText = false;
     }
 
-    // ========== 主文献状态 ==========
+    // ========== 模式状态 ==========
 
-    /**
-     * 解析主文献对应的阅读笔记（已存在则返回，否则由 PdfReaderModule 创建）。
-     * 未设主文献 / 主文献 PDF 已失效时返回 null，调用方回退默认逻辑。
-     */
-    private async resolveMainArticleNote(): Promise<TFile | null> {
-        if (!this.mainArticlePdfPath) return null;
-        const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(this.mainArticlePdfPath);
-        if (!(pdfFile instanceof TFile)) return null;
-        return await this.pdfModule.createReadingNote(pdfFile);
-    }
-
-    /** 切换主文献：同路径 → 取消；否则设为新主文献（替换原值）。反馈仅靠按钮高亮 + tooltip 变化 */
-    private toggleMainArticle(pdfFile: TFile): void {
-        if (this.mainArticlePdfPath === pdfFile.path) {
-            this.mainArticlePdfPath = null;
-        } else {
-            this.mainArticlePdfPath = pdfFile.path;
-        }
+    /** 切换「附带原文」开关并刷新所有按钮激活态 */
+    private toggleMode(): void {
+        this.includeOriginalText = !this.includeOriginalText;
         this.refreshAllButtonStates();
     }
 
@@ -138,7 +124,7 @@ export class MainArticleModule implements PluginModule {
             // 注意：同一叶子可含多个 PDF 标签页、各自有工具条按钮；命中已有按钮时
             // 必须把 map 重指到当前可见按钮，否则状态刷新会作用到隐藏标签页的按钮上
             // （点击功能正常但外观不更新）
-            const existing = pageNumberEl.parentElement.querySelector<HTMLElement>('.pdfreader-main-article-button');
+            const existing = pageNumberEl.parentElement.querySelector<HTMLElement>('.pdfreader-annotation-mode-button');
             if (existing) {
                 this.toolbarButtons.set(leaf, existing);
                 return;
@@ -153,24 +139,24 @@ export class MainArticleModule implements PluginModule {
 
             const btn = document.createElement('div');
             btn.addClass('clickable-icon');
-            btn.addClass('pdfreader-main-article-button');
-            setIcon(btn, 'bookmark');
+            btn.addClass('pdfreader-annotation-mode-button');
+            setIcon(btn, 'link');
+            btn.createSpan({ text: '附带原文' });
             btn.addEventListener('click', (evt: MouseEvent) => {
                 evt.stopPropagation();
-                const currentFile = (leaf.view as FileView).file;
-                if (currentFile) this.toggleMainArticle(currentFile);
+                this.toggleMode();
             });
 
             pageNumberEl.after(btn);
 
             this.toolbarButtons.set(leaf, btn);
             this.createdButtons.add(btn);
-            this.applyButtonState(leaf, btn);
+            this.applyButtonState(btn);
         });
     }
 
     /**
-     * 切换主文献 / 叶子文件切换后重算所有按钮激活态：
+     * 重算所有按钮激活态（开关切换 / 工具条重建后）：
      * 直接扫描各叶子当前可见工具条上的按钮，不依赖可能指向隐藏标签页按钮的 map。
      */
     private refreshAllButtonStates(): void {
@@ -180,20 +166,19 @@ export class MainArticleModule implements PluginModule {
             const toolbar = viewer?.child?.toolbar;
             const pageNumberEl = toolbar?.pageNumberEl as HTMLElement | undefined;
             if (!pageNumberEl?.parentElement) return;
-            const btn = pageNumberEl.parentElement.querySelector<HTMLElement>('.pdfreader-main-article-button');
-            if (btn) this.applyButtonState(leaf, btn);
+            const btn = pageNumberEl.parentElement.querySelector<HTMLElement>('.pdfreader-annotation-mode-button');
+            if (btn) this.applyButtonState(btn);
         });
     }
 
-    /** 按「该叶子当前 PDF 是否为主文献」切换激活态与提示文案 */
-    private applyButtonState(leaf: WorkspaceLeaf, btn: HTMLElement): void {
-        const file = (leaf.view as FileView)?.file;
-        const isMain = !!file && this.mainArticlePdfPath === file.path;
-        btn.toggleClass('is-active', isMain);
-        if (isMain) {
-            setTooltip(btn, '主文献已开启（点击取消）\n批注将汇集到本篇笔记');
+    /** 按当前开关切换激活态与提示文案 */
+    private applyButtonState(btn: HTMLElement): void {
+        const on = this.includeOriginalText;
+        btn.toggleClass('is-active', on);
+        if (on) {
+            setTooltip(btn, '附带原文已开启（点击关闭）\n批注将包含原文文字');
         } else {
-            setTooltip(btn, '设为主文献：批注汇集到本篇笔记');
+            setTooltip(btn, '附带原文已关闭（默认，点击开启）\n批注只写 PDF 链接，不附带原文');
         }
     }
 }
