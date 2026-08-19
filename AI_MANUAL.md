@@ -1,6 +1,6 @@
 # 文献阅读助手插件技术手册
 
-> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.4.0`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
+> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.4.1`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
 
 ---
 
@@ -190,7 +190,10 @@
 - `metadataCache.changed` 仅重建受影响 PDF（过滤 `.pdf` 链接）；`deleted`/`rename` 触发全量重建
 - 翻页/缩放重发渲染事件 → 自动重建高亮
 - **删除同步**：笔记中删掉批注 → 300ms 防抖重建 → 高亮消失
-- 即时高亮：批注写入后调用 `refresh(file, explicit)`，把显式选区/矩形直接并入索引，规避落盘延迟
+- **即时高亮（显式覆盖层）**：批注写入后调用 `refresh(file, explicit)`，把显式选区/矩形记入 `explicitOverlay`（pdfPath → page → key），每次串行重建索引时并入并清理已被笔记内容确认的条目——即使 `resolvedLinks` 尚未收录新链接（首次批注到新笔记）或 metadataCache 落盘延迟，并发的 300ms 防抖重建也不会用「缺新条目」的索引覆盖掉刚批注的高亮；`deleted`/`rename` 全量重建时清空覆盖层
+- **重建串行化**：同一 PDF 的重建按启动顺序执行（`rebuildIndexSerialized`），避免并发重建交错导致旧索引覆盖新索引
+- **非破坏性渲染**：文本层未就绪（页面重渲染间隙）或选区计算不出矩形时保留旧高亮层，只有真正产出矩形或权威索引为空时才替换/删除，避免中间态误删高亮
+- **挂载兜底**：PDF 叶子事件总线未就绪（视图异步加载中）时轮询重试挂载（最多 4s），避免错过页面首次 `textlayerrendered` 导致高亮在该叶子永不渲染
 - PdfHighlight 矩形计算优先用文本项逐字符包围盒（`item.chars.r`），缺失回退 DOM Range；同行相邻项合并；零宽零高 span 跳过避免除零
 
 ---

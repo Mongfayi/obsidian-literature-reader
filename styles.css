@@ -290,6 +290,24 @@
 }
 
 
+/* ---------- 文件管理器：已有阅读笔记的 PDF 标记 ---------- */
+
+.pdf-reader-has-note .pdf-reader-has-note-marker {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  margin-left: 0;
+  flex-shrink: 0;
+  color: var(--interactive-accent);
+  opacity: 0.85;
+}
+
+.pdf-reader-has-note .pdf-reader-has-note-marker svg {
+  width: 14px;
+  height: 14px;
+}
+
+
 /* ---------- 批注 callout：无标题栏，框紧密包裹内容 ---------- */
 
 .callout[data-callout="pdf-annotation"] {

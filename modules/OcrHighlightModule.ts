@@ -52,25 +52,33 @@ export class OcrHighlightModule extends BasePdfHighlightModule<PdfOcrIndex> {
 
     /**
      * 刷新指定 PDF 的高亮：
-     *  - 先从笔记内容重建索引
-     *  - explicit 为刚批注写入的条目，直接并入索引（规避 metadataCache 落盘延迟，实现即时高亮）
+     *  - 刚批注写入的条目先记入「显式覆盖层」（笔记可能尚未落盘 / resolvedLinks
+     *    尚未收录新链接），由串行重建统一并入索引，规避 metadataCache 落盘延迟
+     *  - 再从笔记内容重建索引（覆盖层条目会被笔记内容确认并自动清理）
      *  - 最后重渲染所有已打开该 PDF 的视图
      */
     refresh(pdfFile: TFile, explicit?: OcrHighlightEntry[]): void {
         const pdfPath = pdfFile.path;
-        this.rebuildIndex(pdfPath).then(() => {
-            if (explicit && explicit.length > 0) {
-                const index = this.getOrCreateIndex(pdfPath, () => new Map<number, PageHighlights>());
-                for (const e of explicit) {
-                    const pageMap = index.get(e.page) ?? new Map<string, IndexedHighlight>();
-                    pageMap.set(rectKey(e.rect), {
-                        nx: e.rect.x, ny: e.rect.y, nw: e.rect.w, nh: e.rect.h,
-                    });
-                    index.set(e.page, pageMap);
-                }
+        if (explicit && explicit.length > 0) {
+            for (const e of explicit) {
+                this.trackExplicitEntry(pdfPath, e.page, rectKey(e.rect));
             }
+        }
+        this.rebuildIndexSerialized(pdfPath).then(() => {
             this.renderForPdf(pdfPath);
         });
+    }
+
+    /** 覆盖层条目并入 OCR 矩形索引；返回 true 表示已被笔记内容确认（移出覆盖层） */
+    protected applyExplicitEntry(index: PdfOcrIndex, page: number, key: string): boolean {
+        const pageMap = index.get(page);
+        if (pageMap?.has(key)) return true;
+        const rect = parseRectKey(key);
+        if (!rect) return false;
+        const map = pageMap ?? new Map<string, IndexedHighlight>();
+        map.set(key, { nx: rect.x, ny: rect.y, nw: rect.w, nh: rect.h });
+        index.set(page, map);
+        return false;
     }
 
     /**
@@ -134,13 +142,16 @@ export class OcrHighlightModule extends BasePdfHighlightModule<PdfOcrIndex> {
         const pageDiv = pageView.div as HTMLElement;
         const pageNumber = parseInt(pageDiv.dataset.pageNumber ?? '0', 10) || 0;
 
-        // 移除旧高亮层（页面重渲染时重建）
-        pageDiv.querySelector('.ocr-highlight-layer')?.remove();
-
         const index = this.indexCache.get(pdfPath);
         const pageMap = index?.get(pageNumber);
-        if (!pageMap || pageMap.size === 0) return;
+        if (!pageMap || pageMap.size === 0) {
+            // 权威索引为空（笔记中已无该页 OCR 批注）→ 删除旧高亮层
+            pageDiv.querySelector('.ocr-highlight-layer')?.remove();
+            return;
+        }
 
+        // 有矩形才替换旧层（防御：pagerendered 与文本高亮重建交错时避免误删）
+        pageDiv.querySelector('.ocr-highlight-layer')?.remove();
         const layerEl = pageDiv.createDiv('ocr-highlight-layer');
         for (const h of pageMap.values()) {
             const rectEl = layerEl.createDiv('ocr-crop-highlight');
@@ -160,4 +171,12 @@ export class OcrHighlightModule extends BasePdfHighlightModule<PdfOcrIndex> {
 /** 归一化矩形→索引键（去重用，4 位小数与笔记中 fmtRectNum 格式一致） */
 function rectKey(r: OcrRect): string {
     return `${Number(r.x.toFixed(4))},${Number(r.y.toFixed(4))},${Number(r.w.toFixed(4))},${Number(r.h.toFixed(4))}`;
+}
+
+/** 索引键 → 归一化矩形（覆盖层条目解析用）；格式非法返回 null */
+function parseRectKey(key: string): OcrRect | null {
+    const parts = key.split(',').map((s) => Number(s));
+    if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p))) return null;
+    const [x, y, w, h] = parts;
+    return { x, y, w, h };
 }

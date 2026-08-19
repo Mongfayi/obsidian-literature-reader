@@ -18,10 +18,22 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
     protected indexCache = new Map<string, T>();
     /** 已挂载事件监听的叶子（避免重复挂载） */
     private attachedLeaves = new Set<WorkspaceLeaf>();
+    /** 事件总线尚未就绪、等待重试挂载的叶子 */
+    private attachRetries = new Set<WorkspaceLeaf>();
     /** 重建索引的防抖定时器 */
     private rebuildTimer: number | null = null;
     /** 防抖窗口内待重建的 PDF：'full' = 全量重建（删除/重命名路径），string[] = 局部重建路径集，null = 无待办 */
     private pendingRebuild: 'full' | string[] | null = null;
+
+    /**
+     * 显式高亮覆盖层：批注写入后、笔记内容尚未确认（resolvedLinks 未收录新链接 /
+     * metadataCache 落盘延迟）期间的显式条目（pdfPath → page → 条目 key）。
+     * 每次重建索引都会并入覆盖层并清理已被笔记内容确认的条目，
+     * 确保并发的防抖重建不会用「缺新条目」的索引覆盖掉刚批注的高亮。
+     */
+    private explicitOverlay = new Map<string, Map<number, Set<string>>>();
+    /** 每个 PDF 的重建串行链：同一 PDF 的重建按序执行，避免并发交错旧索引覆盖新索引 */
+    private rebuildChains = new Map<string, Promise<void>>();
 
     /** 页面（重新）渲染时触发的事件名，子类覆写 */
     protected abstract get renderEventName(): string;
@@ -79,7 +91,10 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
 
     unload(): void {
         this.attachedLeaves.clear();
+        this.attachRetries.clear();
         this.indexCache.clear();
+        this.explicitOverlay.clear();
+        this.rebuildChains.clear();
         this.pendingRebuild = null;
         if (this.rebuildTimer !== null) {
             window.clearTimeout(this.rebuildTimer);
@@ -89,6 +104,63 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
 
     /** 重建单个 PDF 的索引（子类解析笔记内容并填充索引） */
     protected abstract rebuildIndex(pdfPath: string): Promise<void>;
+
+    /**
+     * 串行化执行 rebuildIndex：同一 PDF 的重建按启动顺序依次执行，
+     * 并在索引写回后并入「显式覆盖层」。并发重建交错时，后启动的重建
+     * 一定读到最新的笔记内容；覆盖层保证刚批注、尚未被笔记内容确认的
+     * 显式条目不会因任何一次重建而丢失。
+     */
+    protected rebuildIndexSerialized(pdfPath: string): Promise<void> {
+        const prev = this.rebuildChains.get(pdfPath) ?? Promise.resolve();
+        const next = prev.catch(() => { /* 前序失败不阻断后续重建 */ }).then(async () => {
+            await this.rebuildIndex(pdfPath);
+            const index = this.indexCache.get(pdfPath);
+            if (index !== undefined) {
+                this.mergeExplicitOverlay(pdfPath, index);
+            }
+        });
+        this.rebuildChains.set(pdfPath, next);
+        return next;
+    }
+
+    /** 记录一条「尚未被笔记内容确认」的显式高亮条目（批注写入后立即调用） */
+    protected trackExplicitEntry(pdfPath: string, page: number, key: string): void {
+        if (!Number.isInteger(page)) return;
+        let pages = this.explicitOverlay.get(pdfPath);
+        if (!pages) {
+            pages = new Map<number, Set<string>>();
+            this.explicitOverlay.set(pdfPath, pages);
+        }
+        const keys = pages.get(page) ?? new Set<string>();
+        keys.add(key);
+        pages.set(page, keys);
+    }
+
+    /**
+     * 把显式覆盖层并入刚重建的索引，并清理已被笔记内容确认的条目：
+     *  - key 已存在于索引（笔记内容已包含该批注）→ 移出覆盖层
+     *  - key 不存在（resolvedLinks 尚未收录笔记 / 笔记未落盘）→ 并入索引兜底
+     */
+    private mergeExplicitOverlay(pdfPath: string, index: T): void {
+        const pages = this.explicitOverlay.get(pdfPath);
+        if (!pages) return;
+        for (const [page, keys] of pages) {
+            for (const key of keys) {
+                if (this.applyExplicitEntry(index, page, key)) {
+                    keys.delete(key);
+                }
+            }
+            if (keys.size === 0) pages.delete(page);
+        }
+        if (pages.size === 0) this.explicitOverlay.delete(pdfPath);
+    }
+
+    /**
+     * 子类实现：把覆盖层条目并入自己的索引结构。
+     * @returns true = 该 key 已存在于索引（笔记内容确认），false = 已兜底并入索引
+     */
+    protected abstract applyExplicitEntry(index: T, page: number, key: string): boolean;
 
     /** 渲染单页的高亮覆盖层（子类实现；render 事件与手动刷新时调用） */
     protected abstract renderPageHighlights(pdfPath: string, pageView: any): void;
@@ -123,6 +195,9 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
             const pending = this.pendingRebuild;
             this.pendingRebuild = null;
             if (pending === 'full' || !pending) {
+                // 全量重建（笔记删除/重命名/插件加载）：笔记集合已权威变化，
+                // 清除尚未被确认的显式覆盖层，避免已删除批注的高亮残留
+                this.explicitOverlay.clear();
                 this.rebuildAllIndexes().then(() => this.renderAllOpenPdfs());
             } else {
                 this.rebuildAndRender(pending);
@@ -133,27 +208,18 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
     /** 只重建指定 PDF 的索引并渲染对应视图（未打开的 PDF 渲染为空操作） */
     private async rebuildAndRender(pdfPaths: string[]): Promise<void> {
         for (const path of pdfPaths) {
-            await this.rebuildIndex(path);
+            await this.rebuildIndexSerialized(path);
         }
         for (const path of pdfPaths) {
             this.renderForPdf(path);
         }
     }
 
-    protected getOrCreateIndex(pdfPath: string, factory: () => T): T {
-        let index = this.indexCache.get(pdfPath);
-        if (!index) {
-            index = factory();
-            this.indexCache.set(pdfPath, index);
-        }
-        return index;
-    }
-
     /** 重建所有「当前有视图打开」的 PDF 索引 */
     private async rebuildAllIndexes(): Promise<void> {
         const openPdfPaths = this.getOpenPdfPaths();
         for (const path of openPdfPaths) {
-            await this.rebuildIndex(path);
+            await this.rebuildIndexSerialized(path);
         }
         // 清理已不再打开（或已删除）PDF 的缓存
         for (const path of [...this.indexCache.keys()]) {
@@ -184,7 +250,14 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
 
             const viewer = (leaf.view as any).viewer;
             const eventBus = viewer?.child?.pdfViewer?.eventBus;
-            if (!eventBus) return;
+            if (!eventBus) {
+                // PDF 视图组件仍在异步加载（child/pdfViewer 尚未就绪）：延迟重试挂载，
+                // 避免错过页面首次 textlayerrendered，导致高亮在该叶子永不渲染。
+                // 若此刻已完成布局（layout-change/active-leaf-change 都提前触发过），
+                // 后续不再有事件来补挂，只能靠这里的轮询兜底。
+                this.retryAttachPdfLeaf(leaf);
+                return;
+            }
 
             this.attachedLeaves.add(leaf);
             const onRendered = (data: any) => {
@@ -205,6 +278,31 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
             if (pdfFile) {
                 this.scheduleRebuildForPdfs([pdfFile.path]);
             }
+        });
+    }
+
+    /**
+     * 事件总线未就绪时的延迟重试：PDF 视图组件（viewer.child.pdfViewer）是异步
+     * 加载的，layout-change / active-leaf-change 可能在其就绪前触发，导致挂载被
+     * 跳过且不再有事件补挂。轮询最多 4 秒（40 × 100ms），就绪后重跑 attachToPdfLeaves。
+     */
+    private retryAttachPdfLeaf(leaf: WorkspaceLeaf): void {
+        if (this.attachRetries.has(leaf)) return;
+        this.attachRetries.add(leaf);
+        let tries = 0;
+        const timer = window.setInterval(() => {
+            tries++;
+            const viewer = (leaf.view as any).viewer;
+            const eventBus = viewer?.child?.pdfViewer?.eventBus;
+            if (eventBus || tries >= 40) {
+                window.clearInterval(timer);
+                this.attachRetries.delete(leaf);
+                if (eventBus) this.attachToPdfLeaves();
+            }
+        }, 100);
+        this.ctx.plugin.register(() => {
+            window.clearInterval(timer);
+            this.attachRetries.delete(leaf);
         });
     }
 

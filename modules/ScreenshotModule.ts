@@ -333,6 +333,12 @@ class PdfDocCache {
                 data: buffer,
                 cMapPacked: true,
                 cMapUrl: '/lib/pdfjs/cmaps/',
+                // Obsidian 内置 pdf.js 5.x 需要显式提供这些资源路径；
+                // 尤其是 wasmUrl，否则 JPEG2000（JPX）等图片解码会失败，
+                // 导致截图嵌入只渲染出文字、丢失图片。
+                wasmUrl: '/lib/pdfjs/wasm/',
+                iccUrl: '/lib/pdfjs/iccs/',
+                standardFontDataUrl: '/lib/pdfjs/standard_fonts/',
             });
             const doc = await task.promise;
             const evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);

@@ -284,53 +284,57 @@ class DeepSeekFloatingWindow {
         const escapedVar = JSON.stringify(varName);
         return `
 (function() {
-    var b64 = window[${escapedVar}] || '';
-    var filename = ${escapedName};
-    var mimeType = ${escapedMime};
+    try {
+        var b64 = window[${escapedVar}] || '';
+        var filename = ${escapedName};
+        var mimeType = ${escapedMime};
 
-    // base64 → Uint8Array
-    var byteChars = atob(b64);
-    var len = byteChars.length;
-    var bytes = new Uint8Array(len);
-    for (var i = 0; i < len; i++) {
-        bytes[i] = byteChars.charCodeAt(i);
-    }
-    var file = new File([bytes], filename, { type: mimeType });
-
-    // 策略 A：通过 <input type="file"> 上传
-    var inputs = document.querySelectorAll('input[type="file"]');
-    for (var j = 0; j < inputs.length; j++) {
-        var input = inputs[j];
-        try {
-            var dt = new DataTransfer();
-            dt.items.add(file);
-            input.files = dt.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            return 'success';
-        } catch (e) {
-            // 该 input 不支持，继续尝试下一个
+        // base64 → Uint8Array
+        var byteChars = atob(b64);
+        var len = byteChars.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+            bytes[i] = byteChars.charCodeAt(i);
         }
-    }
+        var file = new File([bytes], filename, { type: mimeType });
 
-    // 策略 B：模拟拖拽放置（drag-drop）
-    var dropZone = document.querySelector('textarea')
-        || document.querySelector('div[contenteditable="true"]')
-        || document.querySelector('[class*="upload"]')
-        || document.querySelector('[class*="input"]');
-    if (dropZone) {
-        var dt2 = new DataTransfer();
-        dt2.items.add(file);
-        try {
-            dropZone.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt2, bubbles: true }));
-            dropZone.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt2, bubbles: true }));
-            dropZone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt2, bubbles: true }));
-            return 'drop';
-        } catch (e) {
-            // DragEvent 构造可能失败，忽略
+        // 策略 A：通过 <input type="file"> 上传
+        var inputs = document.querySelectorAll('input[type="file"]');
+        for (var j = 0; j < inputs.length; j++) {
+            var input = inputs[j];
+            try {
+                var dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'success';
+            } catch (e) {
+                // 该 input 不支持，继续尝试下一个
+            }
         }
-    }
 
-    return 'not-found';
+        // 策略 B：模拟拖拽放置（drag-drop）
+        var dropZone = document.querySelector('textarea')
+            || document.querySelector('div[contenteditable="true"]')
+            || document.querySelector('[class*="upload"]')
+            || document.querySelector('[class*="input"]');
+        if (dropZone) {
+            var dt2 = new DataTransfer();
+            dt2.items.add(file);
+            try {
+                dropZone.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt2, bubbles: true }));
+                dropZone.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt2, bubbles: true }));
+                dropZone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt2, bubbles: true }));
+                return 'drop';
+            } catch (e) {
+                // DragEvent 构造可能失败，忽略
+            }
+        }
+
+        return 'not-found';
+    } catch (e) {
+        return 'error: ' + (e && e.message ? e.message : e);
+    }
 })();
         `.trim();
     }
@@ -343,7 +347,11 @@ class DeepSeekFloatingWindow {
  */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     const bytes = new Uint8Array(buffer);
-    const chunkSize = 0x8000; // 32KB
+    // 32766 字节 = 3 * 10922，是 3 的倍数。
+    // 逐块 btoa 时若块大小不是 3 的倍数，每个分块都会产生独立的 base64 padding（=），
+    // 拼接后字符串中间会出现 '='，导致上传脚本里 atob(b64) 抛 Invalid character。
+    // 使用 3 的倍数可保证只有整个 base64 的末尾可能出现 padding。
+    const chunkSize = 0x7FFE; // 约 32KB，且可被 3 整除
     let out = '';
     for (let i = 0; i < bytes.length; i += chunkSize) {
         const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
