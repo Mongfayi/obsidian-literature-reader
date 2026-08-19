@@ -38,24 +38,32 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
 
     /**
      * 刷新指定 PDF 的高亮：
-     *  - 先从笔记内容重建索引
-     *  - explicitSelections 为刚批注写入的选区，直接并入索引（笔记可能尚未落盘，规避写入延迟，实现即时高亮）
+     *  - 刚批注写入的选区先记入「显式覆盖层」（笔记可能尚未落盘 / resolvedLinks
+     *    尚未收录新链接），由串行重建统一并入索引，规避写入延迟实现即时高亮
+     *  - 再从笔记内容重建索引（覆盖层条目会被笔记内容确认并自动清理）
      *  - 最后重渲染所有已打开该 PDF 的视图
      */
     refresh(pdfFile: TFile, explicitSelections?: SavedSelectionInfo[]): void {
         const pdfPath = pdfFile.path;
-        this.rebuildIndex(pdfPath).then(() => {
-            if (explicitSelections && explicitSelections.length > 0) {
-                const index = this.getOrCreateIndex(pdfPath, () => new Map<number, Set<SelectionId>>());
-                for (const sel of explicitSelections) {
-                    if (sel.page === null) continue;
-                    const selections = index.get(sel.page) ?? new Set<string>();
-                    selections.add(this.selectionId(sel));
-                    index.set(sel.page, selections);
-                }
+        if (explicitSelections && explicitSelections.length > 0) {
+            for (const sel of explicitSelections) {
+                if (sel.page === null) continue;
+                this.trackExplicitEntry(pdfPath, sel.page, this.selectionId(sel));
             }
+        }
+        this.rebuildIndexSerialized(pdfPath).then(() => {
             this.renderForPdf(pdfPath);
         });
+    }
+
+    /** 覆盖层条目并入文本选区索引；返回 true 表示已被笔记内容确认（移出覆盖层） */
+    protected applyExplicitEntry(index: PdfHighlightIndex, page: number, key: string): boolean {
+        const selections = index.get(page);
+        if (selections?.has(key)) return true;
+        const set = selections ?? new Set<SelectionId>();
+        set.add(key);
+        index.set(page, set);
+        return false;
     }
 
     /**
@@ -120,17 +128,21 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
         const index = this.indexCache.get(pdfPath);
         const selections = index?.get(pageNumber);
 
-        // 移除旧高亮层（文本层重渲染时 div 结构已重建，这里防御性清理）
-        pageView.div.querySelector('.pdf-reader-highlight-layer')?.remove();
-        if (!selections || selections.size === 0) return;
-
         const textLayerBuilder = pageView.textLayer;
         const textLayer = textLayerBuilder?.textLayer;
-        if (!textLayer) return;
+        const textDivs: HTMLElement[] = textLayer?.textDivs ?? [];
 
-        const textDivs: HTMLElement[] = textLayer.textDivs ?? [];
+        // 文本层尚未就绪（页面重渲染间隙 / 尚未渲染）：保留已有高亮层，
+        // 等待 textlayerrendered 事件就绪后重放，避免在中间态误删已放置的高亮
+        if (!textLayer || textDivs.length === 0) return;
+
+        // 无选区：权威索引为空（笔记中已无该页批注）→ 删除旧高亮层
+        if (!selections || selections.size === 0) {
+            pageView.div.querySelector('.pdf-reader-highlight-layer')?.remove();
+            return;
+        }
+
         const textContentItems: any[] = textLayer.textContentItems ?? [];
-        if (textDivs.length === 0) return;
 
         // 首个文本节点的 data-idx 可能非 0，批注索引是相对值，需换算回数组下标
         const firstIdx = parseInt(textDivs[0].getAttribute('data-idx') || '0', 10) || 0;
@@ -149,7 +161,10 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
             viewBox: pageView.pdfPage?.view ?? [0, 0, 0, 0],
         };
 
-        const layerEl = this.getOrCreateHighlightLayer(pageView);
+        // 先离线计算所有矩形：只有真正产出矩形时才替换旧层。
+        // 选区存在但计算不出矩形（如选区越界/文本层半就绪）时保留旧层，避免误删。
+        const rectsBySelection: { sel: string; rects: number[][] }[] = [];
+        let totalRects = 0;
         for (const selectionStr of selections) {
             const [bi, bo, ei, eo] = selectionStr.split(',').map((s) => parseInt(s, 10));
             if (Number.isNaN(bi) || Number.isNaN(bo) || Number.isNaN(ei) || Number.isNaN(eo)) continue;
@@ -159,8 +174,19 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
                 bi + firstIdx, bo, ei + firstIdx, eo,
                 pageGeom
             );
+            if (rects.length > 0) {
+                rectsBySelection.push({ sel: selectionStr, rects });
+                totalRects += rects.length;
+            }
+        }
+        if (totalRects === 0) return;
+
+        // 移除旧高亮层（文本层重渲染时 div 结构已重建，这里防御性清理）
+        pageView.div.querySelector('.pdf-reader-highlight-layer')?.remove();
+        const layerEl = this.getOrCreateHighlightLayer(pageView);
+        for (const { sel, rects } of rectsBySelection) {
             for (const rect of rects) {
-                this.placeRectInPage(rect, pageView, layerEl, pageNumber, selectionStr);
+                this.placeRectInPage(rect, pageView, layerEl, pageNumber, sel);
             }
         }
     }

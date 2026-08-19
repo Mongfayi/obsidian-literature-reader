@@ -58,7 +58,7 @@ __export(main_exports, {
   default: () => LiteratureReaderPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian13 = require("obsidian");
+var import_obsidian14 = require("obsidian");
 
 // types.ts
 var DEFAULT_SETTINGS = {
@@ -27351,60 +27351,64 @@ var DeepSeekFloatingWindow = class {
     const escapedVar = JSON.stringify(varName);
     return `
 (function() {
-    var b64 = window[${escapedVar}] || '';
-    var filename = ${escapedName};
-    var mimeType = ${escapedMime};
+    try {
+        var b64 = window[${escapedVar}] || '';
+        var filename = ${escapedName};
+        var mimeType = ${escapedMime};
 
-    // base64 \u2192 Uint8Array
-    var byteChars = atob(b64);
-    var len = byteChars.length;
-    var bytes = new Uint8Array(len);
-    for (var i = 0; i < len; i++) {
-        bytes[i] = byteChars.charCodeAt(i);
-    }
-    var file = new File([bytes], filename, { type: mimeType });
-
-    // \u7B56\u7565 A\uFF1A\u901A\u8FC7 <input type="file"> \u4E0A\u4F20
-    var inputs = document.querySelectorAll('input[type="file"]');
-    for (var j = 0; j < inputs.length; j++) {
-        var input = inputs[j];
-        try {
-            var dt = new DataTransfer();
-            dt.items.add(file);
-            input.files = dt.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            return 'success';
-        } catch (e) {
-            // \u8BE5 input \u4E0D\u652F\u6301\uFF0C\u7EE7\u7EED\u5C1D\u8BD5\u4E0B\u4E00\u4E2A
+        // base64 \u2192 Uint8Array
+        var byteChars = atob(b64);
+        var len = byteChars.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+            bytes[i] = byteChars.charCodeAt(i);
         }
-    }
+        var file = new File([bytes], filename, { type: mimeType });
 
-    // \u7B56\u7565 B\uFF1A\u6A21\u62DF\u62D6\u62FD\u653E\u7F6E\uFF08drag-drop\uFF09
-    var dropZone = document.querySelector('textarea')
-        || document.querySelector('div[contenteditable="true"]')
-        || document.querySelector('[class*="upload"]')
-        || document.querySelector('[class*="input"]');
-    if (dropZone) {
-        var dt2 = new DataTransfer();
-        dt2.items.add(file);
-        try {
-            dropZone.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt2, bubbles: true }));
-            dropZone.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt2, bubbles: true }));
-            dropZone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt2, bubbles: true }));
-            return 'drop';
-        } catch (e) {
-            // DragEvent \u6784\u9020\u53EF\u80FD\u5931\u8D25\uFF0C\u5FFD\u7565
+        // \u7B56\u7565 A\uFF1A\u901A\u8FC7 <input type="file"> \u4E0A\u4F20
+        var inputs = document.querySelectorAll('input[type="file"]');
+        for (var j = 0; j < inputs.length; j++) {
+            var input = inputs[j];
+            try {
+                var dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'success';
+            } catch (e) {
+                // \u8BE5 input \u4E0D\u652F\u6301\uFF0C\u7EE7\u7EED\u5C1D\u8BD5\u4E0B\u4E00\u4E2A
+            }
         }
-    }
 
-    return 'not-found';
+        // \u7B56\u7565 B\uFF1A\u6A21\u62DF\u62D6\u62FD\u653E\u7F6E\uFF08drag-drop\uFF09
+        var dropZone = document.querySelector('textarea')
+            || document.querySelector('div[contenteditable="true"]')
+            || document.querySelector('[class*="upload"]')
+            || document.querySelector('[class*="input"]');
+        if (dropZone) {
+            var dt2 = new DataTransfer();
+            dt2.items.add(file);
+            try {
+                dropZone.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt2, bubbles: true }));
+                dropZone.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt2, bubbles: true }));
+                dropZone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt2, bubbles: true }));
+                return 'drop';
+            } catch (e) {
+                // DragEvent \u6784\u9020\u53EF\u80FD\u5931\u8D25\uFF0C\u5FFD\u7565
+            }
+        }
+
+        return 'not-found';
+    } catch (e) {
+        return 'error: ' + (e && e.message ? e.message : e);
+    }
 })();
         `.trim();
   }
 };
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
-  const chunkSize = 32768;
+  const chunkSize = 32766;
   let out = "";
   for (let i = 0; i < bytes.length; i += chunkSize) {
     const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
@@ -27478,10 +27482,21 @@ var BasePdfHighlightModule = class {
     this.indexCache = /* @__PURE__ */ new Map();
     /** 已挂载事件监听的叶子（避免重复挂载） */
     this.attachedLeaves = /* @__PURE__ */ new Set();
+    /** 事件总线尚未就绪、等待重试挂载的叶子 */
+    this.attachRetries = /* @__PURE__ */ new Set();
     /** 重建索引的防抖定时器 */
     this.rebuildTimer = null;
     /** 防抖窗口内待重建的 PDF：'full' = 全量重建（删除/重命名路径），string[] = 局部重建路径集，null = 无待办 */
     this.pendingRebuild = null;
+    /**
+     * 显式高亮覆盖层：批注写入后、笔记内容尚未确认（resolvedLinks 未收录新链接 /
+     * metadataCache 落盘延迟）期间的显式条目（pdfPath → page → 条目 key）。
+     * 每次重建索引都会并入覆盖层并清理已被笔记内容确认的条目，
+     * 确保并发的防抖重建不会用「缺新条目」的索引覆盖掉刚批注的高亮。
+     */
+    this.explicitOverlay = /* @__PURE__ */ new Map();
+    /** 每个 PDF 的重建串行链：同一 PDF 的重建按序执行，避免并发交错旧索引覆盖新索引 */
+    this.rebuildChains = /* @__PURE__ */ new Map();
     this.ctx = ctx;
   }
   load() {
@@ -27521,12 +27536,68 @@ var BasePdfHighlightModule = class {
   }
   unload() {
     this.attachedLeaves.clear();
+    this.attachRetries.clear();
     this.indexCache.clear();
+    this.explicitOverlay.clear();
+    this.rebuildChains.clear();
     this.pendingRebuild = null;
     if (this.rebuildTimer !== null) {
       window.clearTimeout(this.rebuildTimer);
       this.rebuildTimer = null;
     }
+  }
+  /**
+   * 串行化执行 rebuildIndex：同一 PDF 的重建按启动顺序依次执行，
+   * 并在索引写回后并入「显式覆盖层」。并发重建交错时，后启动的重建
+   * 一定读到最新的笔记内容；覆盖层保证刚批注、尚未被笔记内容确认的
+   * 显式条目不会因任何一次重建而丢失。
+   */
+  rebuildIndexSerialized(pdfPath) {
+    const prev = this.rebuildChains.get(pdfPath) ?? Promise.resolve();
+    const next = prev.catch(() => {
+    }).then(async () => {
+      await this.rebuildIndex(pdfPath);
+      const index = this.indexCache.get(pdfPath);
+      if (index !== void 0) {
+        this.mergeExplicitOverlay(pdfPath, index);
+      }
+    });
+    this.rebuildChains.set(pdfPath, next);
+    return next;
+  }
+  /** 记录一条「尚未被笔记内容确认」的显式高亮条目（批注写入后立即调用） */
+  trackExplicitEntry(pdfPath, page, key) {
+    if (!Number.isInteger(page))
+      return;
+    let pages = this.explicitOverlay.get(pdfPath);
+    if (!pages) {
+      pages = /* @__PURE__ */ new Map();
+      this.explicitOverlay.set(pdfPath, pages);
+    }
+    const keys = pages.get(page) ?? /* @__PURE__ */ new Set();
+    keys.add(key);
+    pages.set(page, keys);
+  }
+  /**
+   * 把显式覆盖层并入刚重建的索引，并清理已被笔记内容确认的条目：
+   *  - key 已存在于索引（笔记内容已包含该批注）→ 移出覆盖层
+   *  - key 不存在（resolvedLinks 尚未收录笔记 / 笔记未落盘）→ 并入索引兜底
+   */
+  mergeExplicitOverlay(pdfPath, index) {
+    const pages = this.explicitOverlay.get(pdfPath);
+    if (!pages)
+      return;
+    for (const [page, keys] of pages) {
+      for (const key of keys) {
+        if (this.applyExplicitEntry(index, page, key)) {
+          keys.delete(key);
+        }
+      }
+      if (keys.size === 0)
+        pages.delete(page);
+    }
+    if (pages.size === 0)
+      this.explicitOverlay.delete(pdfPath);
   }
   /** 全部（已打开视图的 PDF）重建并重渲染 */
   scheduleRebuild() {
@@ -27558,6 +27629,7 @@ var BasePdfHighlightModule = class {
       const pending = this.pendingRebuild;
       this.pendingRebuild = null;
       if (pending === "full" || !pending) {
+        this.explicitOverlay.clear();
         this.rebuildAllIndexes().then(() => this.renderAllOpenPdfs());
       } else {
         this.rebuildAndRender(pending);
@@ -27567,25 +27639,17 @@ var BasePdfHighlightModule = class {
   /** 只重建指定 PDF 的索引并渲染对应视图（未打开的 PDF 渲染为空操作） */
   async rebuildAndRender(pdfPaths) {
     for (const path of pdfPaths) {
-      await this.rebuildIndex(path);
+      await this.rebuildIndexSerialized(path);
     }
     for (const path of pdfPaths) {
       this.renderForPdf(path);
     }
   }
-  getOrCreateIndex(pdfPath, factory) {
-    let index = this.indexCache.get(pdfPath);
-    if (!index) {
-      index = factory();
-      this.indexCache.set(pdfPath, index);
-    }
-    return index;
-  }
   /** 重建所有「当前有视图打开」的 PDF 索引 */
   async rebuildAllIndexes() {
     const openPdfPaths = this.getOpenPdfPaths();
     for (const path of openPdfPaths) {
-      await this.rebuildIndex(path);
+      await this.rebuildIndexSerialized(path);
     }
     for (const path of [...this.indexCache.keys()]) {
       if (!openPdfPaths.has(path) && !this.ctx.plugin.app.vault.getAbstractFileByPath(path)) {
@@ -27613,8 +27677,10 @@ var BasePdfHighlightModule = class {
         return;
       const viewer = leaf.view.viewer;
       const eventBus = viewer?.child?.pdfViewer?.eventBus;
-      if (!eventBus)
+      if (!eventBus) {
+        this.retryAttachPdfLeaf(leaf);
         return;
+      }
       this.attachedLeaves.add(leaf);
       const onRendered = (data) => {
         const pdfFile2 = leaf.view.file;
@@ -27631,6 +27697,32 @@ var BasePdfHighlightModule = class {
       if (pdfFile) {
         this.scheduleRebuildForPdfs([pdfFile.path]);
       }
+    });
+  }
+  /**
+   * 事件总线未就绪时的延迟重试：PDF 视图组件（viewer.child.pdfViewer）是异步
+   * 加载的，layout-change / active-leaf-change 可能在其就绪前触发，导致挂载被
+   * 跳过且不再有事件补挂。轮询最多 4 秒（40 × 100ms），就绪后重跑 attachToPdfLeaves。
+   */
+  retryAttachPdfLeaf(leaf) {
+    if (this.attachRetries.has(leaf))
+      return;
+    this.attachRetries.add(leaf);
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      tries++;
+      const viewer = leaf.view.viewer;
+      const eventBus = viewer?.child?.pdfViewer?.eventBus;
+      if (eventBus || tries >= 40) {
+        window.clearInterval(timer);
+        this.attachRetries.delete(leaf);
+        if (eventBus)
+          this.attachToPdfLeaves();
+      }
+    }, 100);
+    this.ctx.plugin.register(() => {
+      window.clearInterval(timer);
+      this.attachRetries.delete(leaf);
     });
   }
   renderForPdf(pdfPath) {
@@ -27683,25 +27775,33 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
   }
   /**
    * 刷新指定 PDF 的高亮：
-   *  - 先从笔记内容重建索引
-   *  - explicitSelections 为刚批注写入的选区，直接并入索引（笔记可能尚未落盘，规避写入延迟，实现即时高亮）
+   *  - 刚批注写入的选区先记入「显式覆盖层」（笔记可能尚未落盘 / resolvedLinks
+   *    尚未收录新链接），由串行重建统一并入索引，规避写入延迟实现即时高亮
+   *  - 再从笔记内容重建索引（覆盖层条目会被笔记内容确认并自动清理）
    *  - 最后重渲染所有已打开该 PDF 的视图
    */
   refresh(pdfFile, explicitSelections) {
     const pdfPath = pdfFile.path;
-    this.rebuildIndex(pdfPath).then(() => {
-      if (explicitSelections && explicitSelections.length > 0) {
-        const index = this.getOrCreateIndex(pdfPath, () => /* @__PURE__ */ new Map());
-        for (const sel of explicitSelections) {
-          if (sel.page === null)
-            continue;
-          const selections = index.get(sel.page) ?? /* @__PURE__ */ new Set();
-          selections.add(this.selectionId(sel));
-          index.set(sel.page, selections);
-        }
+    if (explicitSelections && explicitSelections.length > 0) {
+      for (const sel of explicitSelections) {
+        if (sel.page === null)
+          continue;
+        this.trackExplicitEntry(pdfPath, sel.page, this.selectionId(sel));
       }
+    }
+    this.rebuildIndexSerialized(pdfPath).then(() => {
       this.renderForPdf(pdfPath);
     });
+  }
+  /** 覆盖层条目并入文本选区索引；返回 true 表示已被笔记内容确认（移出覆盖层） */
+  applyExplicitEntry(index, page, key) {
+    const selections = index.get(page);
+    if (selections?.has(key))
+      return true;
+    const set = selections ?? /* @__PURE__ */ new Set();
+    set.add(key);
+    index.set(page, set);
+    return false;
   }
   /**
    * 重建单个 PDF 的索引。
@@ -27758,17 +27858,16 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
     const pageNumber = parseInt(pageView.div.dataset.pageNumber, 10) || 0;
     const index = this.indexCache.get(pdfPath);
     const selections = index?.get(pageNumber);
-    pageView.div.querySelector(".pdf-reader-highlight-layer")?.remove();
-    if (!selections || selections.size === 0)
-      return;
     const textLayerBuilder = pageView.textLayer;
     const textLayer = textLayerBuilder?.textLayer;
-    if (!textLayer)
+    const textDivs = textLayer?.textDivs ?? [];
+    if (!textLayer || textDivs.length === 0)
       return;
-    const textDivs = textLayer.textDivs ?? [];
+    if (!selections || selections.size === 0) {
+      pageView.div.querySelector(".pdf-reader-highlight-layer")?.remove();
+      return;
+    }
     const textContentItems = textLayer.textContentItems ?? [];
-    if (textDivs.length === 0)
-      return;
     const firstIdx = parseInt(textDivs[0].getAttribute("data-idx") || "0", 10) || 0;
     const pageDivRect = pageView.div.getBoundingClientRect();
     const pageGeom = {
@@ -27780,7 +27879,8 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
       },
       viewBox: pageView.pdfPage?.view ?? [0, 0, 0, 0]
     };
-    const layerEl = this.getOrCreateHighlightLayer(pageView);
+    const rectsBySelection = [];
+    let totalRects = 0;
     for (const selectionStr of selections) {
       const [bi, bo, ei, eo] = selectionStr.split(",").map((s) => parseInt(s, 10));
       if (Number.isNaN(bi) || Number.isNaN(bo) || Number.isNaN(ei) || Number.isNaN(eo))
@@ -27794,8 +27894,18 @@ var PdfHighlightModule = class extends BasePdfHighlightModule {
         eo,
         pageGeom
       );
+      if (rects.length > 0) {
+        rectsBySelection.push({ sel: selectionStr, rects });
+        totalRects += rects.length;
+      }
+    }
+    if (totalRects === 0)
+      return;
+    pageView.div.querySelector(".pdf-reader-highlight-layer")?.remove();
+    const layerEl = this.getOrCreateHighlightLayer(pageView);
+    for (const { sel, rects } of rectsBySelection) {
       for (const rect of rects) {
-        this.placeRectInPage(rect, pageView, layerEl, pageNumber, selectionStr);
+        this.placeRectInPage(rect, pageView, layerEl, pageNumber, sel);
       }
     }
   }
@@ -28490,7 +28600,13 @@ var PdfDocCache = class {
       const task = pdfjs.getDocument({
         data: buffer,
         cMapPacked: true,
-        cMapUrl: "/lib/pdfjs/cmaps/"
+        cMapUrl: "/lib/pdfjs/cmaps/",
+        // Obsidian 内置 pdf.js 5.x 需要显式提供这些资源路径；
+        // 尤其是 wasmUrl，否则 JPEG2000（JPX）等图片解码会失败，
+        // 导致截图嵌入只渲染出文字、丢失图片。
+        wasmUrl: "/lib/pdfjs/wasm/",
+        iccUrl: "/lib/pdfjs/iccs/",
+        standardFontDataUrl: "/lib/pdfjs/standard_fonts/"
       });
       const doc = await task.promise;
       const evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);
@@ -28904,28 +29020,34 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
   }
   /**
    * 刷新指定 PDF 的高亮：
-   *  - 先从笔记内容重建索引
-   *  - explicit 为刚批注写入的条目，直接并入索引（规避 metadataCache 落盘延迟，实现即时高亮）
+   *  - 刚批注写入的条目先记入「显式覆盖层」（笔记可能尚未落盘 / resolvedLinks
+   *    尚未收录新链接），由串行重建统一并入索引，规避 metadataCache 落盘延迟
+   *  - 再从笔记内容重建索引（覆盖层条目会被笔记内容确认并自动清理）
    *  - 最后重渲染所有已打开该 PDF 的视图
    */
   refresh(pdfFile, explicit) {
     const pdfPath = pdfFile.path;
-    this.rebuildIndex(pdfPath).then(() => {
-      if (explicit && explicit.length > 0) {
-        const index = this.getOrCreateIndex(pdfPath, () => /* @__PURE__ */ new Map());
-        for (const e of explicit) {
-          const pageMap = index.get(e.page) ?? /* @__PURE__ */ new Map();
-          pageMap.set(rectKey(e.rect), {
-            nx: e.rect.x,
-            ny: e.rect.y,
-            nw: e.rect.w,
-            nh: e.rect.h
-          });
-          index.set(e.page, pageMap);
-        }
+    if (explicit && explicit.length > 0) {
+      for (const e of explicit) {
+        this.trackExplicitEntry(pdfPath, e.page, rectKey(e.rect));
       }
+    }
+    this.rebuildIndexSerialized(pdfPath).then(() => {
       this.renderForPdf(pdfPath);
     });
+  }
+  /** 覆盖层条目并入 OCR 矩形索引；返回 true 表示已被笔记内容确认（移出覆盖层） */
+  applyExplicitEntry(index, page, key) {
+    const pageMap = index.get(page);
+    if (pageMap?.has(key))
+      return true;
+    const rect = parseRectKey(key);
+    if (!rect)
+      return false;
+    const map = pageMap ?? /* @__PURE__ */ new Map();
+    map.set(key, { nx: rect.x, ny: rect.y, nw: rect.w, nh: rect.h });
+    index.set(page, map);
+    return false;
   }
   /**
    * 重建单个 PDF 的索引。
@@ -28979,11 +29101,13 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
       return;
     const pageDiv = pageView.div;
     const pageNumber = parseInt(pageDiv.dataset.pageNumber ?? "0", 10) || 0;
-    pageDiv.querySelector(".ocr-highlight-layer")?.remove();
     const index = this.indexCache.get(pdfPath);
     const pageMap = index?.get(pageNumber);
-    if (!pageMap || pageMap.size === 0)
+    if (!pageMap || pageMap.size === 0) {
+      pageDiv.querySelector(".ocr-highlight-layer")?.remove();
       return;
+    }
+    pageDiv.querySelector(".ocr-highlight-layer")?.remove();
     const layerEl = pageDiv.createDiv("ocr-highlight-layer");
     for (const h of pageMap.values()) {
       const rectEl = layerEl.createDiv("ocr-crop-highlight");
@@ -29000,6 +29124,13 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
 };
 function rectKey(r) {
   return `${Number(r.x.toFixed(4))},${Number(r.y.toFixed(4))},${Number(r.w.toFixed(4))},${Number(r.h.toFixed(4))}`;
+}
+function parseRectKey(key) {
+  const parts = key.split(",").map((s) => Number(s));
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p)))
+    return null;
+  const [x, y, w, h] = parts;
+  return { x, y, w, h };
 }
 
 // modules/MainArticleModule.ts
@@ -29775,9 +29906,172 @@ var PdfJumpModule = class {
   }
 };
 
-// modules/SettingsTab.ts
+// modules/ReadingNoteMarkerModule.ts
 var import_obsidian12 = require("obsidian");
-var UnifiedSettingTab = class extends import_obsidian12.PluginSettingTab {
+var ReadingNoteMarkerModule = class {
+  constructor(ctx) {
+    /** 已有阅读笔记的 PDF 路径集合 */
+    this.pdfPathsWithNotes = /* @__PURE__ */ new Set();
+    /** 各文件管理器叶子的 MutationObserver，用于 DOM 动态重建后重新装饰 */
+    this.observers = [];
+    // ========== 监听与防抖 ==========
+    /** 文件管理器虚拟滚动/重建时，只需要重新装饰，不重建索引 */
+    this.decorateAllDebounced = (0, import_obsidian12.debounce)(() => {
+      this.decorateAll();
+    }, 100, true);
+    /** 文件/笔记变化时，重建索引并重新装饰 */
+    this.scheduleRefresh = (0, import_obsidian12.debounce)(async () => {
+      try {
+        await this.rebuildIndex();
+        this.decorateAll();
+      } catch (e) {
+        console.error("[ReadingNoteMarker] \u5237\u65B0\u9605\u8BFB\u7B14\u8BB0\u6807\u8BB0\u5931\u8D25:", e);
+      }
+    }, 200, true);
+    this.ctx = ctx;
+  }
+  load() {
+    const plugin = this.ctx.plugin;
+    plugin.app.workspace.onLayoutReady(() => {
+      void this.scheduleRefresh();
+      this.watchExplorers();
+    });
+    plugin.registerEvent(plugin.app.vault.on("create", () => this.scheduleRefresh()));
+    plugin.registerEvent(plugin.app.vault.on("delete", () => this.scheduleRefresh()));
+    plugin.registerEvent(plugin.app.vault.on("rename", () => this.scheduleRefresh()));
+    plugin.registerEvent(plugin.app.metadataCache.on("changed", (file) => {
+      if (file.extension === "md")
+        this.scheduleRefresh();
+    }));
+    plugin.registerEvent(plugin.app.metadataCache.on("resolved", () => this.scheduleRefresh()));
+    plugin.registerEvent(plugin.app.workspace.on("layout-change", () => {
+      this.watchExplorers();
+      this.scheduleRefresh();
+    }));
+    plugin.register(() => {
+      this.decorateAllDebounced.cancel();
+      this.scheduleRefresh.cancel();
+      this.disconnectObservers();
+      this.clearAll();
+      this.pdfPathsWithNotes.clear();
+    });
+  }
+  unload() {
+    this.decorateAllDebounced.cancel();
+    this.scheduleRefresh.cancel();
+    this.disconnectObservers();
+    this.clearAll();
+    this.pdfPathsWithNotes.clear();
+  }
+  // ========== 索引建立 ==========
+  /**
+   * 重建“PDF 路径 -> 已有阅读笔记”索引。
+   * 优先使用 frontmatter 的 pdf 字段；旧笔记无该字段时按命名规则在阅读笔记文件夹内兜底。
+   */
+  async rebuildIndex() {
+    const next = /* @__PURE__ */ new Set();
+    const pdfsByBasename = /* @__PURE__ */ new Map();
+    for (const file of this.ctx.plugin.app.vault.getFiles()) {
+      if (file.extension !== "pdf")
+        continue;
+      const arr = pdfsByBasename.get(file.basename) ?? [];
+      arr.push(file.path);
+      pdfsByBasename.set(file.basename, arr);
+    }
+    const folderPath = (0, import_obsidian12.normalizePath)(this.ctx.getSettings().readingNoteFolder);
+    for (const note of this.ctx.plugin.app.vault.getMarkdownFiles()) {
+      const pdfPath = this.extractPdfPath(note);
+      if (pdfPath) {
+        next.add(pdfPath);
+        continue;
+      }
+      const inReadingFolder = !folderPath || note.path.startsWith(folderPath + "/");
+      if (inReadingFolder) {
+        const m = note.basename.match(/^(.+) 阅读(?: \((\d+)\))?$/);
+        if (!m)
+          continue;
+        const matches = pdfsByBasename.get(m[1]);
+        if (matches?.length === 1)
+          next.add(matches[0]);
+      }
+    }
+    this.pdfPathsWithNotes = next;
+  }
+  /** 从笔记 frontmatter 中解析 `pdf: "[[path]]"`，返回 PDF 路径；无则返回 null */
+  extractPdfPath(note) {
+    const fm = this.ctx.plugin.app.metadataCache.getFileCache(note)?.frontmatter;
+    const value = fm?.pdf;
+    if (typeof value !== "string")
+      return null;
+    const m = value.match(/\[\[(.+?)\]\]/);
+    const path = (m ? m[1] : value.trim()) || "";
+    return path || null;
+  }
+  // ========== 文件管理器 DOM 装饰 ==========
+  /** 遍历所有文件管理器叶子，重新装饰所有 PDF 行 */
+  decorateAll() {
+    for (const leaf of this.ctx.plugin.app.workspace.getLeavesOfType("file-explorer")) {
+      const container = leaf.view.containerEl;
+      if (!container)
+        continue;
+      container.querySelectorAll(".nav-file-title[data-path]").forEach((el) => this.decorateEl(el));
+    }
+  }
+  /** 装饰单个文件管理器行：有笔记的 PDF 加 class + 小图标 */
+  decorateEl(el) {
+    const path = el.getAttribute("data-path") || "";
+    const hasNote = path.toLowerCase().endsWith(".pdf") && this.pdfPathsWithNotes.has(path);
+    el.toggleClass("pdf-reader-has-note", hasNote);
+    let marker = el.querySelector(":scope > .pdf-reader-has-note-marker");
+    if (hasNote) {
+      if (!marker) {
+        marker = el.createSpan({ cls: "pdf-reader-has-note-marker" });
+        (0, import_obsidian12.setIcon)(marker, "file-check");
+        (0, import_obsidian12.setTooltip)(marker, "\u5DF2\u6709\u9605\u8BFB\u7B14\u8BB0");
+        const content = el.querySelector(".nav-file-title-content");
+        if (content) {
+          content.before(marker);
+        } else {
+          el.prepend(marker);
+        }
+      }
+    } else {
+      marker?.remove();
+    }
+  }
+  /** 清理所有文件管理器行上的标记 */
+  clearAll() {
+    for (const leaf of this.ctx.plugin.app.workspace.getLeavesOfType("file-explorer")) {
+      const container = leaf.view.containerEl;
+      if (!container)
+        continue;
+      container.querySelectorAll(".pdf-reader-has-note-marker").forEach((el) => el.remove());
+      container.querySelectorAll(".nav-file-title.pdf-reader-has-note").forEach((el) => el.removeClass("pdf-reader-has-note"));
+    }
+  }
+  /** 为每个文件管理器叶子挂 MutationObserver，处理虚拟化/重建 */
+  watchExplorers() {
+    this.disconnectObservers();
+    for (const leaf of this.ctx.plugin.app.workspace.getLeavesOfType("file-explorer")) {
+      const container = leaf.view.containerEl;
+      if (!container)
+        continue;
+      const observer = new MutationObserver(() => this.decorateAllDebounced());
+      observer.observe(container, { subtree: true, childList: true });
+      this.observers.push(observer);
+    }
+  }
+  disconnectObservers() {
+    for (const observer of this.observers) {
+      observer.disconnect();
+    }
+    this.observers = [];
+  }
+};
+
+// modules/SettingsTab.ts
+var import_obsidian13 = require("obsidian");
+var UnifiedSettingTab = class extends import_obsidian13.PluginSettingTab {
   constructor(app, plugin, getSettings, saveSettings) {
     super(app, plugin);
     /** 防抖保存定时器（连续输入时避免每字符一次全量写盘） */
@@ -29811,60 +30105,60 @@ var UnifiedSettingTab = class extends import_obsidian12.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "PDF \u9605\u8BFB\u8BBE\u7F6E" });
-    new import_obsidian12.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939").setDesc("\u65B0\u521B\u5EFA\u7684\u9605\u8BFB\u7B14\u8BB0\u5C06\u5B58\u653E\u5728\u6B64\u6587\u4EF6\u5939\u4E2D\uFF08\u76F8\u5BF9 vault \u6839\u76EE\u5F55\uFF09").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.readingNoteFolder).setValue(this.getSettings().readingNoteFolder).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939").setDesc("\u65B0\u521B\u5EFA\u7684\u9605\u8BFB\u7B14\u8BB0\u5C06\u5B58\u653E\u5728\u6B64\u6587\u4EF6\u5939\u4E2D\uFF08\u76F8\u5BF9 vault \u6839\u76EE\u5F55\uFF09").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.readingNoteFolder).setValue(this.getSettings().readingNoteFolder).onChange(async (value) => {
       this.getSettings().readingNoteFolder = value.trim() || DEFAULT_SETTINGS.readingNoteFolder;
       this.scheduleSave();
     }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "DeepSeek \u6D6E\u52A8\u7A97\u53E3\u8BBE\u7F6E" });
-    new import_obsidian12.Setting(containerEl).setName("DeepSeek URL").setDesc("\u5D4C\u5165\u6D6E\u52A8\u7A97\u53E3\u7684 DeepSeek \u7F51\u9875\u5730\u5740\uFF0C\u4FEE\u6539\u540E\u9700\u91CD\u542F\u63D2\u4EF6\u6216\u91CD\u65B0\u6253\u5F00\u7A97\u53E3\u751F\u6548").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.deepseekUrl).setValue(this.getSettings().deepseekUrl).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("DeepSeek URL").setDesc("\u5D4C\u5165\u6D6E\u52A8\u7A97\u53E3\u7684 DeepSeek \u7F51\u9875\u5730\u5740\uFF0C\u4FEE\u6539\u540E\u9700\u91CD\u542F\u63D2\u4EF6\u6216\u91CD\u65B0\u6253\u5F00\u7A97\u53E3\u751F\u6548").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.deepseekUrl).setValue(this.getSettings().deepseekUrl).onChange(async (value) => {
       this.getSettings().deepseekUrl = value || DEFAULT_SETTINGS.deepseekUrl;
       this.scheduleSave();
     }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "\u622A\u56FE OCR \u6279\u6CE8\u8BBE\u7F6E" });
-    new import_obsidian12.Setting(containerEl).setName("LM Studio \u670D\u52A1\u5668\u5730\u5740").setDesc("OpenAI \u517C\u5BB9\u63A5\u53E3\u5730\u5740\uFF0C\u9700\u5148\u542F\u52A8 LM Studio \u5E76\u52A0\u8F7D\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl).setValue(this.getSettings().ocrServerUrl).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("LM Studio \u670D\u52A1\u5668\u5730\u5740").setDesc("OpenAI \u517C\u5BB9\u63A5\u53E3\u5730\u5740\uFF0C\u9700\u5148\u542F\u52A8 LM Studio \u5E76\u52A0\u8F7D\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl).setValue(this.getSettings().ocrServerUrl).onChange(async (value) => {
       this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
       this.scheduleSave();
     }));
-    new import_obsidian12.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
+    new import_obsidian13.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("sk-lm-...").setValue(this.getSettings().ocrApiKey).onChange(async (value) => {
         this.getSettings().ocrApiKey = value.trim();
         this.scheduleSave();
       });
     });
-    new import_obsidian12.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u7559\u7A7A = \u81EA\u52A8\u9009\u62E9\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u9009\u62E9").setValue(this.getSettings().ocrModel).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u7559\u7A7A = \u81EA\u52A8\u9009\u62E9\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u9009\u62E9").setValue(this.getSettings().ocrModel).onChange(async (value) => {
       this.getSettings().ocrModel = value.trim();
       this.scheduleSave();
     }));
-    new import_obsidian12.Setting(containerEl).setName("\u8BF7\u6C42\u8D85\u65F6\uFF08\u79D2\uFF09").setDesc("\u5355\u6B21 OCR \u8BF7\u6C42\u8D85\u65F6\u65F6\u95F4").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec)).setValue(String(this.getSettings().ocrRequestTimeoutSec)).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("\u8BF7\u6C42\u8D85\u65F6\uFF08\u79D2\uFF09").setDesc("\u5355\u6B21 OCR \u8BF7\u6C42\u8D85\u65F6\u65F6\u95F4").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec)).setValue(String(this.getSettings().ocrRequestTimeoutSec)).onChange(async (value) => {
       const n = parseInt(value, 10);
       if (!Number.isNaN(n) && n >= 10) {
         this.getSettings().ocrRequestTimeoutSec = n;
         this.scheduleSave();
       }
     }));
-    new import_obsidian12.Setting(containerEl).setName("\u6700\u5927\u8F93\u51FA\u4EE4\u724C").setDesc("\u5355\u6B21\u8BC6\u522B\u8BF7\u6C42\u5141\u8BB8\u7684\u6700\u5927\u8F93\u51FA\u957F\u5EA6\uFF08token\uFF09\uFF0C\u6846\u9009\u533A\u57DF\u6587\u672C\u8F83\u591A\u65F6\u53EF\u8C03\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens)).setValue(String(this.getSettings().ocrMaxTokens)).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("\u6700\u5927\u8F93\u51FA\u4EE4\u724C").setDesc("\u5355\u6B21\u8BC6\u522B\u8BF7\u6C42\u5141\u8BB8\u7684\u6700\u5927\u8F93\u51FA\u957F\u5EA6\uFF08token\uFF09\uFF0C\u6846\u9009\u533A\u57DF\u6587\u672C\u8F83\u591A\u65F6\u53EF\u8C03\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens)).setValue(String(this.getSettings().ocrMaxTokens)).onChange(async (value) => {
       const n = parseInt(value, 10);
       if (!Number.isNaN(n) && n >= 512) {
         this.getSettings().ocrMaxTokens = n;
         this.scheduleSave();
       }
     }));
-    new import_obsidian12.Setting(containerEl).setName("OCR \u63D0\u793A\u8BCD").setDesc("PaddleOCR-VL \u4F7F\u7528\u5B98\u65B9\u4EFB\u52A1\u8BCD\uFF08\u5982 OCR:\uFF09").addTextArea((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrPrompt).setValue(this.getSettings().ocrPrompt).onChange(async (value) => {
+    new import_obsidian13.Setting(containerEl).setName("OCR \u63D0\u793A\u8BCD").setDesc("PaddleOCR-VL \u4F7F\u7528\u5B98\u65B9\u4EFB\u52A1\u8BCD\uFF08\u5982 OCR:\uFF09").addTextArea((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrPrompt).setValue(this.getSettings().ocrPrompt).onChange(async (value) => {
       this.getSettings().ocrPrompt = value || DEFAULT_SETTINGS.ocrPrompt;
       this.scheduleSave();
     }));
-    new import_obsidian12.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
+    new import_obsidian13.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
       const service = new OcrService(this.getSettings().ocrServerUrl, this.getSettings().ocrApiKey);
       btn.setButtonText("\u6D4B\u8BD5\u4E2D\u2026").setDisabled(true);
       try {
         const models = await service.listModels();
-        new import_obsidian12.Notice(`\u8FDE\u63A5\u6210\u529F\uFF0C\u53EF\u7528\u6A21\u578B\uFF1A
+        new import_obsidian13.Notice(`\u8FDE\u63A5\u6210\u529F\uFF0C\u53EF\u7528\u6A21\u578B\uFF1A
 ${models.join("\n")}`, 8e3);
       } catch (e) {
-        new import_obsidian12.Notice(`\u8FDE\u63A5\u5931\u8D25: ${e.message}`);
+        new import_obsidian13.Notice(`\u8FDE\u63A5\u5931\u8D25: ${e.message}`);
       } finally {
         btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").setDisabled(false);
       }
@@ -29912,7 +30206,7 @@ ${models.join("\n")}`, 8e3);
 };
 
 // main.ts
-var LiteratureReaderPlugin = class extends import_obsidian13.Plugin {
+var LiteratureReaderPlugin = class extends import_obsidian14.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -29938,6 +30232,7 @@ var LiteratureReaderPlugin = class extends import_obsidian13.Plugin {
     const mainArticleModule = new MainArticleModule(ctx, pdfModule);
     const annotationModeModule = new AnnotationModeModule(ctx, pdfModule);
     const jumpModule = new PdfJumpModule(ctx);
+    const readingNoteMarkerModule = new ReadingNoteMarkerModule(ctx);
     const deepseekCtx = {
       ...ctx,
       getCurrentFileForUpload: () => pdfModule.getCurrentFileForUpload()
@@ -29951,6 +30246,7 @@ var LiteratureReaderPlugin = class extends import_obsidian13.Plugin {
       ocrHighlightModule,
       ocrModule,
       jumpModule,
+      readingNoteMarkerModule,
       new DeepSeekModule(deepseekCtx)
     ];
     for (const mod of this.modules) {

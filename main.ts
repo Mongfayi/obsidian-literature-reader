@@ -9,6 +9,7 @@ import { OcrHighlightModule } from './modules/OcrHighlightModule';
 import { MainArticleModule } from './modules/MainArticleModule';
 import { AnnotationModeModule } from './modules/AnnotationModeModule';
 import { PdfJumpModule } from './modules/PdfJumpModule';
+import { ReadingNoteMarkerModule } from './modules/ReadingNoteMarkerModule';
 import { UnifiedSettingTab } from './modules/SettingsTab';
 
 /**
@@ -63,6 +64,9 @@ export default class LiteratureReaderPlugin extends Plugin {
         // （目标未打开时在笔记左侧 / PDF 右侧分屏打开，不在焦点叶子直接打开）
         const jumpModule = new PdfJumpModule(ctx);
 
+        // 文件管理器标记模块：为已有阅读笔记的 PDF 在左侧文件管理器中显示小图标
+        const readingNoteMarkerModule = new ReadingNoteMarkerModule(ctx);
+
         const deepseekCtx: ModuleContext = {
             ...ctx,
             getCurrentFileForUpload: () => pdfModule.getCurrentFileForUpload(),
@@ -78,6 +82,7 @@ export default class LiteratureReaderPlugin extends Plugin {
             ocrHighlightModule,
             ocrModule,
             jumpModule,
+            readingNoteMarkerModule,
             new DeepSeekModule(deepseekCtx),
         ];
 
