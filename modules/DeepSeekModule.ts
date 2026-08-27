@@ -1,12 +1,13 @@
 import { Notice } from 'obsidian';
-import type { ModuleContext, PluginModule, FileUploadData } from '../types';
+import type { ModuleContext, PluginModule, FileUploadData, WindowGeometry } from '../types';
 
 /**
  * DeepSeek 浮动窗口模块
  *
  * 职责：
  *  - 以浮动窗口形式嵌入 DeepSeek 网页聊天
- *  - 支持标题栏拖拽、最小化、置顶显示
+ *  - 支持标题栏拖拽、拖动边缘调整大小、最小化、置顶显示
+ *  - 窗口位置/大小（几何信息）在拖拽/缩放后自动持久化到插件设置，重启后恢复
  *  - 提供 Ribbon 图标与命令切换窗口显隐
  *  - 「添加当前文件」按钮：将正在阅读的文件上传到 DeepSeek 聊天框
  *
@@ -51,17 +52,27 @@ export class DeepSeekModule implements PluginModule {
 /** 上传文件大小上限（100MB），超过则提示用户 */
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
+/** 浮动窗口最小尺寸（拖动边缘调整大小时的下限） */
+const MIN_WINDOW_WIDTH = 320;
+const MIN_WINDOW_HEIGHT = 400;
+
+/** 缩放手柄方向 → 对应 CSS 类名后缀（n/s/e/w/ne/nw/se/sw） */
+const RESIZE_DIRECTIONS = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'] as const;
+
 /**
  * DeepSeek 浮动窗口
- * 负责窗口的创建、显示、隐藏、拖拽与销毁
+ * 负责窗口的创建、显示、隐藏、拖拽、边缘缩放与销毁
  */
 class DeepSeekFloatingWindow {
     private ctx: ModuleContext;
     private container: HTMLElement | null = null;
+    private content: HTMLElement | null = null;
     private webview: any = null;
     private isVisible = false;
     private isDragging = false;
     private dragOffset = { x: 0, y: 0 };
+    /** 正在进行的边缘缩放清理函数（挂 document 级监听；销毁窗口时兜底调用） */
+    private resizeCleanup: (() => void) | null = null;
 
     constructor(ctx: ModuleContext) {
         this.ctx = ctx;
@@ -108,6 +119,19 @@ class DeepSeekFloatingWindow {
             },
         });
         this.webview = wv as any;
+        this.content = content;
+
+        // 恢复上次保存的窗口几何（位置 + 大小）
+        this.applySavedGeometry(container);
+
+        // 注入八方向缩放手柄（拖动边缘调整大小）
+        for (const dir of RESIZE_DIRECTIONS) {
+            const handle = container.createDiv({ cls: `deepseek-float-resize deepseek-float-resize-${dir}` });
+            handle.addEventListener('mousedown', (e: MouseEvent) => {
+                e.stopPropagation();
+                this.beginResize(e, dir);
+            });
+        }
 
         // 拖拽：按下标题栏时记录偏移并禁用 webview 指针事件；点击按钮不触发拖拽
         titleBar.addEventListener('mousedown', (e) => {
@@ -134,6 +158,8 @@ class DeepSeekFloatingWindow {
                 container.style.cursor = '';
                 container.style.transition = '';
                 content.style.pointerEvents = '';
+                // 拖拽结束：持久化窗口位置（含大小），重启后恢复
+                this.persistGeometry();
             }
         };
 
@@ -154,11 +180,12 @@ class DeepSeekFloatingWindow {
         // 先恢复显示，否则 display:none 下 getBoundingClientRect 恒为 0，
         // 会误判为「已拖出视口」而清空上次拖拽位置（导致隐藏后再显示位置丢失）
         this.container.style.display = 'flex';
-        // 若面板已被完全拖出 Obsidian 可视区域，复位到默认位置，避免无法找回
+        // 若面板已被完全拖出 Obsidian 可视区域，复位到 CSS 默认位置与尺寸，避免无法找回；
+        // 同时清除持久化几何，否则下次创建窗口又会回到屏幕外
         const rect = this.container.getBoundingClientRect();
         if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) {
-            this.container.style.left = '';
-            this.container.style.top = '';
+            this.resetGeometryStyles(this.container);
+            this.clearGeometry();
         }
         this.isVisible = true;
     }
@@ -178,9 +205,142 @@ class DeepSeekFloatingWindow {
     }
 
     destroy() {
+        this.resizeCleanup?.();
+        this.resizeCleanup = null;
         this.container?.remove();
         this.container = null;
+        this.content = null;
         this.webview = null;
+    }
+
+    // ========== 窗口几何：持久化与恢复 ==========
+
+    /** 恢复保存的窗口几何（非法或缺省时保持 CSS 默认值） */
+    private applySavedGeometry(container: HTMLElement): void {
+        const geom = this.ctx.getSettings().deepseekWindowGeometry;
+        if (!isValidGeometry(geom)) return;
+        container.style.width = `${geom!.width}px`;
+        container.style.height = `${geom!.height}px`;
+        container.style.left = `${geom!.left}px`;
+        container.style.top = `${geom!.top}px`;
+        // 覆盖 CSS 中的 right 定位（left/right 同时生效会拉伸元素）
+        container.style.right = 'auto';
+    }
+
+    /** 把当前窗口几何写入设置并落盘 */
+    private persistGeometry(): void {
+        if (!this.container) return;
+        const rect = this.container.getBoundingClientRect();
+        const geom: WindowGeometry = {
+            left: Math.round(rect.left),
+            top: Math.round(rect.top),
+            width: Math.max(1, Math.round(rect.width)),
+            height: Math.max(1, Math.round(rect.height)),
+        };
+        if (!isValidGeometry(geom)) return;
+        try {
+            this.ctx.getSettings().deepseekWindowGeometry = geom;
+            void this.ctx.saveSettings().catch((e) => {
+                console.error('[DeepSeek] 保存窗口几何失败:', e);
+            });
+        } catch (e) {
+            console.error('[DeepSeek] 写入窗口几何失败:', e);
+        }
+    }
+
+    /** 清除持久化几何（面板被拖出视口复位时调用） */
+    private clearGeometry(): void {
+        try {
+            this.ctx.getSettings().deepseekWindowGeometry = null;
+            void this.ctx.saveSettings().catch((e) => {
+                console.error('[DeepSeek] 清除窗口几何失败:', e);
+            });
+        } catch (e) {
+            console.error('[DeepSeek] 清除窗口几何失败:', e);
+        }
+    }
+
+    /** 清空全部内联几何样式，回退到 CSS 默认定位与尺寸 */
+    private resetGeometryStyles(container: HTMLElement): void {
+        container.style.left = '';
+        container.style.top = '';
+        container.style.right = '';
+        container.style.width = '';
+        container.style.height = '';
+    }
+
+    // ========== 边缘缩放 ==========
+
+    /**
+     * 开始边缘缩放：按方向在 document 上挂一次性 move/up 监听。
+     * 8 个方向复用同一套数学：n/s 改高度，e/w 改宽度，w/n 同时平移 left/top，
+     * 全程从起始矩形推导（绝对量），避免累积误差；尺寸钳制到最小值。
+     */
+    private beginResize(e: MouseEvent, dir: string): void {
+        if (e.button !== 0) return;
+        const container = this.container;
+        const content = this.content;
+        if (!container || !content) return;
+
+        e.preventDefault();
+
+        const startRect = container.getBoundingClientRect();
+        const startX = e.clientX;
+        const startY = e.clientY;
+        let resized = false;
+
+        container.style.transition = 'none';
+        content.style.pointerEvents = 'none';
+
+        const MIN_W = MIN_WINDOW_WIDTH;
+        const MIN_H = MIN_WINDOW_HEIGHT;
+
+        const onMouseMove = (ev: MouseEvent) => {
+            resized = true;
+            const dx = ev.clientX - startX;
+            const dy = ev.clientY - startY;
+
+            let width = startRect.width;
+            let height = startRect.height;
+            let left = startRect.left;
+            let top = startRect.top;
+
+            if (dir.includes('e')) {
+                width = Math.max(MIN_W, startRect.width + dx);
+            }
+            if (dir.includes('s')) {
+                height = Math.max(MIN_H, startRect.height + dy);
+            }
+            if (dir.includes('w')) {
+                // 钳制最小宽度后按右缘固定反推 left
+                width = Math.max(MIN_W, startRect.width - dx);
+                left = startRect.right - width;
+            }
+            if (dir.includes('n')) {
+                height = Math.max(MIN_H, startRect.height - dy);
+                top = startRect.bottom - height;
+            }
+
+            container.style.width = `${Math.round(width)}px`;
+            container.style.height = `${Math.round(height)}px`;
+            // 一旦缩放即转为左上角锚定，覆盖 CSS 的 right 默认定位
+            container.style.right = 'auto';
+            container.style.left = `${Math.round(left)}px`;
+            container.style.top = `${Math.round(top)}px`;
+        };
+
+        const finish = () => {
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', finish);
+            container.style.transition = '';
+            content.style.pointerEvents = '';
+            this.resizeCleanup = null;
+            if (resized) this.persistGeometry();
+        };
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', finish);
+        this.resizeCleanup = finish;
     }
 
     // ========== 上传当前文件到聊天框 ==========
@@ -362,4 +522,11 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
         out += btoa(binary);
     }
     return out;
+}
+
+/** 校验窗口几何是否为可用的有限数值（left/top 允许负值以支持部分拖出屏幕） */
+function isValidGeometry(g: WindowGeometry | null | undefined): g is WindowGeometry {
+    if (!g) return false;
+    const nums = [g.left, g.top, g.width, g.height];
+    return nums.every((n) => Number.isFinite(n)) && g.width > 50 && g.height > 50;
 }

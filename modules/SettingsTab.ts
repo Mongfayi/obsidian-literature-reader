@@ -2,12 +2,16 @@ import { App, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import type { PluginSettings } from '../types';
 import { DEFAULT_SETTINGS } from '../types';
 import { OcrService } from './OcrService';
+import {
+    DEFAULT_NOTE_NAME_TEMPLATE,
+    isValidNameTemplate,
+} from './noteNaming';
 
 /**
  * 合并插件的统一设置面板
  *
- * 将原 pdf-reader 的「阅读笔记文件夹」与原 deepseek-sidebar 的「DeepSeek URL」
- * 合并到一个设置页，并附带功能介绍。
+ * 包含：PDF 阅读（笔记文件夹/命名模板/正文模板/高亮外观）、批注格式与界面开关、
+ * DeepSeek 浮动窗口、截图 OCR 批注四部分，并附带功能介绍。
  */
 export class UnifiedSettingTab extends PluginSettingTab {
     private getSettings: () => PluginSettings;
@@ -68,9 +72,112 @@ export class UnifiedSettingTab extends PluginSettingTab {
                     this.scheduleSave();
                 }));
 
+        new Setting(containerEl)
+            .setName('阅读笔记命名模板')
+            .setDesc('新建阅读笔记的文件名规则，{name} 为 PDF 文件名（不含扩展名）。需包含 {name}，否则按默认模板处理')
+            .addText((text) => text
+                .setPlaceholder(DEFAULT_NOTE_NAME_TEMPLATE)
+                .setValue(this.getSettings().readingNoteNameTemplate || DEFAULT_NOTE_NAME_TEMPLATE)
+                .onChange(async (value) => {
+                    const v = value.trim();
+                    this.getSettings().readingNoteNameTemplate =
+                        isValidNameTemplate(v) ? v : DEFAULT_NOTE_NAME_TEMPLATE;
+                    this.scheduleSave();
+                }));
+
+        new Setting(containerEl)
+            .setName('笔记正文模板')
+            .setDesc('新创建阅读笔记的正文内容，可自由修改板块标题')
+            .addTextArea((text) => {
+                text.inputEl.rows = 4;
+                text.setPlaceholder(DEFAULT_SETTINGS.readingNoteBodyTemplate)
+                    .setValue(this.getSettings().readingNoteBodyTemplate)
+                    .onChange(async (value) => {
+                        this.getSettings().readingNoteBodyTemplate =
+                            value.trim() ? value.replace(/\r\n/g, '\n') : DEFAULT_SETTINGS.readingNoteBodyTemplate;
+                        this.scheduleSave();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName('高亮颜色')
+            .setDesc('批注在 PDF 上持久高亮的填充色（文字批注与 OCR 区域高亮共用）')
+            .addColorPicker((color) => color
+                .setValue(this.normalizeHex(this.getSettings().highlightColor))
+                .onChange(async (value) => {
+                    this.getSettings().highlightColor = value;
+                    // 颜色即时生效（saveSettings 内同步刷新 CSS 变量）
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('高亮透明度')
+            .setDesc('持久高亮的不透明度（0.05 - 1）')
+            .addSlider((slider) => slider
+                .setLimits(0.05, 1, 0.05)
+                .setDynamicTooltip()
+                .setValue(this.clampOpacity(this.getSettings().highlightOpacity))
+                .onChange(async (value) => {
+                    this.getSettings().highlightOpacity = value;
+                    await this.saveSettings();
+                }));
+
+        // ===== 批注格式与界面 =====
+        containerEl.createEl('hr');
+        containerEl.createEl('h2', { text: '批注格式与界面' });
+
+        new Setting(containerEl)
+            .setName('批注链接别名')
+            .setDesc('批注回链 PDF 的链接显示文字（写入笔记正文），留空恢复默认')
+            .addText((text) => text
+                .setPlaceholder(DEFAULT_SETTINGS.annotationLinkLabel)
+                .setValue(this.getSettings().annotationLinkLabel || DEFAULT_SETTINGS.annotationLinkLabel)
+                .onChange(async (value) => {
+                    this.getSettings().annotationLinkLabel = value.trim() || DEFAULT_SETTINGS.annotationLinkLabel;
+                    this.scheduleSave();
+                }));
+
+        new Setting(containerEl)
+            .setName('批注提示行')
+            .setDesc('批注 callout 末尾的提示行（写入笔记正文）；需以 > 开头，不足时自动补全')
+            .addText((text) => text
+                .setPlaceholder(DEFAULT_SETTINGS.annotationPromptLine)
+                .setValue(this.getSettings().annotationPromptLine || DEFAULT_SETTINGS.annotationPromptLine)
+                .onChange(async (value) => {
+                    const v = value.trim();
+                    let line = v || DEFAULT_SETTINGS.annotationPromptLine;
+                    if (!line.startsWith('>')) line = `> ${line}`;
+                    this.getSettings().annotationPromptLine = line;
+                    this.scheduleSave();
+                }));
+
+        new Setting(containerEl)
+            .setName('默认附带原文')
+            .setDesc('开启后工具条「附带原文」按钮初始为打开状态；用按钮切换也会被记住')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().annotationIncludeOriginalText === true)
+                .onChange(async (value) => {
+                    this.getSettings().annotationIncludeOriginalText = value;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('文件管理器阅读笔记标记')
+            .setDesc('为已有阅读笔记的 PDF 在文件管理器中显示小图标；关闭后隐藏（任意布局变化即清空）')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().fileMarkerEnabled !== false)
+                .onChange(async (value) => {
+                    this.getSettings().fileMarkerEnabled = value;
+                    await this.saveSettings();
+                }));
+
         // ===== DeepSeek 设置 =====
         containerEl.createEl('hr');
         containerEl.createEl('h2', { text: 'DeepSeek 浮动窗口设置' });
+        containerEl.createEl('p', {
+            text: '提示：拖动标题栏移动窗口、拖动窗口边缘可调整大小；位置与大小会自动记住。',
+            cls: 'setting-item-description',
+        });
 
         new Setting(containerEl)
             .setName('DeepSeek URL')
@@ -113,9 +220,9 @@ export class UnifiedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('OCR 模型')
-            .setDesc('留空 = 自动选择服务器上的视觉模型')
+            .setDesc('自由填写服务器上的视觉模型名；推荐 paddleocr-vl-1.6，留空则按此优先自动选择')
             .addText((text) => text
-                .setPlaceholder('留空自动选择')
+                .setPlaceholder('paddleocr-vl-1.6（推荐）')
                 .setValue(this.getSettings().ocrModel)
                 .onChange(async (value) => {
                     this.getSettings().ocrModel = value.trim();
@@ -162,6 +269,44 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
+            .setName('清洗 OCR 输出')
+            .setDesc('去除 HTML/LaTeX 包装等模型噪音；关闭后原样保留模型输出（保留 LaTeX 命令与代码块，适合公式密集场景）')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().ocrSanitizeOutput !== false)
+                .onChange(async (value) => {
+                    this.getSettings().ocrSanitizeOutput = value;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('放大目标短边（像素）')
+            .setDesc('框选区域短边不足该值时等比放大后再送 OCR，小字更清晰；设为 0 关闭放大')
+            .addText((text) => text
+                .setPlaceholder(String(DEFAULT_SETTINGS.ocrMinSidePx))
+                .setValue(String(this.getSettings().ocrMinSidePx ?? DEFAULT_SETTINGS.ocrMinSidePx))
+                .onChange(async (value) => {
+                    const n = parseInt(value, 10);
+                    if (!Number.isNaN(n) && n >= 0 && n <= 4096) {
+                        this.getSettings().ocrMinSidePx = n;
+                        this.scheduleSave();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('放大倍率上限')
+            .setDesc('小区域放大的最大倍数（1 - 8），低配设备可调低')
+            .addText((text) => text
+                .setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxUpscaleFactor))
+                .setValue(String(this.getSettings().ocrMaxUpscaleFactor ?? DEFAULT_SETTINGS.ocrMaxUpscaleFactor))
+                .onChange(async (value) => {
+                    const n = parseFloat(value);
+                    if (!Number.isNaN(n) && n >= 1 && n <= 8) {
+                        this.getSettings().ocrMaxUpscaleFactor = n;
+                        this.scheduleSave();
+                    }
+                }));
+
+        new Setting(containerEl)
             .setName('测试连接')
             .setDesc('检测服务器可达性并列出可用模型')
             .addButton((btn) => btn
@@ -198,7 +343,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
             },
             {
                 title: 'DeepSeek 浮动窗口',
-                desc: '点击左侧栏机器人图标或执行命令「切换 DeepSeek 浮动窗口」，以浮动窗口形式嵌入 DeepSeek 网页聊天，支持标题栏拖拽移动与最小化。',
+                desc: '点击左侧栏机器人图标或执行命令「切换 DeepSeek 浮动窗口」，以浮动窗口形式嵌入 DeepSeek 网页聊天，支持标题栏拖拽移动、拖动边缘调整大小与最小化，位置和大小自动记忆。',
             },
             {
                 title: '上传当前文件到 DeepSeek',
@@ -222,5 +367,17 @@ export class UnifiedSettingTab extends PluginSettingTab {
             itemEl.createEl('br');
             itemEl.createSpan({ text: feature.desc, cls: 'setting-item-description' });
         }
+    }
+
+    /** 把任意存量颜色值规范成 #RRGGBB 供取色器显示（非法值回退默认黄色） */
+    private normalizeHex(input: string): string {
+        const m = /^#?([0-9a-fA-F]{6})$/.exec((input ?? '').trim());
+        return m ? `#${m[1]}` : DEFAULT_SETTINGS.highlightColor;
+    }
+
+    private clampOpacity(v: number): number {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return DEFAULT_SETTINGS.highlightOpacity;
+        return Math.min(1, Math.max(0.05, n));
     }
 }

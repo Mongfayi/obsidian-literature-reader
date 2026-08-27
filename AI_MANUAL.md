@@ -1,6 +1,6 @@
 # 文献阅读助手插件技术手册
 
-> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.4.1`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
+> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.5.0`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
 
 ---
 
@@ -15,13 +15,14 @@
 | PdfReaderModule | `modules/PdfReaderModule.ts` | 开始阅读、关键词提取、文字/截图/OCR 批注写入笔记、上传文件数据源 |
 | DeepSeekModule | `modules/DeepSeekModule.ts` | DeepSeek 浮动窗口（webview）、拖拽/最小化、上传当前文件到聊天框 |
 | ScreenshotModule | `modules/ScreenshotModule.ts` | 截图批注：框选区域 → PDF 嵌入链接（无图片文件），注册自定义 EmbedCreator 实时渲染裁剪区 |
+| ScreenshotHighlightModule | `modules/ScreenshotHighlightModule.ts` | 截图批注区域持久高亮（笔记 `&rect=` 链接驱动，黄色边框、内部不填充） |
 | OcrModule | `modules/OcrModule.ts` | 截图 OCR 批注：框选 → 截取 canvas → LM Studio 视觉模型识别 → 写入笔记 |
 | OcrService | `modules/OcrService.ts` | LM Studio OpenAI 兼容接口封装（模型列表、识别、文本清洗） |
 | PdfHighlightModule | `modules/PdfHighlightModule.ts` | 文字选区持久高亮（笔记 `&selection=` 链接驱动） |
 | OcrHighlightModule | `modules/OcrHighlightModule.ts` | OCR 区域持久高亮（笔记 `&ocr=` 链接驱动，不可交互） |
 | MainArticleModule | `modules/MainArticleModule.ts` | 主文献批注汇集：开启后所有批注写入主文献笔记 |
 | PdfJumpModule | `modules/PdfJumpModule.ts` | 双向跳转：点击 PDF 高亮 → 笔记对应批注；点击笔记 PDF 链接 → PDF 对应位置（目标未打开时自动分屏） |
-| AnnotationModeModule | `modules/AnnotationModeModule.ts` | 批注原文附带模式（测试功能）：工具条「附带原文」开关，默认关闭=文字批注只写链接 |
+| AnnotationModeModule | `modules/AnnotationModeModule.ts` | 批注原文附带模式（测试功能）：工具条「附带原文」开关，默认关闭=只写链接（定位 + 用户输入）；开启=附带原文（原文 / 定位 / 笔记：） |
 | SettingsTab | `modules/SettingsTab.ts` | 统一设置面板（PDF / DeepSeek / OCR 三段） |
 | BaseCropModeModule | `modules/BaseCropModeModule.ts` | 截图模式公共基类（框选交互、工具条按钮注入） |
 | HighlightBase | `modules/HighlightBase.ts` | 持久高亮公共基类（事件挂载、防抖重建、渲染调度） |
@@ -81,7 +82,7 @@
 
 **生成内容**：
 - frontmatter：`pdf: "[[路径]]"`、`created: 日期`、`tags:`（关键词列表，提取失败则省略）
-- 正文：三个引导问题（实验思路 / 获得的信息 / 发现的问题）
+- 正文：信息与疑问两个板块（`## 信息`、`## 疑问`）
 - 文本提取优先用 Obsidian 自带 `window.pdfjsLib`，缺失时回退内置 `pdfjs-dist` + 自定义 `CMapReaderFactory`（读取 `cmaps/` 目录）；逐页并行提取，单页失败跳过
 
 ### 4.3 批注入口（三个统一走 `resolveTargetNote`）
@@ -89,7 +90,7 @@
 | 方法 | 触发 | 链接形式 |
 |------|------|----------|
 | `handleAnnotation()` | 浮动按钮「批注到笔记」（文字选区） | `&selection=bi,bo,ei,eo` |
-| `annotateScreenshot(pdfFile, page, rect)` | 截图批注模块调用 | `![[...#page=N&rect=x1,y1,x2,y2]]` |
+| `annotateScreenshot(pdfFile, page, rect)` | 截图批注模块调用 | `![[...#page=N&rect=x1,y1,x2,y2]]`，页面链接同样带 `&rect=` 以便点击精确定位 |
 | `annotateOcrText(pdfFile, text, page, ocrRect?)` | OCR 批注模块调用 | `&ocr=x,y,w,h`（无文本锚点） |
 
 **`resolveTargetNote(pdfFile)`**：先查 `redirectResolver`（MainArticleModule 注入），命中→写入主文献笔记；否则回退 `ensureNoteOpen`（源 PDF 对应笔记）。批注 callout 内原文链接始终用源 `pdfFile` 构造，跳转指向源 PDF。
@@ -98,7 +99,7 @@
 ```markdown
 > [!pdf-annotation]
 > {选中文字}
-> [[{PDF路径}#page={页码}&selection={beginIndex},{beginOffset},{endIndex},{endOffset}|{PDF名}, 页面 {页码}]]
+> [[{PDF路径}#page={页码}&selection={beginIndex},{beginOffset},{endIndex},{endOffset}|定位]]
 >
 > 笔记：
 ```
@@ -110,7 +111,9 @@
 - 写入后光标自动定位到「笔记：」行尾；写入失败选区自动恢复
 - 文本清洗：移除换行/控制字符/Unicode 换行符号，以及 PDF 私有区字符（U+E000–U+F8FF，无 ToUnicode 映射的字形占位符）
 
-**「附带原文」关闭时的链接-only 格式**（AnnotationModeModule 注入 `includeOriginalTextProvider`，默认关闭；测试功能，以后可能删除）：文字选中批注只写链接、无 callout、无「笔记：」提示行；插入锚点默认在笔记光标处，光标行/其后两行内存在链接-only 链接行时改在该链接之后插入（避免插进上一条批注的文字与链接之间）；链接上方留空行放光标（文字在上、链接在下）。OCR（`beginIndex<0`）与截图批注不受该开关影响。
+**「附带原文」关闭时的链接-only 格式**（AnnotationModeModule 注入 `includeOriginalTextProvider`，默认关闭；测试功能，以后可能删除）：文字选中批注只写链接、无 callout、无「笔记：」提示行；插入位置为当前光标处，链接后带一个空格并把光标停在链接后，用户直接输入形成“定位 我打字的内容”。多重批注时多个「定位」按钮在同一行排列，如“定位 定位 定位”。不再使用旧版“在链接上方留空行、笔记写在链接上方”的逆序机制。OCR（`beginIndex<0`）与截图批注不受该开关影响。
+
+**历史旧笔记缩短**：命令 `shorten-pdf-annotation-links`（“将当前笔记中的 PDF 批注链接显示文字改为「定位」”）会读取当前 Markdown 笔记，将形如 `[[*.pdf#page=…|XXX, 页面 N]]` 的链接显示文字替换为 `定位`，不改变链接目标与定位参数，因此既有跳转/高亮功能不受影响。
 
 ### 4.4 `getCurrentFileForUpload(): Promise<FileUploadData | null>`
 供 DeepSeek 上传：
@@ -147,7 +150,7 @@
 
 继承 `BaseCropModeModule`。工具条按钮 `image-plus`（class `pdfreader-screenshot-button`），命令 `screenshot-annotate`。
 
-**流程**：框选区域 → 屏幕坐标转 PDF 坐标（`pageView.getPagePoint` + `pdfjsLib.Util.normalizeRect`）→ 写入嵌入链接 `![[file.pdf#page=N&rect=x1,y1,x2,y2]]`（不产生图片文件）。
+**流程**：框选区域 → 屏幕坐标转 PDF 坐标（`pageView.getPagePoint` + `pdfjsLib.Util.normalizeRect`）→ 写入嵌入链接 `![[file.pdf#page=N&rect=x1,y1,x2,y2]]`（不产生图片文件）→ 触发 `ScreenshotHighlightModule.refresh` 在 PDF 上渲染黄色边框持久高亮（内部不填充）。
 
 **自定义 EmbedCreator（CropEmbed）**：注册到 `app.embedRegistry`，当嵌入链接含 `rect`+`page` 时用 pdfjs 实时渲染裁剪区域为 PNG；无 rect 回退原始创建器。卸载时仅当注册表仍为本插件包装器才恢复，避免覆盖其他插件。
 
@@ -174,9 +177,9 @@
 
 ---
 
-## 8. 持久高亮（PdfHighlightModule / OcrHighlightModule）
+## 8. 持久高亮（PdfHighlightModule / OcrHighlightModule / ScreenshotHighlightModule）
 
-二者继承 `BasePdfHighlightModule`，共享同一套骨架：事件挂载、索引防抖重建（300ms）、视图渲染调度、笔记内容读取（优先编辑器缓冲，其次磁盘）。
+三者继承 `BasePdfHighlightModule`，共享同一套骨架：事件挂载、索引防抖重建（300ms）、视图渲染调度、笔记内容读取（优先编辑器缓冲，其次磁盘）。
 
 **核心理念**：高亮由**笔记内容**驱动，而非内存状态。批注写入笔记时链接附带定位参数，模块扫描指向该 PDF 的笔记建立索引并渲染。
 
@@ -184,6 +187,7 @@
 |------|-------------|----------|----------|
 | PdfHighlightModule | `textlayerrendered` | `#page=N&selection=bi,bo,ei,eo` | `.pdf-reader-highlight-layer` > `.pdf-reader-selection-highlight` |
 | OcrHighlightModule | `pagerendered` | `#page=N&ocr=x,y,w,h` | `.ocr-highlight-layer` > `.ocr-crop-highlight`（`pointer-events:none`，不可点击） |
+| ScreenshotHighlightModule | `pagerendered` | `#page=N&rect=x1,y1,x2,y2` | `.pdf-screenshot-highlight-layer` > `.pdf-screenshot-crop-highlight`（黄色边框、内部不填充） |
 
 **索引来源**：`metadataCache` 不记录指向 PDF 的正文链接，故通过 `resolvedLinks` 反查链接到该 PDF 的笔记 → 读取笔记原文 → 正则提取链接参数。
 - 优先读打开中编辑器缓冲（批注写入后可能未落盘）
@@ -325,9 +329,9 @@ Ribbon 机器人图标 → DeepSeek 浮动窗口
 - **文本提取范围**：仅提取 PDF 文本层，扫描版 PDF 无法提取关键词；逐页并行，单页失败跳过
 - **关键词提取**：依赖论文格式（「关键词：」行），非标准格式无法提取标签
 - **笔记覆盖**：`createReadingNote` 仅在笔记不存在/需去重时写初始内容，已存在笔记不更新 frontmatter（除 pdf 字段失效修复）
-- **批注定位**：跨页选区、文本层未渲染、无 `data-idx` 的文本（标题/图表标注）会回退为纯文字或仅页码链接（`beginIndex=-1`），不生成 selection 锚点
+- **批注定位**：跨页选区、文本层未渲染会回退为纯文字；无 `data-idx` 的文本（标题/图表标注）会回退为“页码链接 + 归一化矩形（`&ocr=`）”，由 OCR 高亮通道渲染持久矩形高亮；矩形计算失败时仅页码链接（`beginIndex=-1`）
 - **PUA 字符**：无 ToUnicode 映射的字形会输出 Unicode 私有区字符（U+E000–U+F8FF，渲染为 □/⏎），批注文本清洗时移除
-- **持久高亮**：依赖 `resolvedLinks` 反查 + 笔记原文正则；OCR 高亮矩形 `pointer-events:none` 不可点击，仅笔记链接可跳转 PDF
+- **持久高亮**：依赖 `resolvedLinks` 反查 + 笔记原文正则；OCR/回退矩形高亮可点击跳转，仅笔记链接可跳转 PDF
 - **删除同步**：笔记中删掉批注 callout → 300ms 防抖重建索引 → 高亮消失
 - **OCR 服务**：需 LM Studio 启动并加载视觉模型；开启 Require Authentication 须填 API Key；`requestUrl` 不支持中止，超时后底层请求仍会跑完（跟踪为僵尸请求）
 - **截图嵌入**：依赖未公开 `app.embedRegistry`，结构变化时降级跳过（链接仍写入，仅实时渲染不可用）

@@ -58,7 +58,25 @@ __export(main_exports, {
   default: () => LiteratureReaderPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian14 = require("obsidian");
+var import_obsidian15 = require("obsidian");
+
+// modules/noteNaming.ts
+var DEFAULT_NOTE_NAME_TEMPLATE = "{name} \u9605\u8BFB";
+function renderNoteBaseName(pdfBasename, template) {
+  const tpl = isValidNameTemplate(template) ? template : DEFAULT_NOTE_NAME_TEMPLATE;
+  return tpl.split("{name}").join(pdfBasename);
+}
+function isValidNameTemplate(template) {
+  return typeof template === "string" && template.includes("{name}");
+}
+function buildNoteBaseRegex(template) {
+  const tpl = isValidNameTemplate(template) ? template : DEFAULT_NOTE_NAME_TEMPLATE;
+  const escaped = tpl.split("{name}").map(escapeRegExp).join("(.+)");
+  return new RegExp(`^${escaped}(?: \\((\\d+)\\))?$`);
+}
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 // types.ts
 var DEFAULT_SETTINGS = {
@@ -69,7 +87,20 @@ var DEFAULT_SETTINGS = {
   ocrModel: "paddleocr-vl-1.6",
   ocrRequestTimeoutSec: 120,
   ocrMaxTokens: 8192,
-  ocrPrompt: "OCR:"
+  ocrPrompt: "OCR:",
+  // 与旧版本遗留 data.json 及 README 承诺一致的经典黄色高亮
+  highlightColor: "#FFFF00",
+  highlightOpacity: 0.4,
+  annotationIncludeOriginalText: false,
+  annotationLinkLabel: "\u5B9A\u4F4D",
+  annotationPromptLine: "> \u7B14\u8BB0\uFF1A",
+  readingNoteNameTemplate: DEFAULT_NOTE_NAME_TEMPLATE,
+  readingNoteBodyTemplate: "## \u4FE1\u606F\n\n## \u7591\u95EE",
+  ocrMinSidePx: 512,
+  ocrMaxUpscaleFactor: 4,
+  ocrSanitizeOutput: true,
+  fileMarkerEnabled: true,
+  deepseekWindowGeometry: null
 };
 
 // modules/PdfReaderModule.ts
@@ -26181,6 +26212,8 @@ var PdfReaderModule = class {
     this.currentPdfPath = null;
     /** 批注写入后回调（由主入口注入 PdfHighlightModule.refresh，用于即时渲染持久高亮） */
     this.refreshHighlights = null;
+    /** 无文本锚点批注写入后的矩形高亮回调（由主入口注入 OcrHighlightModule.refresh） */
+    this.refreshRectHighlights = null;
     /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
     this.redirectResolver = null;
     /** 批注是否附带原文的模式提供者（由 AnnotationModeModule 注入；默认关闭=不附带原文） */
@@ -26189,9 +26222,24 @@ var PdfReaderModule = class {
     this.startingPdfs = /* @__PURE__ */ new Set();
     this.ctx = ctx;
   }
+  /** 批注回链 PDF 的链接显示文字（可配置，默认「定位」；写入用户笔记正文） */
+  get linkLabel() {
+    const v = this.ctx.getSettings().annotationLinkLabel;
+    return v && v.trim() ? v.trim() : DEFAULT_SETTINGS.annotationLinkLabel;
+  }
+  /** 批注 callout 末尾提示行（可配置；强制以 '>' 开头以维持 callout 块格式） */
+  get notePrompt() {
+    const v = this.ctx.getSettings().annotationPromptLine;
+    const raw = v && v.trim() ? v.trim() : DEFAULT_SETTINGS.annotationPromptLine;
+    return raw.startsWith(">") ? raw : `> ${raw}`;
+  }
   /** 注入批注后的高亮刷新回调 */
   setRefreshHighlights(cb) {
     this.refreshHighlights = cb;
+  }
+  /** 注入无文本锚点批注的矩形高亮刷新回调 */
+  setRefreshRectHighlights(cb) {
+    this.refreshRectHighlights = cb;
   }
   /** 注入批注目标笔记重定向解析器（主文献开启时批注写入主文献笔记而非源 PDF 对应笔记） */
   setRedirectResolver(cb) {
@@ -26215,6 +26263,19 @@ var PdfReaderModule = class {
         }
       })
     );
+    plugin.addCommand({
+      id: "shorten-pdf-annotation-links",
+      name: `\u5C06\u5F53\u524D\u7B14\u8BB0\u4E2D\u7684 PDF \u6279\u6CE8\u94FE\u63A5\u663E\u793A\u6587\u5B57\u6539\u4E3A\u300C${this.linkLabel}\u300D`,
+      checkCallback: (checking) => {
+        const file = plugin.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md")
+          return false;
+        if (!checking) {
+          void this.shortenPdfAnnotationLinks(file);
+        }
+        return true;
+      }
+    });
     this.initFloatingButton();
     plugin.registerDomEvent(document, "mouseup", (evt) => {
       this.handlePdfMouseUp(evt);
@@ -26277,6 +26338,29 @@ var PdfReaderModule = class {
       };
     }
     return null;
+  }
+  /**
+   * 把当前笔记中已有 PDF 批注链接的冗长显示文字（如“XXX, 页面 12”）批量改成短标签。
+   * 只改链接的显示文字，不改变链接目标，因此原有跳转/高亮功能不受影响。
+   */
+  async shortenPdfAnnotationLinks(file) {
+    const label = this.linkLabel;
+    try {
+      const content = await this.ctx.plugin.app.vault.read(file);
+      const updated = content.replace(
+        /\[\[([^\]|]+?\.pdf#[^\]|]*?)\|[^\]|]*?[,，]\s*页面\s*\d+\]\]/g,
+        `[[$1|${label}]]`
+      );
+      if (updated === content) {
+        new import_obsidian.Notice("\u5F53\u524D\u7B14\u8BB0\u4E2D\u6CA1\u6709\u627E\u5230\u53EF\u7F29\u77ED\u7684 PDF \u6279\u6CE8\u94FE\u63A5");
+        return;
+      }
+      await this.ctx.plugin.app.vault.modify(file, updated);
+      new import_obsidian.Notice(`\u5DF2\u5C06\u8BE5\u7B14\u8BB0\u4E2D\u7684 PDF \u6279\u6CE8\u94FE\u63A5\u663E\u793A\u6587\u5B57\u6539\u4E3A\u300C${label}\u300D`);
+    } catch (e) {
+      console.error("[PdfReader] \u7F29\u77ED\u6279\u6CE8\u94FE\u63A5\u5931\u8D25:", e);
+      new import_obsidian.Notice("\u7F29\u77ED\u6279\u6CE8\u94FE\u63A5\u5931\u8D25");
+    }
   }
   // ========== 开始阅读主流程 ==========
   async startReading(pdfFile) {
@@ -26347,15 +26431,15 @@ var PdfReaderModule = class {
     return await this.ctx.plugin.app.vault.create(notePath, initialContent);
   }
   /**
-   * 解析阅读笔记路径：
-   *  - 优先 `{PDF文件名} 阅读.md`，不存在则返回
+   * 解析阅读笔记路径（文件名来自可配置模板，{name} = PDF 文件名）：
+   *  - 优先「渲染(模板).md」，不存在则返回
    *  - 已存在且属于同一 PDF（frontmatter pdf 字段一致或缺失）时复用
-   *  - 属于其他 PDF（同名 PDF 冲突）时，按 `{文件名} 阅读 (n).md` 递增去重
+   *  - 属于其他 PDF（同名 PDF 冲突）时，按「渲染(模板) (n).md」递增去重
    *  - 所有候选都被其他 PDF 占用时返回 null（调用方应终止并提示，避免写错笔记）
    */
   async resolveNotePath(pdfFile, folderPath) {
-    const baseName = pdfFile.basename;
-    const basePath = (0, import_obsidian.normalizePath)(`${folderPath}/${baseName} \u9605\u8BFB.md`);
+    const baseName = renderNoteBaseName(pdfFile.basename, this.ctx.getSettings().readingNoteNameTemplate);
+    const basePath = (0, import_obsidian.normalizePath)(`${folderPath}/${baseName}.md`);
     const base = this.ctx.plugin.app.vault.getAbstractFileByPath(basePath);
     if (base instanceof import_obsidian.TFile && await this.belongsToPdf(base, pdfFile)) {
       return basePath;
@@ -26364,7 +26448,7 @@ var PdfReaderModule = class {
       return basePath;
     }
     for (let n = 2; n <= 99; n++) {
-      const candidate = (0, import_obsidian.normalizePath)(`${folderPath}/${baseName} \u9605\u8BFB (${n}).md`);
+      const candidate = (0, import_obsidian.normalizePath)(`${folderPath}/${baseName} (${n}).md`);
       const existing = this.ctx.plugin.app.vault.getAbstractFileByPath(candidate);
       if (existing instanceof import_obsidian.TFile && await this.belongsToPdf(existing, pdfFile)) {
         return candidate;
@@ -26431,7 +26515,9 @@ var PdfReaderModule = class {
     }
   }
   async generateNoteContent(pdfFile) {
-    const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+    const now = /* @__PURE__ */ new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     let tags = [];
     try {
       const text = await this.extractPdfText(pdfFile);
@@ -26450,14 +26536,9 @@ tags:
 ${tags.map((t) => `  - ${t}`).join("\n")}`;
     }
     frontmatter += "\n---\n";
-    const body = [
-      "1.\u5199\u51FA\u4F60\u7684\u5B9E\u9A8C\u601D\u8DEF\u3002",
-      "",
-      "2.\u4ECE\u8BBA\u6587\u4E2D\u83B7\u5F97\u7684\u4FE1\u606F\u3002",
-      "",
-      "3.\u53D1\u73B0\u7684\u95EE\u9898\u3002"
-    ].join("\n");
-    return frontmatter + "\n" + body + "\n";
+    const bodyTpl = this.ctx.getSettings().readingNoteBodyTemplate;
+    const body = bodyTpl && bodyTpl.trim() ? bodyTpl.replace(/\r\n/g, "\n") : DEFAULT_SETTINGS.readingNoteBodyTemplate;
+    return frontmatter + body + "\n";
   }
   // ========== PDF 文本提取 ==========
   async extractPdfText(pdfFile) {
@@ -26757,7 +26838,15 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       const startSpan = startTextLayer ? this.findParentTextSpan(range.startContainer, startTextLayer) : null;
       const endSpan = endTextLayer ? this.findParentTextSpan(range.endContainer, endTextLayer) : null;
       if (textSpans.length === 0 || !startSpan || !endSpan) {
-        return { page: pageNumber, beginIndex: -1, beginOffset: 0, endIndex: -1, endOffset: 0 };
+        const fallbackRect = this.computeSelectionOcrRect(range, startPageDiv);
+        return {
+          page: pageNumber,
+          beginIndex: -1,
+          beginOffset: 0,
+          endIndex: -1,
+          endOffset: 0,
+          ...fallbackRect ? { ocrRect: fallbackRect } : {}
+        };
       }
       const textDivFirstIdx = parseInt(
         textSpans[0].getAttribute("data-idx") || "0"
@@ -26777,6 +26866,32 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       return { page: pageNumber, beginIndex, beginOffset, endIndex, endOffset };
     } catch (e) {
       console.error("[PdfReader] \u83B7\u53D6PDF\u9009\u62E9\u4FE1\u606F\u5931\u8D25:", e);
+      return null;
+    }
+  }
+  /**
+   * 计算无 data-idx 文本选区的归一化矩形（0-1，相对页面内边距框）。
+   * 用于标题/图表标注等文本层锚点缺失时的矩形持久高亮。
+   */
+  computeSelectionOcrRect(range, pageDiv) {
+    try {
+      const rect = range.getBoundingClientRect();
+      const pageRect = pageDiv.getBoundingClientRect();
+      const ox = pageRect.left + pageDiv.clientLeft;
+      const oy = pageRect.top + pageDiv.clientTop;
+      const pw = pageDiv.clientWidth;
+      const ph = pageDiv.clientHeight;
+      if (!pw || !ph || !rect.width || !rect.height)
+        return null;
+      const clamp012 = (n) => Math.min(1, Math.max(0, n));
+      return {
+        x: clamp012((rect.left - ox) / pw),
+        y: clamp012((rect.top - oy) / ph),
+        w: clamp012(rect.width / pw),
+        h: clamp012(rect.height / ph)
+      };
+    } catch (e) {
+      console.warn("[PdfReader] \u8BA1\u7B97\u9009\u533A\u56DE\u9000\u77E9\u5F62\u5931\u8D25:", e);
       return null;
     }
   }
@@ -26873,11 +26988,12 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     try {
       const rectStr = rect.join(",");
       const embedLink = `![[${pdfFile.path}#page=${page}&rect=${rectStr}]]`;
-      const pageLink = `[[${pdfFile.path}#page=${page}|${pdfFile.basename}, \u9875\u9762 ${page}]]`;
+      const pageLink = `[[${pdfFile.path}#page=${page}&rect=${rectStr}|${this.linkLabel}]]`;
+      const prompt = this.notePrompt;
       const block = `> [!pdf-annotation]
 > ${embedLink}
 > ${pageLink}
-> \u7B14\u8BB0\uFF1A`;
+${prompt}`;
       const annotation = "\n" + block + "\n";
       const cursorPos = this.getNoteCursorEditorPos(noteFile);
       let promptLine = null;
@@ -26887,7 +27003,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       } else {
         await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
       }
-      await this.focusNotePrompt(noteFile, "> \u7B14\u8BB0\uFF1A", promptLine);
+      await this.focusNotePrompt(noteFile, prompt, promptLine);
       return true;
     } catch (e) {
       console.error("[PdfReader] \u622A\u56FE\u6279\u6CE8\u5199\u5165\u5931\u8D25:", e);
@@ -26916,6 +27032,13 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       this.refreshHighlights?.(
         pdfFile,
         selections.filter((sel) => sel.beginIndex >= 0)
+      );
+      this.refreshRectHighlights?.(
+        pdfFile,
+        selections.filter((sel) => sel.beginIndex < 0 && sel.ocrRect).map((sel) => ({
+          page: sel.page,
+          rect: sel.ocrRect
+        }))
       );
     } catch (e) {
       this.savedSelections = [...selections, ...this.savedSelections];
@@ -26975,7 +27098,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       await this.appendLinksOnly(noteFile, selections, pdfFile);
       return;
     }
-    const notePrompt = "> \u7B14\u8BB0\uFF1A";
+    const notePrompt = this.notePrompt;
     const items = selections.map((sel) => {
       const flatText = sel.text.replace(
         /[\r\n\u000B\u000C\u2028\u2029\u21B5\u23CE\u240D\u2424\u2937\u0000-\u0008\u000E-\u001F\u007F-\u009F\uE000-\uF8FF]/g,
@@ -26986,12 +27109,12 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       }
       if (sel.beginIndex < 0) {
         const rectParam = sel.ocrRect ? `&ocr=${fmtRectNum(sel.ocrRect.x)},${fmtRectNum(sel.ocrRect.y)},${fmtRectNum(sel.ocrRect.w)},${fmtRectNum(sel.ocrRect.h)}` : "";
-        const link2 = `[[${pdfFile.path}#page=${sel.page}${rectParam}|${pdfFile.basename}, \u9875\u9762 ${sel.page}]]`;
+        const link2 = `[[${pdfFile.path}#page=${sel.page}${rectParam}|${this.linkLabel}]]`;
         return `> ${flatText}
 > ${link2}`;
       }
       const selectionParam = `${sel.beginIndex},${sel.beginOffset},${sel.endIndex},${sel.endOffset}`;
-      const link = `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${pdfFile.basename}, \u9875\u9762 ${sel.page}]]`;
+      const link = `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${this.linkLabel}]]`;
       return `> ${flatText}
 > ${link}`;
     });
@@ -27016,16 +27139,11 @@ ${notePrompt}`;
     await this.focusNotePrompt(noteFile, notePrompt, promptLine);
   }
   /**
-   * 「附带原文」关闭时的批注形式（测试功能，以后可能删除）：
-   * 只写 PDF 链接（多段选中每段一行），无 callout 包围框、无「> 笔记：」提示行。
+   * 「附带原文」关闭时的批注形式：
+   * 只写 PDF 链接，并把光标停在链接后，让用户直接按“定位 我打字的内容”的正序记录。
+   * 多重批注时所有「定位」按钮在同一行排列，如“定位 定位 定位”。
+   * 不再使用旧版“在链接上方留空行、笔记写在链接上方”的逆序机制。
    * 定位失败（page=null）的选区无链接可写，保留拍平文字行兜底，避免批注静默丢失。
-   * 该路径只被文字选中批注（handleAnnotation）调用；OCR / 截图批注不受影响。
-   *
-   * 写入策略：默认插入在笔记光标所在行末尾（支持从笔记中间批注，后面的内容不动）；
-   * 若光标行或其后两行内存在链接-only 批注的链接行（典型场景：光标停在上一条批注的
-   * 文字末尾或链接上方的空行），则改在该链接行之后插入，避免新链接插进上一条批注的
-   * 「批注文字」与「链接」之间。链接上方保留一个空行放光标，批注后直接输入的文字
-   * 写在链接上方（版式：文字在上、链接在下）。无编辑器时回退追加到文末。
    */
   async appendLinksOnly(noteFile, selections, pdfFile) {
     const flatten = (text) => text.replace(
@@ -27037,36 +27155,27 @@ ${notePrompt}`;
         return flatten(sel.text);
       }
       if (sel.beginIndex < 0) {
-        return `[[${pdfFile.path}#page=${sel.page}|${pdfFile.basename}, \u9875\u9762 ${sel.page}]]`;
+        const rectParam = sel.ocrRect ? `&ocr=${fmtRectNum(sel.ocrRect.x)},${fmtRectNum(sel.ocrRect.y)},${fmtRectNum(sel.ocrRect.w)},${fmtRectNum(sel.ocrRect.h)}` : "";
+        return `[[${pdfFile.path}#page=${sel.page}${rectParam}|${this.linkLabel}]]`;
       }
       const selectionParam = `${sel.beginIndex},${sel.beginOffset},${sel.endIndex},${sel.endOffset}`;
-      return `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${pdfFile.basename}, \u9875\u9762 ${sel.page}]]`;
+      return `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${this.linkLabel}]]`;
     });
     if (lines.length === 0)
       return;
     const cursorPos = this.getNoteCursorEditorPos(noteFile);
     if (cursorPos) {
       const editor = cursorPos.editor;
-      const lastLine = editor.lastLine();
-      const linkLineRegex = /^\[\[[^\]]*#page=\d+[^\]]*\]\]$/;
-      const isLinkLine = (line) => line >= 0 && line <= lastLine && linkLineRegex.test(editor.getLine(line));
-      let anchor = cursorPos.line;
-      for (let i = 0; i < 3; i++) {
-        if (isLinkLine(anchor + i)) {
-          anchor = anchor + i;
-          break;
-        }
-      }
-      const anchorText = editor.getLine(anchor);
-      const prefix = anchorText.length === 0 ? "\n" : "\n\n";
-      const annotation = prefix + lines.join("\n") + "\n";
-      editor.replaceRange(annotation, { line: anchor, ch: anchorText.length });
-      const firstLinkLine = anchor + (anchorText.length === 0 ? 1 : 2);
-      editor.setCursor({ line: firstLinkLine - 1, ch: 0 });
+      const startLine = cursorPos.line;
+      const startCh = cursorPos.ch;
+      const inserted = lines.join(" ") + " ";
+      editor.replaceRange(inserted, { line: startLine, ch: startCh });
+      editor.setCursor({ line: startLine, ch: startCh + inserted.length });
     } else {
       await this.ctx.plugin.app.vault.process(noteFile, (data) => {
         const endsWithNewline = data.endsWith("\n");
-        return data + (endsWithNewline ? "\n" : "\n\n") + lines.join("\n") + "\n";
+        const suffix = lines.join(" ") + " ";
+        return data + (endsWithNewline ? "\n" : "\n\n") + suffix + "\n";
       });
     }
   }
@@ -27164,13 +27273,19 @@ var DeepSeekModule = class {
   }
 };
 var MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+var MIN_WINDOW_WIDTH = 320;
+var MIN_WINDOW_HEIGHT = 400;
+var RESIZE_DIRECTIONS = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 var DeepSeekFloatingWindow = class {
   constructor(ctx) {
     this.container = null;
+    this.content = null;
     this.webview = null;
     this.isVisible = false;
     this.isDragging = false;
     this.dragOffset = { x: 0, y: 0 };
+    /** 正在进行的边缘缩放清理函数（挂 document 级监听；销毁窗口时兜底调用） */
+    this.resizeCleanup = null;
     this.ctx = ctx;
   }
   createWindow() {
@@ -27203,6 +27318,15 @@ var DeepSeekFloatingWindow = class {
       }
     });
     this.webview = wv;
+    this.content = content;
+    this.applySavedGeometry(container);
+    for (const dir of RESIZE_DIRECTIONS) {
+      const handle = container.createDiv({ cls: `deepseek-float-resize deepseek-float-resize-${dir}` });
+      handle.addEventListener("mousedown", (e) => {
+        e.stopPropagation();
+        this.beginResize(e, dir);
+      });
+    }
     titleBar.addEventListener("mousedown", (e) => {
       if (e.target.closest("button"))
         return;
@@ -27226,6 +27350,7 @@ var DeepSeekFloatingWindow = class {
         container.style.cursor = "";
         container.style.transition = "";
         content.style.pointerEvents = "";
+        this.persistGeometry();
       }
     };
     document.addEventListener("mousemove", onMouseMove);
@@ -27244,8 +27369,8 @@ var DeepSeekFloatingWindow = class {
     this.container.style.display = "flex";
     const rect = this.container.getBoundingClientRect();
     if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) {
-      this.container.style.left = "";
-      this.container.style.top = "";
+      this.resetGeometryStyles(this.container);
+      this.clearGeometry();
     }
     this.isVisible = true;
   }
@@ -27263,9 +27388,128 @@ var DeepSeekFloatingWindow = class {
     }
   }
   destroy() {
+    this.resizeCleanup?.();
+    this.resizeCleanup = null;
     this.container?.remove();
     this.container = null;
+    this.content = null;
     this.webview = null;
+  }
+  // ========== 窗口几何：持久化与恢复 ==========
+  /** 恢复保存的窗口几何（非法或缺省时保持 CSS 默认值） */
+  applySavedGeometry(container) {
+    const geom = this.ctx.getSettings().deepseekWindowGeometry;
+    if (!isValidGeometry(geom))
+      return;
+    container.style.width = `${geom.width}px`;
+    container.style.height = `${geom.height}px`;
+    container.style.left = `${geom.left}px`;
+    container.style.top = `${geom.top}px`;
+    container.style.right = "auto";
+  }
+  /** 把当前窗口几何写入设置并落盘 */
+  persistGeometry() {
+    if (!this.container)
+      return;
+    const rect = this.container.getBoundingClientRect();
+    const geom = {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      width: Math.max(1, Math.round(rect.width)),
+      height: Math.max(1, Math.round(rect.height))
+    };
+    if (!isValidGeometry(geom))
+      return;
+    try {
+      this.ctx.getSettings().deepseekWindowGeometry = geom;
+      void this.ctx.saveSettings().catch((e) => {
+        console.error("[DeepSeek] \u4FDD\u5B58\u7A97\u53E3\u51E0\u4F55\u5931\u8D25:", e);
+      });
+    } catch (e) {
+      console.error("[DeepSeek] \u5199\u5165\u7A97\u53E3\u51E0\u4F55\u5931\u8D25:", e);
+    }
+  }
+  /** 清除持久化几何（面板被拖出视口复位时调用） */
+  clearGeometry() {
+    try {
+      this.ctx.getSettings().deepseekWindowGeometry = null;
+      void this.ctx.saveSettings().catch((e) => {
+        console.error("[DeepSeek] \u6E05\u9664\u7A97\u53E3\u51E0\u4F55\u5931\u8D25:", e);
+      });
+    } catch (e) {
+      console.error("[DeepSeek] \u6E05\u9664\u7A97\u53E3\u51E0\u4F55\u5931\u8D25:", e);
+    }
+  }
+  /** 清空全部内联几何样式，回退到 CSS 默认定位与尺寸 */
+  resetGeometryStyles(container) {
+    container.style.left = "";
+    container.style.top = "";
+    container.style.right = "";
+    container.style.width = "";
+    container.style.height = "";
+  }
+  // ========== 边缘缩放 ==========
+  /**
+   * 开始边缘缩放：按方向在 document 上挂一次性 move/up 监听。
+   * 8 个方向复用同一套数学：n/s 改高度，e/w 改宽度，w/n 同时平移 left/top，
+   * 全程从起始矩形推导（绝对量），避免累积误差；尺寸钳制到最小值。
+   */
+  beginResize(e, dir) {
+    if (e.button !== 0)
+      return;
+    const container = this.container;
+    const content = this.content;
+    if (!container || !content)
+      return;
+    e.preventDefault();
+    const startRect = container.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let resized = false;
+    container.style.transition = "none";
+    content.style.pointerEvents = "none";
+    const MIN_W = MIN_WINDOW_WIDTH;
+    const MIN_H = MIN_WINDOW_HEIGHT;
+    const onMouseMove = (ev) => {
+      resized = true;
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      let width = startRect.width;
+      let height = startRect.height;
+      let left = startRect.left;
+      let top = startRect.top;
+      if (dir.includes("e")) {
+        width = Math.max(MIN_W, startRect.width + dx);
+      }
+      if (dir.includes("s")) {
+        height = Math.max(MIN_H, startRect.height + dy);
+      }
+      if (dir.includes("w")) {
+        width = Math.max(MIN_W, startRect.width - dx);
+        left = startRect.right - width;
+      }
+      if (dir.includes("n")) {
+        height = Math.max(MIN_H, startRect.height - dy);
+        top = startRect.bottom - height;
+      }
+      container.style.width = `${Math.round(width)}px`;
+      container.style.height = `${Math.round(height)}px`;
+      container.style.right = "auto";
+      container.style.left = `${Math.round(left)}px`;
+      container.style.top = `${Math.round(top)}px`;
+    };
+    const finish = () => {
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", finish);
+      container.style.transition = "";
+      content.style.pointerEvents = "";
+      this.resizeCleanup = null;
+      if (resized)
+        this.persistGeometry();
+    };
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", finish);
+    this.resizeCleanup = finish;
   }
   // ========== 上传当前文件到聊天框 ==========
   async addCurrentFileToChat() {
@@ -27419,6 +27663,12 @@ function arrayBufferToBase64(buffer) {
     out += btoa(binary);
   }
   return out;
+}
+function isValidGeometry(g) {
+  if (!g)
+    return false;
+  const nums = [g.left, g.top, g.width, g.height];
+  return nums.every((n) => Number.isFinite(n)) && g.width > 50 && g.height > 50;
 }
 
 // modules/PdfHighlightModule.ts
@@ -28369,6 +28619,8 @@ function clampCoord(value, size) {
 var ScreenshotModule = class extends BaseCropModeModule {
   constructor(ctx, pdfModule) {
     super(ctx);
+    /** 截图批注写入后的高亮刷新回调（由主入口注入 ScreenshotHighlightModule.refresh） */
+    this.refreshHighlights = null;
     /** 原始 PDF EmbedCreator（注册自定义裁剪嵌入前保存，卸载时恢复） */
     this.originalPdfEmbedCreator = null;
     /** 本插件注册的包装创建器（用于卸载时校验注册表归属，避免覆盖其他插件） */
@@ -28381,6 +28633,10 @@ var ScreenshotModule = class extends BaseCropModeModule {
     this.commandId = "screenshot-annotate";
     this.commandName = "\u622A\u56FE\u6279\u6CE8\u5230\u7B14\u8BB0";
     this.pdfModule = pdfModule;
+  }
+  /** 注入截图批注高亮刷新回调（批注成功后触发即时渲染） */
+  setHighlightRefresh(cb) {
+    this.refreshHighlights = cb;
   }
   load() {
     super.load();
@@ -28427,8 +28683,10 @@ var ScreenshotModule = class extends BaseCropModeModule {
     try {
       const ok = await this.pdfModule.annotateScreenshot(file, pageNum, rect);
       notice.hide();
-      if (ok)
+      if (ok) {
+        this.refreshHighlights?.(file, [{ page: pageNum, rect }]);
         new import_obsidian5.Notice("\u622A\u56FE\u6279\u6CE8\u5DF2\u5199\u5165\u7B14\u8BB0");
+      }
     } catch (e) {
       notice.hide();
       new import_obsidian5.Notice(`\u622A\u56FE\u6279\u6CE8\u5931\u8D25: ${e.message}`);
@@ -28642,13 +28900,152 @@ var PdfDocCache = class {
 };
 var pdfDocCache = new PdfDocCache();
 
+// modules/ScreenshotHighlightModule.ts
+var import_obsidian6 = require("obsidian");
+var ScreenshotHighlightModule = class extends BasePdfHighlightModule {
+  constructor(ctx) {
+    super(ctx);
+  }
+  get renderEventName() {
+    return "pagerendered";
+  }
+  /**
+   * 刷新指定 PDF 的截图批注高亮：
+   *  - 刚批注写入的条目先记入「显式覆盖层」
+   *  - 再从笔记内容重建索引
+   *  - 最后重渲染所有已打开该 PDF 的视图
+   */
+  refresh(pdfFile, explicit) {
+    const pdfPath = pdfFile.path;
+    if (explicit && explicit.length > 0) {
+      for (const e of explicit) {
+        this.trackExplicitEntry(pdfPath, e.page, rectKey(e.rect));
+      }
+    }
+    this.rebuildIndexSerialized(pdfPath).then(() => {
+      this.renderForPdf(pdfPath);
+    });
+  }
+  /** 覆盖层条目并入截图矩形索引；返回 true 表示已被笔记内容确认（移出覆盖层） */
+  applyExplicitEntry(index, page, key) {
+    const pageMap = index.get(page);
+    if (pageMap?.has(key))
+      return true;
+    const rect = parseRectKey(key);
+    if (!rect)
+      return false;
+    const map = pageMap ?? /* @__PURE__ */ new Map();
+    map.set(key, rect);
+    index.set(page, map);
+    return false;
+  }
+  /**
+   * 重建单个 PDF 的索引。
+   * 与其它高亮模块一致：通过 resolvedLinks 反查链接到该 PDF 的笔记，
+   * 再读取笔记原文提取 rect 链接。
+   */
+  async rebuildIndex(pdfPath) {
+    const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
+    if (!(pdfFile instanceof import_obsidian6.TFile))
+      return;
+    const newIndex = /* @__PURE__ */ new Map();
+    const app = this.ctx.plugin.app;
+    for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
+      if (!links[pdfPath])
+        continue;
+      const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
+      if (!(sourceFile instanceof import_obsidian6.TFile))
+        continue;
+      try {
+        const content = await this.readNoteContent(sourceFile);
+        this.extractRectLinks(content, pdfFile, sourcePath, newIndex);
+      } catch (e) {
+        console.warn("[ScreenshotHighlight] \u8BFB\u53D6\u7B14\u8BB0\u5931\u8D25:", sourcePath, e);
+      }
+    }
+    this.indexCache.set(pdfPath, newIndex);
+  }
+  /** 从笔记原文中提取指向指定 PDF 的 rect 嵌入链接并写入索引 */
+  extractRectLinks(content, pdfFile, sourcePath, index) {
+    const app = this.ctx.plugin.app;
+    const linkRegex = /\[\[([^\]#|]+?)#page=(\d+)&rect=([\d.,\s-]+?)(?:\|[^\]]*)?\]\]/g;
+    let m;
+    while ((m = linkRegex.exec(content)) !== null) {
+      const linkpath = m[1].trim();
+      const target = app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+      if (target !== pdfFile)
+        continue;
+      const page = parseInt(m[2], 10);
+      const parts = m[3].split(",").map((s) => parseFloat(s.trim()));
+      if (!Number.isInteger(page) || parts.length !== 4 || parts.some((p) => Number.isNaN(p)))
+        continue;
+      const [a, b, c, d] = parts;
+      const rect = {
+        x1: Math.min(a, c),
+        y1: Math.min(b, d),
+        x2: Math.max(a, c),
+        y2: Math.max(b, d)
+      };
+      const pageMap = index.get(page) ?? /* @__PURE__ */ new Map();
+      pageMap.set(rectKey([rect.x1, rect.y1, rect.x2, rect.y2]), rect);
+      index.set(page, pageMap);
+    }
+  }
+  /** 渲染单页的截图批注高亮层（pagerendered 时调用） */
+  renderPageHighlights(pdfPath, pageView) {
+    if (!pageView?.div)
+      return;
+    const pageDiv = pageView.div;
+    const pageNumber = parseInt(pageDiv.dataset.pageNumber ?? "0", 10) || 0;
+    const index = this.indexCache.get(pdfPath);
+    const pageMap = index?.get(pageNumber);
+    if (!pageMap || pageMap.size === 0) {
+      pageDiv.querySelector(".pdf-screenshot-highlight-layer")?.remove();
+      return;
+    }
+    const view = pageView.pdfPage?.view;
+    if (!view || view.length < 4)
+      return;
+    const [minX, minY, maxX, maxY] = view;
+    const pageWidth = maxX - minX;
+    const pageHeight = maxY - minY;
+    if (pageWidth <= 0 || pageHeight <= 0)
+      return;
+    pageDiv.querySelector(".pdf-screenshot-highlight-layer")?.remove();
+    const layerEl = pageDiv.createDiv("pdf-screenshot-highlight-layer");
+    for (const h of pageMap.values()) {
+      const rectEl = layerEl.createDiv("pdf-screenshot-crop-highlight");
+      rectEl.setAttr("data-pdf-jump-page", String(pageNumber));
+      rectEl.setAttr("data-pdf-jump-rect", rectKey([h.x1, h.y1, h.x2, h.y2]));
+      Object.assign(rectEl.style, {
+        left: `${(100 * (h.x1 - minX) / pageWidth).toFixed(3)}%`,
+        top: `${(100 * (maxY - h.y2) / pageHeight).toFixed(3)}%`,
+        width: `${(100 * (h.x2 - h.x1) / pageWidth).toFixed(3)}%`,
+        height: `${(100 * (h.y2 - h.y1) / pageHeight).toFixed(3)}%`
+      });
+    }
+  }
+};
+function rectKey(rect) {
+  return rect.map((n) => Number(n.toFixed(4))).join(",");
+}
+function parseRectKey(key) {
+  const parts = key.split(",").map((s) => Number(s));
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p)))
+    return null;
+  const [x1, y1, x2, y2] = parts;
+  return { x1, y1, x2, y2 };
+}
+
 // modules/OcrModule.ts
-var import_obsidian7 = require("obsidian");
+var import_obsidian8 = require("obsidian");
 
 // modules/OcrService.ts
-var import_obsidian6 = require("obsidian");
+var import_obsidian7 = require("obsidian");
 var OcrService = class {
   constructor(baseUrl, apiKey) {
+    /** 是否清洗 OCR 输出（默认开启）；关闭时原样保留模型返回文本 */
+    this.sanitizeOutput = true;
     /** 超时后仍在运行的底层请求（requestUrl 不支持中止，仅跟踪以防 unhandled rejection） */
     this.zombieRequest = null;
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -28660,6 +29057,9 @@ var OcrService = class {
   setApiKey(key) {
     this.apiKey = key;
   }
+  setSanitizeOutput(value) {
+    this.sanitizeOutput = value;
+  }
   /** 拉取服务器可用模型列表 */
   async listModels() {
     const res = await this.request({
@@ -28670,7 +29070,7 @@ var OcrService = class {
     const models = data?.data ?? [];
     return models.map((m) => typeof m === "string" ? m : m?.id ?? "").filter(Boolean);
   }
-  /** 自动选择模型：设置指定 → 视觉模型按优先级（paddleocr-vl-1.6 首选） */
+  /** 自动选择模型：设置指定 → 视觉模型按优先级（推荐 paddleocr-vl-1.6 优先） */
   async resolveModel(configured) {
     if (configured.trim())
       return configured.trim();
@@ -28684,7 +29084,12 @@ var OcrService = class {
         return hit;
     }
     const preferred = models.find((m) => /ocr|vision|vl|qwen|llava|gemini/i.test(m));
-    return preferred ?? models[0];
+    if (preferred)
+      return preferred;
+    const preview = models.slice(0, 10).join(", ") + (models.length > 10 ? " \u2026" : "");
+    throw new Error(
+      `\u670D\u52A1\u5668\u4E0A\u672A\u627E\u5230\u89C6\u89C9\u6A21\u578B\uFF0C\u8BF7\u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u624B\u52A8\u586B\u5199\u300COCR \u6A21\u578B\u300D\u3002\u53EF\u7528\u6A21\u578B\uFF1A${preview}`
+    );
   }
   /**
    * 识别截图图像中的文字（纯文本输出）
@@ -28742,7 +29147,7 @@ var OcrService = class {
     const choice = res.json?.choices?.[0];
     const raw = choice?.message?.content ?? "";
     return {
-      text: sanitizeOcrText(raw),
+      text: this.sanitizeOutput ? sanitizeOcrText(raw) : raw,
       finishReason: choice?.finish_reason ?? null
     };
   }
@@ -28759,7 +29164,7 @@ var OcrService = class {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
     }
     const requestPromise = (async () => {
-      const res = await (0, import_obsidian6.requestUrl)({
+      const res = await (0, import_obsidian7.requestUrl)({
         throw: false,
         ...params,
         headers
@@ -28825,8 +29230,6 @@ function sanitizeOcrText(text) {
 }
 
 // modules/OcrModule.ts
-var MIN_OCR_SIDE = 512;
-var MAX_CROP_SCALE = 4;
 var OcrModule = class extends BaseCropModeModule {
   constructor(ctx, pdfModule) {
     super(ctx);
@@ -28851,7 +29254,7 @@ var OcrModule = class extends BaseCropModeModule {
       await this.doCaptureAndAnnotate(leaf, pageDiv, pageRect);
     } catch (e) {
       console.error("[Ocr] \u622A\u56FE\u6279\u6CE8\u5931\u8D25:", e);
-      new import_obsidian7.Notice(`\u622A\u56FE\u6279\u6CE8\u5931\u8D25: ${e.message}`);
+      new import_obsidian8.Notice(`\u622A\u56FE\u6279\u6CE8\u5931\u8D25: ${e.message}`);
     }
   }
   async doCaptureAndAnnotate(leaf, pageDiv, pageRect) {
@@ -28859,7 +29262,7 @@ var OcrModule = class extends BaseCropModeModule {
       return;
     const pageNum = parseInt(pageDiv.dataset?.pageNumber ?? "0", 10) || 0;
     if (pageNum <= 0) {
-      new import_obsidian7.Notice("\u65E0\u6CD5\u786E\u5B9A\u622A\u56FE\u9875\u7801");
+      new import_obsidian8.Notice("\u65E0\u6CD5\u786E\u5B9A\u622A\u56FE\u9875\u7801");
       return;
     }
     const bl = pageDiv.clientLeft;
@@ -28873,10 +29276,11 @@ var OcrModule = class extends BaseCropModeModule {
       h: clamp01(pageRect.height / ph)
     } : null;
     let imageDataUrl = null;
+    const cropOpts = this.cropOptions();
     const canvas = pageDiv.querySelector("canvas");
     if (canvas && canvas.width > 0 && canvas.height > 0) {
       try {
-        imageDataUrl = cropFromCanvas(canvas, pageRect, pageDiv);
+        imageDataUrl = cropFromCanvas(canvas, pageRect, pageDiv, cropOpts);
       } catch (e) {
         console.warn("[Ocr] \u753B\u5E03\u88C1\u526A\u5931\u8D25\uFF0C\u5C1D\u8BD5\u515C\u5E95\u6E32\u67D3:", e);
       }
@@ -28886,10 +29290,10 @@ var OcrModule = class extends BaseCropModeModule {
         const proxy = this.getPdfDocumentProxy(leaf);
         if (!proxy)
           throw new Error("\u65E0\u6CD5\u83B7\u53D6 PDF \u6587\u6863\u4EE3\u7406");
-        imageDataUrl = await this.renderCropFallback(proxy, pageNum, pageRect, pageDiv);
+        imageDataUrl = await this.renderCropFallback(proxy, pageNum, pageRect, pageDiv, cropOpts);
       } catch (e) {
         console.warn("[Ocr] \u622A\u56FE\u515C\u5E95\u6E32\u67D3\u5931\u8D25:", e);
-        new import_obsidian7.Notice("\u9875\u9762\u5C1A\u672A\u6E32\u67D3\uFF0C\u8BF7\u6EDA\u52A8\u89C6\u56FE\u540E\u91CD\u8BD5");
+        new import_obsidian8.Notice("\u9875\u9762\u5C1A\u672A\u6E32\u67D3\uFF0C\u8BF7\u6EDA\u52A8\u89C6\u56FE\u540E\u91CD\u8BD5");
         return;
       }
     }
@@ -28912,20 +29316,21 @@ var OcrModule = class extends BaseCropModeModule {
   async ocrAndAnnotate(leaf, imageDataUrl, pageNum, ocrRect) {
     const file = leaf.view.file;
     if (!file) {
-      new import_obsidian7.Notice("\u65E0\u6CD5\u8BC6\u522B\u5F53\u524D PDF \u6587\u4EF6");
+      new import_obsidian8.Notice("\u65E0\u6CD5\u8BC6\u522B\u5F53\u524D PDF \u6587\u4EF6");
       return false;
     }
     const settings = this.ctx.getSettings();
     this.service.setBaseUrl(settings.ocrServerUrl);
     this.service.setApiKey(settings.ocrApiKey);
+    this.service.setSanitizeOutput(settings.ocrSanitizeOutput !== false);
     let model;
     try {
       model = await this.service.resolveModel(settings.ocrModel);
     } catch (e) {
-      new import_obsidian7.Notice(`\u65E0\u6CD5\u8FDE\u63A5 OCR \u670D\u52A1\u5668: ${e.message}`);
+      new import_obsidian8.Notice(`\u9009\u62E9 OCR \u6A21\u578B\u5931\u8D25: ${e.message}`);
       return false;
     }
-    const notice = new import_obsidian7.Notice("OCR \u8BC6\u522B\u4E2D\u2026", 0);
+    const notice = new import_obsidian8.Notice("OCR \u8BC6\u522B\u4E2D\u2026", 0);
     try {
       const { text } = await this.service.ocrText(
         imageDataUrl,
@@ -28936,22 +29341,29 @@ var OcrModule = class extends BaseCropModeModule {
       );
       notice.hide();
       if (!text.trim()) {
-        new import_obsidian7.Notice("\u672A\u8BC6\u522B\u5230\u6587\u5B57\uFF0C\u8BF7\u8C03\u6574\u6846\u9009\u533A\u57DF\u540E\u91CD\u8BD5");
+        new import_obsidian8.Notice("\u672A\u8BC6\u522B\u5230\u6587\u5B57\uFF0C\u8BF7\u8C03\u6574\u6846\u9009\u533A\u57DF\u540E\u91CD\u8BD5");
         return false;
       }
       const ok = await this.pdfModule.annotateOcrText(file, text, pageNum, ocrRect ?? void 0);
       if (ok) {
-        new import_obsidian7.Notice("OCR \u6279\u6CE8\u5DF2\u5199\u5165\u7B14\u8BB0");
+        new import_obsidian8.Notice("OCR \u6279\u6CE8\u5DF2\u5199\u5165\u7B14\u8BB0");
       }
       return ok;
     } catch (e) {
       notice.hide();
-      new import_obsidian7.Notice(`OCR \u5931\u8D25: ${e.message}`);
+      new import_obsidian8.Notice(`OCR \u5931\u8D25: ${e.message}`);
       return false;
     }
   }
+  /** 从设置读取截图放大参数（非法值回退默认；minSidePx<=0 表示关闭放大） */
+  cropOptions() {
+    const s = this.ctx.getSettings();
+    const minSidePx = Math.max(0, Math.floor(Number(s.ocrMinSidePx) || 0));
+    const maxScale = Math.min(8, Math.max(1, Number(s.ocrMaxUpscaleFactor) || 4));
+    return { minSidePx, maxScale };
+  }
   // ========== 兜底整页渲染（canvas 缺失时） ==========
-  async renderCropFallback(proxy, pageNum, pageRect, pageDiv) {
+  async renderCropFallback(proxy, pageNum, pageRect, pageDiv, cropOpts = { minSidePx: 512, maxScale: 4 }) {
     const page = await proxy.getPage(pageNum);
     const scale = 2;
     const viewport = page.getViewport({ scale });
@@ -28971,10 +29383,10 @@ var OcrModule = class extends BaseCropModeModule {
     const sy = pageRect.y * dpr;
     const sw = pageRect.width * dpr;
     const sh = pageRect.height * dpr;
-    return cropCanvasRegion(canvas, sx, sy, sw, sh);
+    return cropCanvasRegion(canvas, sx, sy, sw, sh, cropOpts);
   }
 };
-function cropFromCanvas(canvas, pageRect, pageDiv) {
+function cropFromCanvas(canvas, pageRect, pageDiv, cropOpts) {
   const canvasRect = canvas.getBoundingClientRect();
   const pr = pageDiv.getBoundingClientRect();
   const dprX = canvas.width / canvasRect.width;
@@ -28983,17 +29395,23 @@ function cropFromCanvas(canvas, pageRect, pageDiv) {
   const sy = (pageRect.y - (canvasRect.top - pr.top)) * dprY;
   const sw = pageRect.width * dprX;
   const sh = pageRect.height * dprY;
-  return cropCanvasRegion(canvas, sx, sy, sw, sh);
+  return cropCanvasRegion(canvas, sx, sy, sw, sh, cropOpts);
 }
-function cropCanvasRegion(source, sx, sy, sw, sh) {
+function cropCanvasRegion(source, sx, sy, sw, sh, cropOpts) {
   const cx = Math.max(0, sx);
   const cy = Math.max(0, sy);
   const cw = Math.min(sw, source.width - cx);
   const ch = Math.min(sh, source.height - cy);
   if (cw < 1 || ch < 1)
     throw new Error("\u622A\u56FE\u533A\u57DF\u8D85\u51FA\u9875\u9762\u8303\u56F4");
-  const minSide = Math.min(cw, ch);
-  const scale = Math.min(MAX_CROP_SCALE, Math.max(1, MIN_OCR_SIDE / minSide));
+  let scale = 1;
+  if (cropOpts.minSidePx > 0) {
+    const minSide = Math.min(cw, ch);
+    scale = Math.min(
+      Math.max(1, cropOpts.maxScale),
+      Math.max(1, cropOpts.minSidePx / minSide)
+    );
+  }
   const out = document.createElement("canvas");
   out.width = Math.max(1, Math.round(cw * scale));
   out.height = Math.max(1, Math.round(ch * scale));
@@ -29010,7 +29428,7 @@ function clamp01(value) {
 }
 
 // modules/OcrHighlightModule.ts
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 var OcrHighlightModule = class extends BasePdfHighlightModule {
   constructor(ctx) {
     super(ctx);
@@ -29029,7 +29447,7 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
     const pdfPath = pdfFile.path;
     if (explicit && explicit.length > 0) {
       for (const e of explicit) {
-        this.trackExplicitEntry(pdfPath, e.page, rectKey(e.rect));
+        this.trackExplicitEntry(pdfPath, e.page, rectKey2(e.rect));
       }
     }
     this.rebuildIndexSerialized(pdfPath).then(() => {
@@ -29041,7 +29459,7 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
     const pageMap = index.get(page);
     if (pageMap?.has(key))
       return true;
-    const rect = parseRectKey(key);
+    const rect = parseRectKey2(key);
     if (!rect)
       return false;
     const map = pageMap ?? /* @__PURE__ */ new Map();
@@ -29056,7 +29474,7 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
    */
   async rebuildIndex(pdfPath) {
     const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
-    if (!(pdfFile instanceof import_obsidian8.TFile))
+    if (!(pdfFile instanceof import_obsidian9.TFile))
       return;
     const newIndex = /* @__PURE__ */ new Map();
     const app = this.ctx.plugin.app;
@@ -29064,7 +29482,7 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
       if (!links[pdfPath])
         continue;
       const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
-      if (!(sourceFile instanceof import_obsidian8.TFile))
+      if (!(sourceFile instanceof import_obsidian9.TFile))
         continue;
       try {
         const content = await this.readNoteContent(sourceFile);
@@ -29091,7 +29509,7 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
         continue;
       const [nx, ny, nw, nh] = parts;
       const pageMap = index.get(page) ?? /* @__PURE__ */ new Map();
-      pageMap.set(rectKey({ x: nx, y: ny, w: nw, h: nh }), { nx, ny, nw, nh });
+      pageMap.set(rectKey2({ x: nx, y: ny, w: nw, h: nh }), { nx, ny, nw, nh });
       index.set(page, pageMap);
     }
   }
@@ -29112,7 +29530,7 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
     for (const h of pageMap.values()) {
       const rectEl = layerEl.createDiv("ocr-crop-highlight");
       rectEl.setAttr("data-pdf-jump-page", String(pageNumber));
-      rectEl.setAttr("data-pdf-jump-ocr", rectKey({ x: h.nx, y: h.ny, w: h.nw, h: h.nh }));
+      rectEl.setAttr("data-pdf-jump-ocr", rectKey2({ x: h.nx, y: h.ny, w: h.nw, h: h.nh }));
       Object.assign(rectEl.style, {
         left: `${(h.nx * 100).toFixed(3)}%`,
         top: `${(h.ny * 100).toFixed(3)}%`,
@@ -29122,10 +29540,10 @@ var OcrHighlightModule = class extends BasePdfHighlightModule {
     }
   }
 };
-function rectKey(r) {
+function rectKey2(r) {
   return `${Number(r.x.toFixed(4))},${Number(r.y.toFixed(4))},${Number(r.w.toFixed(4))},${Number(r.h.toFixed(4))}`;
 }
-function parseRectKey(key) {
+function parseRectKey2(key) {
   const parts = key.split(",").map((s) => Number(s));
   if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p)))
     return null;
@@ -29134,7 +29552,7 @@ function parseRectKey(key) {
 }
 
 // modules/MainArticleModule.ts
-var import_obsidian9 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 var MainArticleModule = class {
   constructor(ctx, pdfModule) {
     /** 当前主文献 PDF 路径（null = 未设置，批注走默认逻辑写入源 PDF 对应笔记） */
@@ -29208,7 +29626,7 @@ var MainArticleModule = class {
     if (!this.mainArticlePdfPath)
       return null;
     const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(this.mainArticlePdfPath);
-    if (!(pdfFile instanceof import_obsidian9.TFile))
+    if (!(pdfFile instanceof import_obsidian10.TFile))
       return null;
     return await this.pdfModule.createReadingNote(pdfFile);
   }
@@ -29247,7 +29665,7 @@ var MainArticleModule = class {
       const btn = document.createElement("div");
       btn.addClass("clickable-icon");
       btn.addClass("pdfreader-main-article-button");
-      (0, import_obsidian9.setIcon)(btn, "bookmark");
+      (0, import_obsidian10.setIcon)(btn, "bookmark");
       btn.addEventListener("click", (evt) => {
         evt.stopPropagation();
         const currentFile = leaf.view.file;
@@ -29284,18 +29702,18 @@ var MainArticleModule = class {
     const isMain = !!file && this.mainArticlePdfPath === file.path;
     btn.toggleClass("is-active", isMain);
     if (isMain) {
-      (0, import_obsidian9.setTooltip)(btn, "\u4E3B\u6587\u732E\u5DF2\u5F00\u542F\uFF08\u70B9\u51FB\u53D6\u6D88\uFF09\n\u6279\u6CE8\u5C06\u6C47\u96C6\u5230\u672C\u7BC7\u7B14\u8BB0");
+      (0, import_obsidian10.setTooltip)(btn, "\u4E3B\u6587\u732E\u5DF2\u5F00\u542F\uFF08\u70B9\u51FB\u53D6\u6D88\uFF09\n\u6279\u6CE8\u5C06\u6C47\u96C6\u5230\u672C\u7BC7\u7B14\u8BB0");
     } else {
-      (0, import_obsidian9.setTooltip)(btn, "\u8BBE\u4E3A\u4E3B\u6587\u732E\uFF1A\u6279\u6CE8\u6C47\u96C6\u5230\u672C\u7BC7\u7B14\u8BB0");
+      (0, import_obsidian10.setTooltip)(btn, "\u8BBE\u4E3A\u4E3B\u6587\u732E\uFF1A\u6279\u6CE8\u6C47\u96C6\u5230\u672C\u7BC7\u7B14\u8BB0");
     }
   }
 };
 
 // modules/AnnotationModeModule.ts
-var import_obsidian10 = require("obsidian");
+var import_obsidian11 = require("obsidian");
 var AnnotationModeModule = class {
   constructor(ctx, pdfModule) {
-    /** 「附带原文」开关：true = 批注附带原文；false（默认）= 批注只写链接 */
+    /** 「附带原文」开关（内存镜像；真实状态持久化于设置 annotationIncludeOriginalText） */
     this.includeOriginalText = false;
     /** 已注入按钮的叶子 → 按钮元素 */
     this.toolbarButtons = /* @__PURE__ */ new Map();
@@ -29308,6 +29726,7 @@ var AnnotationModeModule = class {
   }
   load() {
     const plugin = this.ctx.plugin;
+    this.includeOriginalText = this.ctx.getSettings().annotationIncludeOriginalText === true;
     this.pdfModule.setIncludeOriginalTextProvider(() => this.includeOriginalText);
     plugin.registerEvent(
       plugin.app.workspace.on("layout-change", () => {
@@ -29328,7 +29747,7 @@ var AnnotationModeModule = class {
     toolbarPoller.start();
     plugin.addCommand({
       id: "toggle-include-original-text",
-      name: "\u5207\u6362\u300C\u9644\u5E26\u539F\u6587\u300D\u6279\u6CE8\u6A21\u5F0F\uFF08\u9ED8\u8BA4\u5173\u95ED\uFF1B\u5173\u95ED\u65F6\u6279\u6CE8\u53EA\u5199 PDF \u94FE\u63A5\uFF09",
+      name: "\u5207\u6362\u300C\u9644\u5E26\u539F\u6587\u300D\u6279\u6CE8\u6A21\u5F0F\uFF08\u9ED8\u8BA4\u5173\u95ED\uFF1B\u5F00\u542F\u65F6\u6279\u6CE8\u5305\u542B\u539F\u6587\uFF09",
       checkCallback: (checking) => {
         const leaf = plugin.app.workspace.activeLeaf;
         if (!leaf || leaf.view.getViewType() !== "pdf")
@@ -29355,9 +29774,13 @@ var AnnotationModeModule = class {
     this.includeOriginalText = false;
   }
   // ========== 模式状态 ==========
-  /** 切换「附带原文」开关并刷新所有按钮激活态 */
+  /** 切换「附带原文」开关，同步写入设置并持久化 */
   toggleMode() {
     this.includeOriginalText = !this.includeOriginalText;
+    this.ctx.getSettings().annotationIncludeOriginalText = this.includeOriginalText;
+    void this.ctx.saveSettings().catch((e) => {
+      console.error("[AnnotationMode] \u4FDD\u5B58\u300C\u9644\u5E26\u539F\u6587\u300D\u5F00\u5173\u5931\u8D25:", e);
+    });
     this.refreshAllButtonStates();
   }
   // ========== 工具条按钮 ==========
@@ -29386,7 +29809,7 @@ var AnnotationModeModule = class {
       const btn = document.createElement("div");
       btn.addClass("clickable-icon");
       btn.addClass("pdfreader-annotation-mode-button");
-      (0, import_obsidian10.setIcon)(btn, "link");
+      (0, import_obsidian11.setIcon)(btn, "link");
       btn.createSpan({ text: "\u9644\u5E26\u539F\u6587" });
       btn.addEventListener("click", (evt) => {
         evt.stopPropagation();
@@ -29416,20 +29839,23 @@ var AnnotationModeModule = class {
         this.applyButtonState(btn);
     });
   }
-  /** 按当前开关切换激活态与提示文案 */
+  /** 按当前开关切换激活态与提示文案（提示中的链接标签跟随设置） */
   applyButtonState(btn) {
     const on = this.includeOriginalText;
+    const label = this.ctx.getSettings().annotationLinkLabel || "\u5B9A\u4F4D";
     btn.toggleClass("is-active", on);
     if (on) {
-      (0, import_obsidian10.setTooltip)(btn, "\u9644\u5E26\u539F\u6587\u5DF2\u5F00\u542F\uFF08\u70B9\u51FB\u5173\u95ED\uFF09\n\u6279\u6CE8\u5C06\u5305\u542B\u539F\u6587\u6587\u5B57");
+      (0, import_obsidian11.setTooltip)(btn, `\u9644\u5E26\u539F\u6587\u5DF2\u5F00\u542F\uFF08\u70B9\u51FB\u5173\u95ED\uFF09
+\u6279\u6CE8\u683C\u5F0F\uFF1A\u539F\u6587 / ${label} / \u7B14\u8BB0\uFF1A`);
     } else {
-      (0, import_obsidian10.setTooltip)(btn, "\u9644\u5E26\u539F\u6587\u5DF2\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF0C\u70B9\u51FB\u5F00\u542F\uFF09\n\u6279\u6CE8\u53EA\u5199 PDF \u94FE\u63A5\uFF0C\u4E0D\u9644\u5E26\u539F\u6587");
+      (0, import_obsidian11.setTooltip)(btn, `\u9644\u5E26\u539F\u6587\u5DF2\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF0C\u70B9\u51FB\u5F00\u542F\uFF09
+\u6279\u6CE8\u683C\u5F0F\uFF1A${label} + \u4F60\u8F93\u5165\u7684\u5185\u5BB9`);
     }
   }
 };
 
 // modules/PdfJumpModule.ts
-var import_obsidian11 = require("obsidian");
+var import_obsidian12 = require("obsidian");
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var PdfJumpModule = class {
   constructor(ctx) {
@@ -29460,13 +29886,13 @@ var PdfJumpModule = class {
       if (anchor) {
         linktext = anchor.getAttribute("data-href") ?? anchor.getAttribute("href") ?? "";
         const leaf = this.findLeafContaining(anchor);
-        sourcePath = leaf?.view instanceof import_obsidian11.MarkdownView ? leaf.view.file?.path ?? "" : this.ctx.plugin.app.workspace.getActiveFile()?.path ?? "";
+        sourcePath = leaf?.view instanceof import_obsidian12.MarkdownView ? leaf.view.file?.path ?? "" : this.ctx.plugin.app.workspace.getActiveFile()?.path ?? "";
       } else {
         const inEditorLink = target.closest(".cm-hmd-internal-link, .cm-link");
         if (!inEditorLink)
           return;
         const leaf = this.findLeafContaining(target);
-        if (!leaf || !(leaf.view instanceof import_obsidian11.MarkdownView))
+        if (!leaf || !(leaf.view instanceof import_obsidian12.MarkdownView))
           return;
         const editMode = leaf.view.editMode;
         if (editMode?.sourceMode)
@@ -29492,7 +29918,7 @@ var PdfJumpModule = class {
       const pathPart = (hashIdx >= 0 ? linktext.slice(0, hashIdx) : linktext).trim();
       const fragment = hashIdx >= 0 ? linktext.slice(hashIdx) : "";
       const pdfFile = this.ctx.plugin.app.metadataCache.getFirstLinkpathDest(pathPart, sourcePath);
-      if (!(pdfFile instanceof import_obsidian11.TFile) || pdfFile.extension !== "pdf")
+      if (!(pdfFile instanceof import_obsidian12.TFile) || pdfFile.extension !== "pdf")
         return;
       evt.preventDefault();
       evt.stopPropagation();
@@ -29527,12 +29953,13 @@ var PdfJumpModule = class {
       const page = parseInt(jumpEl.getAttribute("data-pdf-jump-page") || "", 10);
       const sel = jumpEl.getAttribute("data-pdf-jump-selection");
       const ocr = jumpEl.getAttribute("data-pdf-jump-ocr");
-      const key = sel ? `s:${sel}` : ocr ? `o:${this.normalizeOcrKey(ocr)}` : null;
+      const rect = jumpEl.getAttribute("data-pdf-jump-rect");
+      const key = sel ? `s:${sel}` : ocr ? `o:${this.normalizeOcrKey(ocr)}` : rect ? `r:${this.normalizeRectKey(rect)}` : null;
       if (!Number.isInteger(page) || !key)
         return;
       const occurrences = this.indexCache.get(pdfFile.path)?.get(page)?.get(key);
       if (!occurrences || occurrences.length === 0) {
-        new import_obsidian11.Notice("\u672A\u5728\u7B14\u8BB0\u4E2D\u627E\u5230\u5BF9\u5E94\u7684\u6279\u6CE8\u94FE\u63A5");
+        new import_obsidian12.Notice("\u672A\u5728\u7B14\u8BB0\u4E2D\u627E\u5230\u5BF9\u5E94\u7684\u6279\u6CE8\u94FE\u63A5");
         return;
       }
       const byNote = /* @__PURE__ */ new Map();
@@ -29544,11 +29971,11 @@ var PdfJumpModule = class {
       if (notes.length === 1) {
         this.jumpToNoteOccurrence(pdfFile, leaf, notes[0]);
       } else {
-        const menu = new import_obsidian11.Menu();
+        const menu = new import_obsidian12.Menu();
         for (const occ of notes) {
           const noteFile = this.ctx.plugin.app.vault.getAbstractFileByPath(occ.notePath);
           menu.addItem(
-            (item) => item.setTitle(noteFile instanceof import_obsidian11.TFile ? noteFile.basename : occ.notePath).onClick(() => this.jumpToNoteOccurrence(pdfFile, leaf, occ))
+            (item) => item.setTitle(noteFile instanceof import_obsidian12.TFile ? noteFile.basename : occ.notePath).onClick(() => this.jumpToNoteOccurrence(pdfFile, leaf, occ))
           );
         }
         menu.showAtMouseEvent(evt);
@@ -29656,7 +30083,7 @@ var PdfJumpModule = class {
    */
   async rebuildIndex(pdfPath) {
     const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
-    if (!(pdfFile instanceof import_obsidian11.TFile))
+    if (!(pdfFile instanceof import_obsidian12.TFile))
       return;
     const newIndex = /* @__PURE__ */ new Map();
     const app = this.ctx.plugin.app;
@@ -29664,7 +30091,7 @@ var PdfJumpModule = class {
       if (!links[pdfPath])
         continue;
       const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
-      if (!(sourceFile instanceof import_obsidian11.TFile))
+      if (!(sourceFile instanceof import_obsidian12.TFile))
         continue;
       try {
         const content = await this.readNoteContent(sourceFile);
@@ -29680,6 +30107,7 @@ var PdfJumpModule = class {
     const app = this.ctx.plugin.app;
     const selRegex = /\[\[([^\]#|]+?)#page=(\d+)&selection=([\d,\s-]+)/g;
     const ocrRegex = /\[\[([^\]#|]+?)#page=(\d+)&ocr=([\d.,\s-]+?)(?:\|[^\]]*)?\]\]/g;
+    const rectRegex = /\[\[([^\]#|]+?)#page=(\d+)&rect=([\d.,\s-]+?)(?:\|[^\]]*)?\]\]/g;
     this.scanMatches(content, selRegex, pdfFile, sourcePath, index, (m) => {
       const sel = this.normalizeSelectionKey(m[3]);
       if (!sel)
@@ -29693,6 +30121,13 @@ var PdfJumpModule = class {
         return null;
       const linktext = `${m[1].trim()}#page=${m[2]}&ocr=${ocr}`;
       return { page: parseInt(m[2], 10), key: `o:${ocr}`, linktext };
+    });
+    this.scanMatches(content, rectRegex, pdfFile, sourcePath, index, (m) => {
+      const rect = this.normalizeRectKey(m[3]);
+      if (!rect)
+        return null;
+      const linktext = `${m[1].trim()}#page=${m[2]}&rect=${rect}`;
+      return { page: parseInt(m[2], 10), key: `r:${rect}`, linktext };
     });
   }
   /** 通用扫描：解析链接、校验目标 PDF、计算行/列并写入索引 */
@@ -29757,9 +30192,9 @@ var PdfJumpModule = class {
       this.scrollToPdfAnchor(leaf, parsed);
     }
   }
-  /** 解析 #page=N&selection=… / #page=N&ocr=… 片段 */
+  /** 解析 #page=N&selection=… / #page=N&ocr=… / #page=N&rect=… 片段 */
   parseFragment(fragment) {
-    const m = fragment.match(/^#page=(\d+)(?:&(selection|ocr)=([\d.,\s-]+))?/);
+    const m = fragment.match(/^#page=(\d+)(?:&(selection|ocr|rect)=([\d.,\s-]+))?/);
     if (!m)
       return null;
     const page = parseInt(m[1], 10);
@@ -29776,6 +30211,11 @@ var PdfJumpModule = class {
       if (!ocr)
         return null;
       key = `o:${ocr}`;
+    } else if (m[2] === "rect") {
+      const rect = this.normalizeRectKey(m[3] ?? "");
+      if (!rect)
+        return null;
+      key = `r:${rect}`;
     }
     return { page, key };
   }
@@ -29788,6 +30228,7 @@ var PdfJumpModule = class {
       return;
     const selAttr = parsed.key.startsWith("s:") ? parsed.key.slice(2) : null;
     const ocrAttr = parsed.key.startsWith("o:") ? parsed.key.slice(2) : null;
+    const rectAttr = parsed.key.startsWith("r:") ? parsed.key.slice(2) : null;
     const deadline = Date.now() + 8e3;
     while (Date.now() < deadline) {
       if (leaf.view.getViewType() !== "pdf")
@@ -29796,7 +30237,7 @@ var PdfJumpModule = class {
         `[data-page-number="${parsed.page}"]`
       );
       const targetEl = pageEl?.querySelector(
-        selAttr ? `[data-pdf-jump-selection="${selAttr}"]` : ocrAttr ? `[data-pdf-jump-ocr="${ocrAttr}"]` : ""
+        selAttr ? `[data-pdf-jump-selection="${selAttr}"]` : ocrAttr ? `[data-pdf-jump-ocr="${ocrAttr}"]` : rectAttr ? `[data-pdf-jump-rect="${rectAttr}"]` : ""
       ) ?? null;
       if (targetEl) {
         targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -29810,7 +30251,7 @@ var PdfJumpModule = class {
   async jumpToNoteOccurrence(pdfFile, pdfLeaf, occ) {
     const app = this.ctx.plugin.app;
     const noteFile = app.vault.getAbstractFileByPath(occ.notePath);
-    if (!(noteFile instanceof import_obsidian11.TFile))
+    if (!(noteFile instanceof import_obsidian12.TFile))
       return;
     let noteLeaf = this.findLeafByPath(occ.notePath);
     if (!noteLeaf) {
@@ -29823,7 +30264,7 @@ var PdfJumpModule = class {
   /** 滚动笔记到批注行：编辑模式经编辑器，阅读模式定位渲染出的链接锚点 */
   async scrollNoteToOccurrence(noteLeaf, occ) {
     const view = noteLeaf.view;
-    if (!(view instanceof import_obsidian11.MarkdownView))
+    if (!(view instanceof import_obsidian12.MarkdownView))
       return;
     const editor = view.getMode() === "source" ? view.editor : null;
     if (editor) {
@@ -29832,12 +30273,15 @@ var PdfJumpModule = class {
       }
       if (editor.lastLine() >= occ.line) {
         const lineText = editor.getLine(occ.line);
-        editor.setCursor({ line: occ.line, ch: Math.min(occ.ch, lineText.length) });
+        const targetCh = Math.min(occ.ch, lineText.length);
         editor.scrollIntoView(
-          { from: { line: occ.line, ch: 0 }, to: { line: occ.line, ch: 1 } },
+          {
+            from: { line: occ.line, ch: targetCh },
+            to: { line: occ.line, ch: Math.min(targetCh + 1, lineText.length) }
+          },
           true
         );
-        editor.focus();
+        this.flashNoteInEditor(editor, occ);
       }
       return;
     }
@@ -29851,6 +30295,72 @@ var PdfJumpModule = class {
       }
       await sleep(100);
     }
+  }
+  /**
+   * 在编辑器（Live Preview / 源码模式）中高亮目标行，不把光标移入链接内，
+   * 避免 Obsidian Live Preview 将短链接「定位」展开为完整 wikilink。
+   *
+   * 这里不再给 CodeMirror 的行元素临时加 class（CM 重绘会清掉），
+   * 而是根据 CodeMirror 坐标在滚动容器里叠加一个临时高亮层。
+   */
+  flashNoteInEditor(editor, occ) {
+    const cm = editor.cm;
+    if (!cm || typeof editor.posToOffset !== "function")
+      return;
+    const lineText = editor.getLine(occ.line);
+    const targetCh = Math.min(occ.ch, lineText.length);
+    const offset = editor.posToOffset({ line: occ.line, ch: targetCh });
+    const showOverlay = () => {
+      try {
+        const viewport = cm.viewport;
+        if (!viewport || offset < viewport.from || offset > viewport.to)
+          return false;
+        const block = cm.lineBlockAt(offset);
+        const contentRect = cm.contentDOM?.getBoundingClientRect?.() ?? null;
+        const scrollerRect = cm.scrollDOM?.getBoundingClientRect?.() ?? null;
+        if (!scrollerRect)
+          return false;
+        const scaleX = cm.scaleX || 1;
+        const scaleY = cm.scaleY || 1;
+        const screenLeft = contentRect?.left ?? scrollerRect.left;
+        const screenTop = cm.documentTop + block.top;
+        const screenBottom = screenTop + block.height;
+        if (screenBottom < scrollerRect.top || screenTop > scrollerRect.bottom)
+          return false;
+        const left = screenLeft - scrollerRect.left + (cm.scrollDOM.scrollLeft || 0) * scaleX;
+        const top = screenTop - scrollerRect.top + (cm.scrollDOM.scrollTop || 0) * scaleY;
+        const width = contentRect?.width ?? scrollerRect.width ?? 0;
+        const height = block.height;
+        if (width <= 0 || height <= 0)
+          return false;
+        this.showNoteOverlay(cm, left, top, width, height);
+        return true;
+      } catch (e) {
+        console.warn("[PdfJump] \u521B\u5EFA\u7B14\u8BB0\u9AD8\u4EAE\u8986\u76D6\u5C42\u5931\u8D25:", e);
+        return false;
+      }
+    };
+    if (showOverlay())
+      return;
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      tries++;
+      if (showOverlay() || tries >= 40) {
+        window.clearInterval(timer);
+      }
+    }, 50);
+  }
+  /** 在 CodeMirror 滚动容器内叠加一个临时的半透明高亮框，不依赖行 DOM 的 class 存活 */
+  showNoteOverlay(cm, left, top, width, height) {
+    document.querySelectorAll(".pdf-reader-note-overlay").forEach((el) => el.remove());
+    const overlay = document.createElement("div");
+    overlay.className = "pdf-reader-note-overlay";
+    overlay.style.left = `${left}px`;
+    overlay.style.top = `${top}px`;
+    overlay.style.width = `${width}px`;
+    overlay.style.height = `${height}px`;
+    cm.scrollDOM.appendChild(overlay);
+    window.setTimeout(() => overlay.remove(), 5e3);
   }
   /** 在阅读模式渲染内容中查找与批注链接匹配的锚点 */
   findRenderedNoteLink(container, occ) {
@@ -29879,6 +30389,13 @@ var PdfJumpModule = class {
       return "";
     return parts.join(",");
   }
+  /** 截图矩形 key 规范化：4 位小数去尾零，与截图高亮层 data-pdf-jump-rect 一致 */
+  normalizeRectKey(s) {
+    const parts = s.split(",").map((p) => Number(Number(p.trim()).toFixed(4)));
+    if (parts.length !== 4 || parts.some((p) => Number.isNaN(p)))
+      return "";
+    return parts.join(",");
+  }
   /** 闪烁提示元素 */
   flashElement(el) {
     el.addClass("pdf-reader-jump-flash");
@@ -29898,7 +30415,7 @@ var PdfJumpModule = class {
   findLeafByPath(path) {
     let result = null;
     this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
-      if (!result && leaf.view instanceof import_obsidian11.FileView && leaf.view.file?.path === path) {
+      if (!result && leaf.view instanceof import_obsidian12.FileView && leaf.view.file?.path === path) {
         result = leaf;
       }
     });
@@ -29907,7 +30424,7 @@ var PdfJumpModule = class {
 };
 
 // modules/ReadingNoteMarkerModule.ts
-var import_obsidian12 = require("obsidian");
+var import_obsidian13 = require("obsidian");
 var ReadingNoteMarkerModule = class {
   constructor(ctx) {
     /** 已有阅读笔记的 PDF 路径集合 */
@@ -29916,11 +30433,11 @@ var ReadingNoteMarkerModule = class {
     this.observers = [];
     // ========== 监听与防抖 ==========
     /** 文件管理器虚拟滚动/重建时，只需要重新装饰，不重建索引 */
-    this.decorateAllDebounced = (0, import_obsidian12.debounce)(() => {
+    this.decorateAllDebounced = (0, import_obsidian13.debounce)(() => {
       this.decorateAll();
     }, 100, true);
     /** 文件/笔记变化时，重建索引并重新装饰 */
-    this.scheduleRefresh = (0, import_obsidian12.debounce)(async () => {
+    this.scheduleRefresh = (0, import_obsidian13.debounce)(async () => {
       try {
         await this.rebuildIndex();
         this.decorateAll();
@@ -29964,9 +30481,13 @@ var ReadingNoteMarkerModule = class {
     this.pdfPathsWithNotes.clear();
   }
   // ========== 索引建立 ==========
+  /** 标记开关（设置为 false 时隐藏全部标记） */
+  markerEnabled() {
+    return this.ctx.getSettings().fileMarkerEnabled !== false;
+  }
   /**
    * 重建“PDF 路径 -> 已有阅读笔记”索引。
-   * 优先使用 frontmatter 的 pdf 字段；旧笔记无该字段时按命名规则在阅读笔记文件夹内兜底。
+   * 优先使用 frontmatter 的 pdf 字段；旧笔记无该字段时按命名模板在阅读笔记文件夹内兜底。
    */
   async rebuildIndex() {
     const next = /* @__PURE__ */ new Set();
@@ -29978,7 +30499,8 @@ var ReadingNoteMarkerModule = class {
       arr.push(file.path);
       pdfsByBasename.set(file.basename, arr);
     }
-    const folderPath = (0, import_obsidian12.normalizePath)(this.ctx.getSettings().readingNoteFolder);
+    const folderPath = (0, import_obsidian13.normalizePath)(this.ctx.getSettings().readingNoteFolder);
+    const nameRegex = buildNoteBaseRegex(this.ctx.getSettings().readingNoteNameTemplate);
     for (const note of this.ctx.plugin.app.vault.getMarkdownFiles()) {
       const pdfPath = this.extractPdfPath(note);
       if (pdfPath) {
@@ -29987,7 +30509,7 @@ var ReadingNoteMarkerModule = class {
       }
       const inReadingFolder = !folderPath || note.path.startsWith(folderPath + "/");
       if (inReadingFolder) {
-        const m = note.basename.match(/^(.+) 阅读(?: \((\d+)\))?$/);
+        const m = note.basename.match(nameRegex);
         if (!m)
           continue;
         const matches = pdfsByBasename.get(m[1]);
@@ -30008,8 +30530,12 @@ var ReadingNoteMarkerModule = class {
     return path || null;
   }
   // ========== 文件管理器 DOM 装饰 ==========
-  /** 遍历所有文件管理器叶子，重新装饰所有 PDF 行 */
+  /** 遍历所有文件管理器叶子，重新装饰所有 PDF 行；关闭开关时清空标记 */
   decorateAll() {
+    if (!this.markerEnabled()) {
+      this.clearAll();
+      return;
+    }
     for (const leaf of this.ctx.plugin.app.workspace.getLeavesOfType("file-explorer")) {
       const container = leaf.view.containerEl;
       if (!container)
@@ -30026,8 +30552,8 @@ var ReadingNoteMarkerModule = class {
     if (hasNote) {
       if (!marker) {
         marker = el.createSpan({ cls: "pdf-reader-has-note-marker" });
-        (0, import_obsidian12.setIcon)(marker, "file-check");
-        (0, import_obsidian12.setTooltip)(marker, "\u5DF2\u6709\u9605\u8BFB\u7B14\u8BB0");
+        (0, import_obsidian13.setIcon)(marker, "file-check");
+        (0, import_obsidian13.setTooltip)(marker, "\u5DF2\u6709\u9605\u8BFB\u7B14\u8BB0");
         const content = el.querySelector(".nav-file-title-content");
         if (content) {
           content.before(marker);
@@ -30070,8 +30596,8 @@ var ReadingNoteMarkerModule = class {
 };
 
 // modules/SettingsTab.ts
-var import_obsidian13 = require("obsidian");
-var UnifiedSettingTab = class extends import_obsidian13.PluginSettingTab {
+var import_obsidian14 = require("obsidian");
+var UnifiedSettingTab = class extends import_obsidian14.PluginSettingTab {
   constructor(app, plugin, getSettings, saveSettings) {
     super(app, plugin);
     /** 防抖保存定时器（连续输入时避免每字符一次全量写盘） */
@@ -30105,60 +30631,124 @@ var UnifiedSettingTab = class extends import_obsidian13.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "PDF \u9605\u8BFB\u8BBE\u7F6E" });
-    new import_obsidian13.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939").setDesc("\u65B0\u521B\u5EFA\u7684\u9605\u8BFB\u7B14\u8BB0\u5C06\u5B58\u653E\u5728\u6B64\u6587\u4EF6\u5939\u4E2D\uFF08\u76F8\u5BF9 vault \u6839\u76EE\u5F55\uFF09").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.readingNoteFolder).setValue(this.getSettings().readingNoteFolder).onChange(async (value) => {
+    new import_obsidian14.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u6587\u4EF6\u5939").setDesc("\u65B0\u521B\u5EFA\u7684\u9605\u8BFB\u7B14\u8BB0\u5C06\u5B58\u653E\u5728\u6B64\u6587\u4EF6\u5939\u4E2D\uFF08\u76F8\u5BF9 vault \u6839\u76EE\u5F55\uFF09").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.readingNoteFolder).setValue(this.getSettings().readingNoteFolder).onChange(async (value) => {
       this.getSettings().readingNoteFolder = value.trim() || DEFAULT_SETTINGS.readingNoteFolder;
       this.scheduleSave();
     }));
+    new import_obsidian14.Setting(containerEl).setName("\u9605\u8BFB\u7B14\u8BB0\u547D\u540D\u6A21\u677F").setDesc("\u65B0\u5EFA\u9605\u8BFB\u7B14\u8BB0\u7684\u6587\u4EF6\u540D\u89C4\u5219\uFF0C{name} \u4E3A PDF \u6587\u4EF6\u540D\uFF08\u4E0D\u542B\u6269\u5C55\u540D\uFF09\u3002\u9700\u5305\u542B {name}\uFF0C\u5426\u5219\u6309\u9ED8\u8BA4\u6A21\u677F\u5904\u7406").addText((text) => text.setPlaceholder(DEFAULT_NOTE_NAME_TEMPLATE).setValue(this.getSettings().readingNoteNameTemplate || DEFAULT_NOTE_NAME_TEMPLATE).onChange(async (value) => {
+      const v = value.trim();
+      this.getSettings().readingNoteNameTemplate = isValidNameTemplate(v) ? v : DEFAULT_NOTE_NAME_TEMPLATE;
+      this.scheduleSave();
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u7B14\u8BB0\u6B63\u6587\u6A21\u677F").setDesc("\u65B0\u521B\u5EFA\u9605\u8BFB\u7B14\u8BB0\u7684\u6B63\u6587\u5185\u5BB9\uFF0C\u53EF\u81EA\u7531\u4FEE\u6539\u677F\u5757\u6807\u9898").addTextArea((text) => {
+      text.inputEl.rows = 4;
+      text.setPlaceholder(DEFAULT_SETTINGS.readingNoteBodyTemplate).setValue(this.getSettings().readingNoteBodyTemplate).onChange(async (value) => {
+        this.getSettings().readingNoteBodyTemplate = value.trim() ? value.replace(/\r\n/g, "\n") : DEFAULT_SETTINGS.readingNoteBodyTemplate;
+        this.scheduleSave();
+      });
+    });
+    new import_obsidian14.Setting(containerEl).setName("\u9AD8\u4EAE\u989C\u8272").setDesc("\u6279\u6CE8\u5728 PDF \u4E0A\u6301\u4E45\u9AD8\u4EAE\u7684\u586B\u5145\u8272\uFF08\u6587\u5B57\u6279\u6CE8\u4E0E OCR \u533A\u57DF\u9AD8\u4EAE\u5171\u7528\uFF09").addColorPicker((color) => color.setValue(this.normalizeHex(this.getSettings().highlightColor)).onChange(async (value) => {
+      this.getSettings().highlightColor = value;
+      await this.saveSettings();
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u9AD8\u4EAE\u900F\u660E\u5EA6").setDesc("\u6301\u4E45\u9AD8\u4EAE\u7684\u4E0D\u900F\u660E\u5EA6\uFF080.05 - 1\uFF09").addSlider((slider) => slider.setLimits(0.05, 1, 0.05).setDynamicTooltip().setValue(this.clampOpacity(this.getSettings().highlightOpacity)).onChange(async (value) => {
+      this.getSettings().highlightOpacity = value;
+      await this.saveSettings();
+    }));
+    containerEl.createEl("hr");
+    containerEl.createEl("h2", { text: "\u6279\u6CE8\u683C\u5F0F\u4E0E\u754C\u9762" });
+    new import_obsidian14.Setting(containerEl).setName("\u6279\u6CE8\u94FE\u63A5\u522B\u540D").setDesc("\u6279\u6CE8\u56DE\u94FE PDF \u7684\u94FE\u63A5\u663E\u793A\u6587\u5B57\uFF08\u5199\u5165\u7B14\u8BB0\u6B63\u6587\uFF09\uFF0C\u7559\u7A7A\u6062\u590D\u9ED8\u8BA4").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.annotationLinkLabel).setValue(this.getSettings().annotationLinkLabel || DEFAULT_SETTINGS.annotationLinkLabel).onChange(async (value) => {
+      this.getSettings().annotationLinkLabel = value.trim() || DEFAULT_SETTINGS.annotationLinkLabel;
+      this.scheduleSave();
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u6279\u6CE8\u63D0\u793A\u884C").setDesc("\u6279\u6CE8 callout \u672B\u5C3E\u7684\u63D0\u793A\u884C\uFF08\u5199\u5165\u7B14\u8BB0\u6B63\u6587\uFF09\uFF1B\u9700\u4EE5 > \u5F00\u5934\uFF0C\u4E0D\u8DB3\u65F6\u81EA\u52A8\u8865\u5168").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.annotationPromptLine).setValue(this.getSettings().annotationPromptLine || DEFAULT_SETTINGS.annotationPromptLine).onChange(async (value) => {
+      const v = value.trim();
+      let line = v || DEFAULT_SETTINGS.annotationPromptLine;
+      if (!line.startsWith(">"))
+        line = `> ${line}`;
+      this.getSettings().annotationPromptLine = line;
+      this.scheduleSave();
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u9ED8\u8BA4\u9644\u5E26\u539F\u6587").setDesc("\u5F00\u542F\u540E\u5DE5\u5177\u6761\u300C\u9644\u5E26\u539F\u6587\u300D\u6309\u94AE\u521D\u59CB\u4E3A\u6253\u5F00\u72B6\u6001\uFF1B\u7528\u6309\u94AE\u5207\u6362\u4E5F\u4F1A\u88AB\u8BB0\u4F4F").addToggle((toggle) => toggle.setValue(this.getSettings().annotationIncludeOriginalText === true).onChange(async (value) => {
+      this.getSettings().annotationIncludeOriginalText = value;
+      await this.saveSettings();
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u6587\u4EF6\u7BA1\u7406\u5668\u9605\u8BFB\u7B14\u8BB0\u6807\u8BB0").setDesc("\u4E3A\u5DF2\u6709\u9605\u8BFB\u7B14\u8BB0\u7684 PDF \u5728\u6587\u4EF6\u7BA1\u7406\u5668\u4E2D\u663E\u793A\u5C0F\u56FE\u6807\uFF1B\u5173\u95ED\u540E\u9690\u85CF\uFF08\u4EFB\u610F\u5E03\u5C40\u53D8\u5316\u5373\u6E05\u7A7A\uFF09").addToggle((toggle) => toggle.setValue(this.getSettings().fileMarkerEnabled !== false).onChange(async (value) => {
+      this.getSettings().fileMarkerEnabled = value;
+      await this.saveSettings();
+    }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "DeepSeek \u6D6E\u52A8\u7A97\u53E3\u8BBE\u7F6E" });
-    new import_obsidian13.Setting(containerEl).setName("DeepSeek URL").setDesc("\u5D4C\u5165\u6D6E\u52A8\u7A97\u53E3\u7684 DeepSeek \u7F51\u9875\u5730\u5740\uFF0C\u4FEE\u6539\u540E\u9700\u91CD\u542F\u63D2\u4EF6\u6216\u91CD\u65B0\u6253\u5F00\u7A97\u53E3\u751F\u6548").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.deepseekUrl).setValue(this.getSettings().deepseekUrl).onChange(async (value) => {
+    containerEl.createEl("p", {
+      text: "\u63D0\u793A\uFF1A\u62D6\u52A8\u6807\u9898\u680F\u79FB\u52A8\u7A97\u53E3\u3001\u62D6\u52A8\u7A97\u53E3\u8FB9\u7F18\u53EF\u8C03\u6574\u5927\u5C0F\uFF1B\u4F4D\u7F6E\u4E0E\u5927\u5C0F\u4F1A\u81EA\u52A8\u8BB0\u4F4F\u3002",
+      cls: "setting-item-description"
+    });
+    new import_obsidian14.Setting(containerEl).setName("DeepSeek URL").setDesc("\u5D4C\u5165\u6D6E\u52A8\u7A97\u53E3\u7684 DeepSeek \u7F51\u9875\u5730\u5740\uFF0C\u4FEE\u6539\u540E\u9700\u91CD\u542F\u63D2\u4EF6\u6216\u91CD\u65B0\u6253\u5F00\u7A97\u53E3\u751F\u6548").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.deepseekUrl).setValue(this.getSettings().deepseekUrl).onChange(async (value) => {
       this.getSettings().deepseekUrl = value || DEFAULT_SETTINGS.deepseekUrl;
       this.scheduleSave();
     }));
     containerEl.createEl("hr");
     containerEl.createEl("h2", { text: "\u622A\u56FE OCR \u6279\u6CE8\u8BBE\u7F6E" });
-    new import_obsidian13.Setting(containerEl).setName("LM Studio \u670D\u52A1\u5668\u5730\u5740").setDesc("OpenAI \u517C\u5BB9\u63A5\u53E3\u5730\u5740\uFF0C\u9700\u5148\u542F\u52A8 LM Studio \u5E76\u52A0\u8F7D\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl).setValue(this.getSettings().ocrServerUrl).onChange(async (value) => {
+    new import_obsidian14.Setting(containerEl).setName("LM Studio \u670D\u52A1\u5668\u5730\u5740").setDesc("OpenAI \u517C\u5BB9\u63A5\u53E3\u5730\u5740\uFF0C\u9700\u5148\u542F\u52A8 LM Studio \u5E76\u52A0\u8F7D\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrServerUrl).setValue(this.getSettings().ocrServerUrl).onChange(async (value) => {
       this.getSettings().ocrServerUrl = value.trim() || DEFAULT_SETTINGS.ocrServerUrl;
       this.scheduleSave();
     }));
-    new import_obsidian13.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
+    new import_obsidian14.Setting(containerEl).setName("LM Studio API Key").setDesc("LM Studio \u5F00\u542F Require Authentication \u65F6\u5FC5\u586B\uFF0C\u4E0E kdata \u7684 token \u76F8\u540C\u3002\u26A0\uFE0F \u5B89\u5168\u63D0\u793A\uFF1A\u5BC6\u94A5\u4EE5\u660E\u6587\u4FDD\u5B58\u5728 vault \u5185\u63D2\u4EF6\u76EE\u5F55\u7684 data.json \u4E2D\uFF0C\u8BF7\u52FF\u5C06 vault \u540C\u6B65/\u5171\u4EAB\u5230\u4E0D\u53D7\u4FE1\u4EFB\u7684\u4F4D\u7F6E\uFF0C\u5E76\u5EFA\u8BAE\u5B9A\u671F\u5728 LM Studio \u4E2D\u8F6E\u6362\u5BC6\u94A5\uFF1B\u4E0D\u4F7F\u7528\u9274\u6743\u65F6\u53EF\u7559\u7A7A\u3002").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("sk-lm-...").setValue(this.getSettings().ocrApiKey).onChange(async (value) => {
         this.getSettings().ocrApiKey = value.trim();
         this.scheduleSave();
       });
     });
-    new import_obsidian13.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u7559\u7A7A = \u81EA\u52A8\u9009\u62E9\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B").addText((text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u9009\u62E9").setValue(this.getSettings().ocrModel).onChange(async (value) => {
+    new import_obsidian14.Setting(containerEl).setName("OCR \u6A21\u578B").setDesc("\u81EA\u7531\u586B\u5199\u670D\u52A1\u5668\u4E0A\u7684\u89C6\u89C9\u6A21\u578B\u540D\uFF1B\u63A8\u8350 paddleocr-vl-1.6\uFF0C\u7559\u7A7A\u5219\u6309\u6B64\u4F18\u5148\u81EA\u52A8\u9009\u62E9").addText((text) => text.setPlaceholder("paddleocr-vl-1.6\uFF08\u63A8\u8350\uFF09").setValue(this.getSettings().ocrModel).onChange(async (value) => {
       this.getSettings().ocrModel = value.trim();
       this.scheduleSave();
     }));
-    new import_obsidian13.Setting(containerEl).setName("\u8BF7\u6C42\u8D85\u65F6\uFF08\u79D2\uFF09").setDesc("\u5355\u6B21 OCR \u8BF7\u6C42\u8D85\u65F6\u65F6\u95F4").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec)).setValue(String(this.getSettings().ocrRequestTimeoutSec)).onChange(async (value) => {
+    new import_obsidian14.Setting(containerEl).setName("\u8BF7\u6C42\u8D85\u65F6\uFF08\u79D2\uFF09").setDesc("\u5355\u6B21 OCR \u8BF7\u6C42\u8D85\u65F6\u65F6\u95F4").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrRequestTimeoutSec)).setValue(String(this.getSettings().ocrRequestTimeoutSec)).onChange(async (value) => {
       const n = parseInt(value, 10);
       if (!Number.isNaN(n) && n >= 10) {
         this.getSettings().ocrRequestTimeoutSec = n;
         this.scheduleSave();
       }
     }));
-    new import_obsidian13.Setting(containerEl).setName("\u6700\u5927\u8F93\u51FA\u4EE4\u724C").setDesc("\u5355\u6B21\u8BC6\u522B\u8BF7\u6C42\u5141\u8BB8\u7684\u6700\u5927\u8F93\u51FA\u957F\u5EA6\uFF08token\uFF09\uFF0C\u6846\u9009\u533A\u57DF\u6587\u672C\u8F83\u591A\u65F6\u53EF\u8C03\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens)).setValue(String(this.getSettings().ocrMaxTokens)).onChange(async (value) => {
+    new import_obsidian14.Setting(containerEl).setName("\u6700\u5927\u8F93\u51FA\u4EE4\u724C").setDesc("\u5355\u6B21\u8BC6\u522B\u8BF7\u6C42\u5141\u8BB8\u7684\u6700\u5927\u8F93\u51FA\u957F\u5EA6\uFF08token\uFF09\uFF0C\u6846\u9009\u533A\u57DF\u6587\u672C\u8F83\u591A\u65F6\u53EF\u8C03\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxTokens)).setValue(String(this.getSettings().ocrMaxTokens)).onChange(async (value) => {
       const n = parseInt(value, 10);
       if (!Number.isNaN(n) && n >= 512) {
         this.getSettings().ocrMaxTokens = n;
         this.scheduleSave();
       }
     }));
-    new import_obsidian13.Setting(containerEl).setName("OCR \u63D0\u793A\u8BCD").setDesc("PaddleOCR-VL \u4F7F\u7528\u5B98\u65B9\u4EFB\u52A1\u8BCD\uFF08\u5982 OCR:\uFF09").addTextArea((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrPrompt).setValue(this.getSettings().ocrPrompt).onChange(async (value) => {
+    new import_obsidian14.Setting(containerEl).setName("OCR \u63D0\u793A\u8BCD").setDesc("PaddleOCR-VL \u4F7F\u7528\u5B98\u65B9\u4EFB\u52A1\u8BCD\uFF08\u5982 OCR:\uFF09").addTextArea((text) => text.setPlaceholder(DEFAULT_SETTINGS.ocrPrompt).setValue(this.getSettings().ocrPrompt).onChange(async (value) => {
       this.getSettings().ocrPrompt = value || DEFAULT_SETTINGS.ocrPrompt;
       this.scheduleSave();
     }));
-    new import_obsidian13.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
+    new import_obsidian14.Setting(containerEl).setName("\u6E05\u6D17 OCR \u8F93\u51FA").setDesc("\u53BB\u9664 HTML/LaTeX \u5305\u88C5\u7B49\u6A21\u578B\u566A\u97F3\uFF1B\u5173\u95ED\u540E\u539F\u6837\u4FDD\u7559\u6A21\u578B\u8F93\u51FA\uFF08\u4FDD\u7559 LaTeX \u547D\u4EE4\u4E0E\u4EE3\u7801\u5757\uFF0C\u9002\u5408\u516C\u5F0F\u5BC6\u96C6\u573A\u666F\uFF09").addToggle((toggle) => toggle.setValue(this.getSettings().ocrSanitizeOutput !== false).onChange(async (value) => {
+      this.getSettings().ocrSanitizeOutput = value;
+      await this.saveSettings();
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u653E\u5927\u76EE\u6807\u77ED\u8FB9\uFF08\u50CF\u7D20\uFF09").setDesc("\u6846\u9009\u533A\u57DF\u77ED\u8FB9\u4E0D\u8DB3\u8BE5\u503C\u65F6\u7B49\u6BD4\u653E\u5927\u540E\u518D\u9001 OCR\uFF0C\u5C0F\u5B57\u66F4\u6E05\u6670\uFF1B\u8BBE\u4E3A 0 \u5173\u95ED\u653E\u5927").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMinSidePx)).setValue(String(this.getSettings().ocrMinSidePx ?? DEFAULT_SETTINGS.ocrMinSidePx)).onChange(async (value) => {
+      const n = parseInt(value, 10);
+      if (!Number.isNaN(n) && n >= 0 && n <= 4096) {
+        this.getSettings().ocrMinSidePx = n;
+        this.scheduleSave();
+      }
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u653E\u5927\u500D\u7387\u4E0A\u9650").setDesc("\u5C0F\u533A\u57DF\u653E\u5927\u7684\u6700\u5927\u500D\u6570\uFF081 - 8\uFF09\uFF0C\u4F4E\u914D\u8BBE\u5907\u53EF\u8C03\u4F4E").addText((text) => text.setPlaceholder(String(DEFAULT_SETTINGS.ocrMaxUpscaleFactor)).setValue(String(this.getSettings().ocrMaxUpscaleFactor ?? DEFAULT_SETTINGS.ocrMaxUpscaleFactor)).onChange(async (value) => {
+      const n = parseFloat(value);
+      if (!Number.isNaN(n) && n >= 1 && n <= 8) {
+        this.getSettings().ocrMaxUpscaleFactor = n;
+        this.scheduleSave();
+      }
+    }));
+    new import_obsidian14.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u68C0\u6D4B\u670D\u52A1\u5668\u53EF\u8FBE\u6027\u5E76\u5217\u51FA\u53EF\u7528\u6A21\u578B").addButton((btn) => btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
       const service = new OcrService(this.getSettings().ocrServerUrl, this.getSettings().ocrApiKey);
       btn.setButtonText("\u6D4B\u8BD5\u4E2D\u2026").setDisabled(true);
       try {
         const models = await service.listModels();
-        new import_obsidian13.Notice(`\u8FDE\u63A5\u6210\u529F\uFF0C\u53EF\u7528\u6A21\u578B\uFF1A
+        new import_obsidian14.Notice(`\u8FDE\u63A5\u6210\u529F\uFF0C\u53EF\u7528\u6A21\u578B\uFF1A
 ${models.join("\n")}`, 8e3);
       } catch (e) {
-        new import_obsidian13.Notice(`\u8FDE\u63A5\u5931\u8D25: ${e.message}`);
+        new import_obsidian14.Notice(`\u8FDE\u63A5\u5931\u8D25: ${e.message}`);
       } finally {
         btn.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").setDisabled(false);
       }
@@ -30180,7 +30770,7 @@ ${models.join("\n")}`, 8e3);
       },
       {
         title: "DeepSeek \u6D6E\u52A8\u7A97\u53E3",
-        desc: "\u70B9\u51FB\u5DE6\u4FA7\u680F\u673A\u5668\u4EBA\u56FE\u6807\u6216\u6267\u884C\u547D\u4EE4\u300C\u5207\u6362 DeepSeek \u6D6E\u52A8\u7A97\u53E3\u300D\uFF0C\u4EE5\u6D6E\u52A8\u7A97\u53E3\u5F62\u5F0F\u5D4C\u5165 DeepSeek \u7F51\u9875\u804A\u5929\uFF0C\u652F\u6301\u6807\u9898\u680F\u62D6\u62FD\u79FB\u52A8\u4E0E\u6700\u5C0F\u5316\u3002"
+        desc: "\u70B9\u51FB\u5DE6\u4FA7\u680F\u673A\u5668\u4EBA\u56FE\u6807\u6216\u6267\u884C\u547D\u4EE4\u300C\u5207\u6362 DeepSeek \u6D6E\u52A8\u7A97\u53E3\u300D\uFF0C\u4EE5\u6D6E\u52A8\u7A97\u53E3\u5F62\u5F0F\u5D4C\u5165 DeepSeek \u7F51\u9875\u804A\u5929\uFF0C\u652F\u6301\u6807\u9898\u680F\u62D6\u62FD\u79FB\u52A8\u3001\u62D6\u52A8\u8FB9\u7F18\u8C03\u6574\u5927\u5C0F\u4E0E\u6700\u5C0F\u5316\uFF0C\u4F4D\u7F6E\u548C\u5927\u5C0F\u81EA\u52A8\u8BB0\u5FC6\u3002"
       },
       {
         title: "\u4E0A\u4F20\u5F53\u524D\u6587\u4EF6\u5230 DeepSeek",
@@ -30203,10 +30793,21 @@ ${models.join("\n")}`, 8e3);
       itemEl.createSpan({ text: feature.desc, cls: "setting-item-description" });
     }
   }
+  /** 把任意存量颜色值规范成 #RRGGBB 供取色器显示（非法值回退默认黄色） */
+  normalizeHex(input) {
+    const m = /^#?([0-9a-fA-F]{6})$/.exec((input ?? "").trim());
+    return m ? `#${m[1]}` : DEFAULT_SETTINGS.highlightColor;
+  }
+  clampOpacity(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n))
+      return DEFAULT_SETTINGS.highlightOpacity;
+    return Math.min(1, Math.max(0.05, n));
+  }
 };
 
 // main.ts
-var LiteratureReaderPlugin = class extends import_obsidian14.Plugin {
+var LiteratureReaderPlugin = class extends import_obsidian15.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -30226,7 +30827,10 @@ var LiteratureReaderPlugin = class extends import_obsidian14.Plugin {
     const highlightModule = new PdfHighlightModule(ctx);
     pdfModule.setRefreshHighlights((file, selections) => highlightModule.refresh(file, selections));
     const screenshotModule = new ScreenshotModule(ctx, pdfModule);
+    const screenshotHighlightModule = new ScreenshotHighlightModule(ctx);
+    screenshotModule.setHighlightRefresh((file, entries) => screenshotHighlightModule.refresh(file, entries));
     const ocrHighlightModule = new OcrHighlightModule(ctx);
+    pdfModule.setRefreshRectHighlights((file, entries) => ocrHighlightModule.refresh(file, entries));
     const ocrModule = new OcrModule(ctx, pdfModule);
     ocrModule.setHighlightRefresh((file, entries) => ocrHighlightModule.refresh(file, entries));
     const mainArticleModule = new MainArticleModule(ctx, pdfModule);
@@ -30243,6 +30847,7 @@ var LiteratureReaderPlugin = class extends import_obsidian14.Plugin {
       mainArticleModule,
       highlightModule,
       screenshotModule,
+      screenshotHighlightModule,
       ocrHighlightModule,
       ocrModule,
       jumpModule,
@@ -30272,8 +30877,41 @@ var LiteratureReaderPlugin = class extends import_obsidian14.Plugin {
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.applyHighlightStyle();
   }
   async saveSettings() {
     await this.saveData(this.settings);
+    this.applyHighlightStyle();
+  }
+  /**
+   * 把高亮颜色/透明度写入 body 级 CSS 变量，styles.css 中的持久高亮规则引用它们。
+   * 颜色转为 "R, G, B" 三元组以便在 rgba() 中复用（文字填充、OCR 边框/填充）。
+   */
+  applyHighlightStyle() {
+    const body = document.body;
+    const opacity = Math.min(1, Math.max(0, Number(this.settings.highlightOpacity)));
+    if (Number.isFinite(opacity)) {
+      body.style.setProperty("--pdf-reader-highlight-opacity", String(opacity));
+      body.style.setProperty(
+        "--pdf-reader-highlight-border-opacity",
+        String(Math.min(1, opacity + 0.2))
+      );
+    } else {
+      body.style.removeProperty("--pdf-reader-highlight-opacity");
+      body.style.removeProperty("--pdf-reader-highlight-border-opacity");
+    }
+    const rgb = hexToRgbTriplet(this.settings.highlightColor);
+    if (rgb) {
+      body.style.setProperty("--pdf-reader-highlight-rgb", rgb);
+    } else {
+      body.style.removeProperty("--pdf-reader-highlight-rgb");
+    }
   }
 };
+function hexToRgbTriplet(input) {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec((input ?? "").trim());
+  if (!m)
+    return null;
+  const n = parseInt(m[1], 16);
+  return `${n >> 16 & 255}, ${n >> 8 & 255}, ${n & 255}`;
+}

@@ -16,12 +16,18 @@ import { BaseCropModeModule } from './BaseCropModeModule';
  *  - 框选完成后：截取 canvas（优先）/ 兜底整页渲染 → OCR → 写入批注 → 即时高亮
  *
  * 与「选中文字批注」互补：扫描版/无文本层的 PDF 也能框选关键段落批注到笔记。
+ *
+ * 放大目标短边（ocrMinSidePx）与放大倍率上限（ocrMaxUpscaleFactor）来自设置，
+ * 每次框选实时读取，修改设置后立即生效；输出清洗开关由 OcrService 使用。
  */
 
-/** 截图区域短边不足该像素时等比放大，保证 OCR 清晰度 */
-const MIN_OCR_SIDE = 512;
-/** 截图缩放上限 */
-const MAX_CROP_SCALE = 4;
+/** 截图放大选项（供本文件内的裁剪工具函数使用） */
+interface CropUpscaleOptions {
+    /** 小区域放大的目标短边像素；0 = 关闭放大 */
+    minSidePx: number;
+    /** 放大倍率上限 */
+    maxScale: number;
+}
 
 export class OcrModule extends BaseCropModeModule {
     private pdfModule: PdfReaderModule;
@@ -98,10 +104,11 @@ export class OcrModule extends BaseCropModeModule {
 
         // 1) 优先用 pdfjs 已渲染 canvas（与显示一致，零额外渲染开销）
         //    裁剪可能抛错（如截图越界），失败时降级走兜底整页渲染，不中断流程
+        const cropOpts = this.cropOptions();
         const canvas = pageDiv.querySelector('canvas') as HTMLCanvasElement | null;
         if (canvas && canvas.width > 0 && canvas.height > 0) {
             try {
-                imageDataUrl = cropFromCanvas(canvas, pageRect, pageDiv);
+                imageDataUrl = cropFromCanvas(canvas, pageRect, pageDiv, cropOpts);
             } catch (e) {
                 console.warn('[Ocr] 画布裁剪失败，尝试兜底渲染:', e);
             }
@@ -112,7 +119,7 @@ export class OcrModule extends BaseCropModeModule {
             try {
                 const proxy = this.getPdfDocumentProxy(leaf);
                 if (!proxy) throw new Error('无法获取 PDF 文档代理');
-                imageDataUrl = await this.renderCropFallback(proxy, pageNum, pageRect, pageDiv);
+                imageDataUrl = await this.renderCropFallback(proxy, pageNum, pageRect, pageDiv, cropOpts);
             } catch (e) {
                 console.warn('[Ocr] 截图兜底渲染失败:', e);
                 new Notice('页面尚未渲染，请滚动视图后重试');
@@ -157,12 +164,14 @@ export class OcrModule extends BaseCropModeModule {
         // 每次请求前同步最新服务器地址和 API Key，确保设置面板修改后立即生效
         this.service.setBaseUrl(settings.ocrServerUrl);
         this.service.setApiKey(settings.ocrApiKey);
+        // 输出清洗开关：关闭时保留模型原始输出（如 LaTeX 命令、markdown 结构）
+        this.service.setSanitizeOutput(settings.ocrSanitizeOutput !== false);
 
         let model: string;
         try {
             model = await this.service.resolveModel(settings.ocrModel);
         } catch (e) {
-            new Notice(`无法连接 OCR 服务器: ${(e as Error).message}`);
+            new Notice(`选择 OCR 模型失败: ${(e as Error).message}`);
             return false;
         }
 
@@ -191,13 +200,22 @@ export class OcrModule extends BaseCropModeModule {
         }
     }
 
+    /** 从设置读取截图放大参数（非法值回退默认；minSidePx<=0 表示关闭放大） */
+    private cropOptions(): CropUpscaleOptions {
+        const s = this.ctx.getSettings();
+        const minSidePx = Math.max(0, Math.floor(Number(s.ocrMinSidePx) || 0));
+        const maxScale = Math.min(8, Math.max(1, Number(s.ocrMaxUpscaleFactor) || 4));
+        return { minSidePx, maxScale };
+    }
+
     // ========== 兜底整页渲染（canvas 缺失时） ==========
 
     private async renderCropFallback(
         proxy: any,
         pageNum: number,
         pageRect: { x: number; y: number; width: number; height: number },
-        pageDiv?: HTMLElement
+        pageDiv?: HTMLElement,
+        cropOpts: CropUpscaleOptions = { minSidePx: 512, maxScale: 4 }
     ): Promise<string> {
         const page = await proxy.getPage(pageNum);
         // 按屏幕显示尺寸渲染（无 canvas 可参考，取 2x 保证清晰）
@@ -221,7 +239,7 @@ export class OcrModule extends BaseCropModeModule {
         const sy = pageRect.y * dpr;
         const sw = pageRect.width * dpr;
         const sh = pageRect.height * dpr;
-        return cropCanvasRegion(canvas, sx, sy, sw, sh);
+        return cropCanvasRegion(canvas, sx, sy, sw, sh, cropOpts);
     }
 }
 
@@ -233,7 +251,8 @@ export class OcrModule extends BaseCropModeModule {
 function cropFromCanvas(
     canvas: HTMLCanvasElement,
     pageRect: { x: number; y: number; width: number; height: number },
-    pageDiv: HTMLElement
+    pageDiv: HTMLElement,
+    cropOpts: CropUpscaleOptions
 ): string {
     const canvasRect = canvas.getBoundingClientRect();
     const pr = pageDiv.getBoundingClientRect();
@@ -243,16 +262,17 @@ function cropFromCanvas(
     const sy = (pageRect.y - (canvasRect.top - pr.top)) * dprY;
     const sw = pageRect.width * dprX;
     const sh = pageRect.height * dprY;
-    return cropCanvasRegion(canvas, sx, sy, sw, sh);
+    return cropCanvasRegion(canvas, sx, sy, sw, sh, cropOpts);
 }
 
-/** 离屏 canvas 裁剪源图区域；小区域等比放大提升 OCR 清晰度 */
+/** 离屏 canvas 裁剪源图区域；小区域按设置等比放大提升 OCR 清晰度 */
 function cropCanvasRegion(
     source: HTMLCanvasElement,
     sx: number,
     sy: number,
     sw: number,
-    sh: number
+    sh: number,
+    cropOpts: CropUpscaleOptions
 ): string {
     // 裁剪边界夹取到源图内
     const cx = Math.max(0, sx);
@@ -261,9 +281,15 @@ function cropCanvasRegion(
     const ch = Math.min(sh, source.height - cy);
     if (cw < 1 || ch < 1) throw new Error('截图区域超出页面范围');
 
-    // 区域过小时等比放大（短边接近 MIN_OCR_SIDE，上限 MAX_CROP_SCALE 倍）
-    const minSide = Math.min(cw, ch);
-    const scale = Math.min(MAX_CROP_SCALE, Math.max(1, MIN_OCR_SIDE / minSide));
+    // 区域短边不足目标像素时等比放大（minSidePx<=0 = 关闭放大），倍率受上限约束
+    let scale = 1;
+    if (cropOpts.minSidePx > 0) {
+        const minSide = Math.min(cw, ch);
+        scale = Math.min(
+            Math.max(1, cropOpts.maxScale),
+            Math.max(1, cropOpts.minSidePx / minSide)
+        );
+    }
 
     const out = document.createElement('canvas');
     out.width = Math.max(1, Math.round(cw * scale));

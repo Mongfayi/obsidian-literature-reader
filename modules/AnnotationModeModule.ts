@@ -7,14 +7,15 @@ import { toolbarPoller, pruneStaleLeaves } from './toolbarPoller';
  * 批注原文附带模式模块（测试功能，以后可能删除）
  *
  * 在每个 PDF 视图工具条注入「附带原文」切换按钮，默认关闭：
- *  - 关闭（默认）：文字选中批注只写 PDF 链接，不附带原文，如
- *    [[essay/xxx.pdf#page=45&selection=1903,0,1940,0|xxx, 页面 45]]
- *  - 开启：批注附带原文（历史行为）
+ *  - 关闭（默认）：文字选中批注只写 PDF 链接，链接显示为「定位」，光标停在链接后，
+ *    用户按“定位 我打字的内容”正序记录。
+ *  - 开启：文字选中批注附带原文，格式为“原文 / 定位 / 笔记：”。
  *
  * 该开关只影响「文字选中批注」（有文本层锚点 beginIndex>=0 的选区）；
  * OCR 批注（beginIndex<0）与截图批注的写入格式不受影响。
  *
- * 状态为会话级（内存），重载插件自动复位为默认关闭。
+ * 开关状态持久化在插件设置 annotationIncludeOriginalText 中：
+ * 插件加载时从设置初始化；经按钮/命令切换时同步写回设置，重载插件或重启后保持。
  *
  * 工具条按钮注入范式与 MainArticleModule 一致：
  *  监听 layout-change / active-leaf-change + 2s 轮询兜底，经 viewer.child.toolbar.pageNumberEl.after(btn) 插入。
@@ -23,7 +24,7 @@ export class AnnotationModeModule implements PluginModule {
     private ctx: ModuleContext;
     private pdfModule: PdfReaderModule;
 
-    /** 「附带原文」开关：true = 批注附带原文；false（默认）= 批注只写链接 */
+    /** 「附带原文」开关（内存镜像；真实状态持久化于设置 annotationIncludeOriginalText） */
     private includeOriginalText = false;
     /** 已注入按钮的叶子 → 按钮元素 */
     private toolbarButtons = new Map<WorkspaceLeaf, HTMLElement>();
@@ -39,6 +40,9 @@ export class AnnotationModeModule implements PluginModule {
 
     load(): void {
         const plugin = this.ctx.plugin;
+
+        // 从持久化设置初始化开关（默认关闭）
+        this.includeOriginalText = this.ctx.getSettings().annotationIncludeOriginalText === true;
 
         // 向 PdfReaderModule 注入原文附带模式提供者：批注入口按当前开关决定是否写原文
         this.pdfModule.setIncludeOriginalTextProvider(() => this.includeOriginalText);
@@ -66,7 +70,7 @@ export class AnnotationModeModule implements PluginModule {
 
         plugin.addCommand({
             id: 'toggle-include-original-text',
-            name: '切换「附带原文」批注模式（默认关闭；关闭时批注只写 PDF 链接）',
+            name: '切换「附带原文」批注模式（默认关闭；开启时批注包含原文）',
             checkCallback: (checking) => {
                 const leaf = plugin.app.workspace.activeLeaf;
                 if (!leaf || leaf.view.getViewType() !== 'pdf') return false;
@@ -93,14 +97,20 @@ export class AnnotationModeModule implements PluginModule {
         this.removePollTask = null;
         this.toolbarButtons.clear();
         this.createdButtons.clear();
+        // 仅清理内存镜像；开关状态已持久化在设置中，重载后从设置恢复
         this.includeOriginalText = false;
     }
 
     // ========== 模式状态 ==========
 
-    /** 切换「附带原文」开关并刷新所有按钮激活态 */
+    /** 切换「附带原文」开关，同步写入设置并持久化 */
     private toggleMode(): void {
         this.includeOriginalText = !this.includeOriginalText;
+        // 写回共享设置对象（同步可见）并异步落盘，重载插件后保持该模式
+        this.ctx.getSettings().annotationIncludeOriginalText = this.includeOriginalText;
+        void this.ctx.saveSettings().catch((e) => {
+            console.error('[AnnotationMode] 保存「附带原文」开关失败:', e);
+        });
         this.refreshAllButtonStates();
     }
 
@@ -171,14 +181,15 @@ export class AnnotationModeModule implements PluginModule {
         });
     }
 
-    /** 按当前开关切换激活态与提示文案 */
+    /** 按当前开关切换激活态与提示文案（提示中的链接标签跟随设置） */
     private applyButtonState(btn: HTMLElement): void {
         const on = this.includeOriginalText;
+        const label = this.ctx.getSettings().annotationLinkLabel || '定位';
         btn.toggleClass('is-active', on);
         if (on) {
-            setTooltip(btn, '附带原文已开启（点击关闭）\n批注将包含原文文字');
+            setTooltip(btn, `附带原文已开启（点击关闭）\n批注格式：原文 / ${label} / 笔记：`);
         } else {
-            setTooltip(btn, '附带原文已关闭（默认，点击开启）\n批注只写 PDF 链接，不附带原文');
+            setTooltip(btn, `附带原文已关闭（默认，点击开启）\n批注格式：${label} + 你输入的内容`);
         }
     }
 }

@@ -1,6 +1,7 @@
 import { TFile, Notice, WorkspaceLeaf, FileView, Component } from 'obsidian';
 import type { ModuleContext } from '../types';
 import type { PdfReaderModule } from './PdfReaderModule';
+import type { ScreenshotHighlightEntry } from './ScreenshotHighlightModule';
 import { BaseCropModeModule } from './BaseCropModeModule';
 
 /**
@@ -20,6 +21,8 @@ import { BaseCropModeModule } from './BaseCropModeModule';
 
 export class ScreenshotModule extends BaseCropModeModule {
     private pdfModule: PdfReaderModule;
+    /** 截图批注写入后的高亮刷新回调（由主入口注入 ScreenshotHighlightModule.refresh） */
+    private refreshHighlights: ((file: TFile, entries: ScreenshotHighlightEntry[]) => void) | null = null;
 
     /** 原始 PDF EmbedCreator（注册自定义裁剪嵌入前保存，卸载时恢复） */
     private originalPdfEmbedCreator: any = null;
@@ -37,6 +40,11 @@ export class ScreenshotModule extends BaseCropModeModule {
     constructor(ctx: ModuleContext, pdfModule: PdfReaderModule) {
         super(ctx);
         this.pdfModule = pdfModule;
+    }
+
+    /** 注入截图批注高亮刷新回调（批注成功后触发即时渲染） */
+    setHighlightRefresh(cb: (file: TFile, entries: ScreenshotHighlightEntry[]) => void): void {
+        this.refreshHighlights = cb;
     }
 
     load(): void {
@@ -103,7 +111,11 @@ export class ScreenshotModule extends BaseCropModeModule {
         try {
             const ok = await this.pdfModule.annotateScreenshot(file, pageNum, rect);
             notice.hide();
-            if (ok) new Notice('截图批注已写入笔记');
+            if (ok) {
+                // 批注成功后触发截图批注高亮模块即时渲染（笔记已写入 &rect= 链接）
+                this.refreshHighlights?.(file, [{ page: pageNum, rect }]);
+                new Notice('截图批注已写入笔记');
+            }
         } catch (e) {
             notice.hide();
             new Notice(`截图批注失败: ${(e as Error).message}`);

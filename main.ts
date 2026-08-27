@@ -4,6 +4,7 @@ import { PdfReaderModule } from './modules/PdfReaderModule';
 import { DeepSeekModule } from './modules/DeepSeekModule';
 import { PdfHighlightModule } from './modules/PdfHighlightModule';
 import { ScreenshotModule } from './modules/ScreenshotModule';
+import { ScreenshotHighlightModule } from './modules/ScreenshotHighlightModule';
 import { OcrModule } from './modules/OcrModule';
 import { OcrHighlightModule } from './modules/OcrHighlightModule';
 import { MainArticleModule } from './modules/MainArticleModule';
@@ -47,8 +48,14 @@ export default class LiteratureReaderPlugin extends Plugin {
         // 截图批注模块：框选 PDF 区域 → 截图保存为附件 → 嵌入阅读笔记
         const screenshotModule = new ScreenshotModule(ctx, pdfModule);
 
+        // 截图批注高亮模块：批注后即时高亮 + 笔记 &rect= 链接驱动的高亮重建
+        const screenshotHighlightModule = new ScreenshotHighlightModule(ctx);
+        screenshotModule.setHighlightRefresh((file, entries) => screenshotHighlightModule.refresh(file, entries));
+
         // OCR 高亮模块：OCR 批注后即时高亮 + 笔记链接驱动的高亮重建
         const ocrHighlightModule = new OcrHighlightModule(ctx);
+        // 无文本锚点的文字批注（如标题）回退为矩形高亮，也复用 OCR 高亮通道即时刷新
+        pdfModule.setRefreshRectHighlights((file, entries) => ocrHighlightModule.refresh(file, entries));
         // 截图 OCR 批注模块：框选 PDF 区域 → LM Studio 视觉模型识别文字 → 写入阅读笔记
         const ocrModule = new OcrModule(ctx, pdfModule);
         ocrModule.setHighlightRefresh((file, entries) => ocrHighlightModule.refresh(file, entries));
@@ -79,6 +86,7 @@ export default class LiteratureReaderPlugin extends Plugin {
             mainArticleModule,
             highlightModule,
             screenshotModule,
+            screenshotHighlightModule,
             ocrHighlightModule,
             ocrModule,
             jumpModule,
@@ -116,9 +124,47 @@ export default class LiteratureReaderPlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        this.applyHighlightStyle();
     }
 
     async saveSettings() {
         await this.saveData(this.settings);
+        // 高亮外观即时生效：设置面板/批注按钮等任何保存动作都同步刷新 CSS 变量
+        this.applyHighlightStyle();
     }
+
+    /**
+     * 把高亮颜色/透明度写入 body 级 CSS 变量，styles.css 中的持久高亮规则引用它们。
+     * 颜色转为 "R, G, B" 三元组以便在 rgba() 中复用（文字填充、OCR 边框/填充）。
+     */
+    private applyHighlightStyle(): void {
+        const body = document.body;
+        const opacity = Math.min(1, Math.max(0, Number(this.settings.highlightOpacity)));
+        if (Number.isFinite(opacity)) {
+            body.style.setProperty('--pdf-reader-highlight-opacity', String(opacity));
+            // OCR 区域边框透明度：在填充基础上略加深保证可见
+            body.style.setProperty(
+                '--pdf-reader-highlight-border-opacity',
+                String(Math.min(1, opacity + 0.2))
+            );
+        } else {
+            body.style.removeProperty('--pdf-reader-highlight-opacity');
+            body.style.removeProperty('--pdf-reader-highlight-border-opacity');
+        }
+        const rgb = hexToRgbTriplet(this.settings.highlightColor);
+        if (rgb) {
+            body.style.setProperty('--pdf-reader-highlight-rgb', rgb);
+        } else {
+            // 无效颜色：移除变量，回退到主题高亮色 --text-highlight-bg-rgb
+            body.style.removeProperty('--pdf-reader-highlight-rgb');
+        }
+    }
+}
+
+/** #RRGGBB → "R, G, B" 三元组；非法输入返回 null */
+function hexToRgbTriplet(input: string): string | null {
+    const m = /^#?([0-9a-fA-F]{6})$/.exec((input ?? '').trim());
+    if (!m) return null;
+    const n = parseInt(m[1], 16);
+    return `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
 }
