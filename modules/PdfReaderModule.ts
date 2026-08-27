@@ -1,6 +1,7 @@
 import { TFile, TFolder, Menu, WorkspaceLeaf, FileView, MarkdownView, Editor, Notice, normalizePath } from 'obsidian';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
-import type { ModuleContext, PluginModule, SavedSelectionInfo, FileUploadData } from '../types';
+import { DEFAULT_SETTINGS, type ModuleContext, type PluginModule, type SavedSelectionInfo, type FileUploadData } from '../types';
+import { renderNoteBaseName } from './noteNaming';
 
 declare const WORKER_CODE: string;
 declare function require(name: string): any;
@@ -32,6 +33,11 @@ export class PdfReaderModule implements PluginModule {
     private currentPdfPath: string | null = null;
     /** 批注写入后回调（由主入口注入 PdfHighlightModule.refresh，用于即时渲染持久高亮） */
     private refreshHighlights: ((file: TFile, selections?: SavedSelectionInfo[]) => void) | null = null;
+    /** 无文本锚点批注写入后的矩形高亮回调（由主入口注入 OcrHighlightModule.refresh） */
+    private refreshRectHighlights: ((
+        file: TFile,
+        entries: { page: number; rect: { x: number; y: number; w: number; h: number } }[]
+    ) => void) | null = null;
     /** 批注目标笔记重定向解析器（由 MainArticleModule 注入：开启主文献时返回主文献笔记，否则 null） */
     private redirectResolver: (() => Promise<TFile | null>) | null = null;
     /** 批注是否附带原文的模式提供者（由 AnnotationModeModule 注入；默认关闭=不附带原文） */
@@ -43,9 +49,30 @@ export class PdfReaderModule implements PluginModule {
         this.ctx = ctx;
     }
 
+    /** 批注回链 PDF 的链接显示文字（可配置，默认「定位」；写入用户笔记正文） */
+    private get linkLabel(): string {
+        const v = this.ctx.getSettings().annotationLinkLabel;
+        return v && v.trim() ? v.trim() : DEFAULT_SETTINGS.annotationLinkLabel;
+    }
+
+    /** 批注 callout 末尾提示行（可配置；强制以 '>' 开头以维持 callout 块格式） */
+    private get notePrompt(): string {
+        const v = this.ctx.getSettings().annotationPromptLine;
+        const raw = v && v.trim() ? v.trim() : DEFAULT_SETTINGS.annotationPromptLine;
+        return raw.startsWith('>') ? raw : `> ${raw}`;
+    }
+
     /** 注入批注后的高亮刷新回调 */
     setRefreshHighlights(cb: (file: TFile, selections?: SavedSelectionInfo[]) => void): void {
         this.refreshHighlights = cb;
+    }
+
+    /** 注入无文本锚点批注的矩形高亮刷新回调 */
+    setRefreshRectHighlights(cb: (
+        file: TFile,
+        entries: { page: number; rect: { x: number; y: number; w: number; h: number } }[]
+    ) => void): void {
+        this.refreshRectHighlights = cb;
     }
 
     /** 注入批注目标笔记重定向解析器（主文献开启时批注写入主文献笔记而非源 PDF 对应笔记） */
@@ -76,6 +103,20 @@ export class PdfReaderModule implements PluginModule {
                 }
             })
         );
+
+        // 命令：把当前笔记里已有 PDF 批注链接的冗长显示文字（“PDF名, 页面 N”）批量改成短标签
+        plugin.addCommand({
+            id: 'shorten-pdf-annotation-links',
+            name: `将当前笔记中的 PDF 批注链接显示文字改为「${this.linkLabel}」`,
+            checkCallback: (checking) => {
+                const file = plugin.app.workspace.getActiveFile();
+                if (!file || file.extension !== 'md') return false;
+                if (!checking) {
+                    void this.shortenPdfAnnotationLinks(file);
+                }
+                return true;
+            },
+        });
 
         // 浮动批注按钮
         this.initFloatingButton();
@@ -153,6 +194,30 @@ export class PdfReaderModule implements PluginModule {
         }
 
         return null;
+    }
+
+    /**
+     * 把当前笔记中已有 PDF 批注链接的冗长显示文字（如“XXX, 页面 12”）批量改成短标签。
+     * 只改链接的显示文字，不改变链接目标，因此原有跳转/高亮功能不受影响。
+     */
+    private async shortenPdfAnnotationLinks(file: TFile): Promise<void> {
+        const label = this.linkLabel;
+        try {
+            const content = await this.ctx.plugin.app.vault.read(file);
+            const updated = content.replace(
+                /\[\[([^\]|]+?\.pdf#[^\]|]*?)\|[^\]|]*?[,，]\s*页面\s*\d+\]\]/g,
+                `[[$1|${label}]]`
+            );
+            if (updated === content) {
+                new Notice('当前笔记中没有找到可缩短的 PDF 批注链接');
+                return;
+            }
+            await this.ctx.plugin.app.vault.modify(file, updated);
+            new Notice(`已将该笔记中的 PDF 批注链接显示文字改为「${label}」`);
+        } catch (e) {
+            console.error('[PdfReader] 缩短批注链接失败:', e);
+            new Notice('缩短批注链接失败');
+        }
     }
 
     // ========== 开始阅读主流程 ==========
@@ -237,15 +302,15 @@ export class PdfReaderModule implements PluginModule {
     }
 
     /**
-     * 解析阅读笔记路径：
-     *  - 优先 `{PDF文件名} 阅读.md`，不存在则返回
+     * 解析阅读笔记路径（文件名来自可配置模板，{name} = PDF 文件名）：
+     *  - 优先「渲染(模板).md」，不存在则返回
      *  - 已存在且属于同一 PDF（frontmatter pdf 字段一致或缺失）时复用
-     *  - 属于其他 PDF（同名 PDF 冲突）时，按 `{文件名} 阅读 (n).md` 递增去重
+     *  - 属于其他 PDF（同名 PDF 冲突）时，按「渲染(模板) (n).md」递增去重
      *  - 所有候选都被其他 PDF 占用时返回 null（调用方应终止并提示，避免写错笔记）
      */
     private async resolveNotePath(pdfFile: TFile, folderPath: string): Promise<string | null> {
-        const baseName = pdfFile.basename;
-        const basePath = normalizePath(`${folderPath}/${baseName} 阅读.md`);
+        const baseName = renderNoteBaseName(pdfFile.basename, this.ctx.getSettings().readingNoteNameTemplate);
+        const basePath = normalizePath(`${folderPath}/${baseName}.md`);
 
         const base = this.ctx.plugin.app.vault.getAbstractFileByPath(basePath);
         if (base instanceof TFile && await this.belongsToPdf(base, pdfFile)) {
@@ -256,7 +321,7 @@ export class PdfReaderModule implements PluginModule {
         }
 
         for (let n = 2; n <= 99; n++) {
-            const candidate = normalizePath(`${folderPath}/${baseName} 阅读 (${n}).md`);
+            const candidate = normalizePath(`${folderPath}/${baseName} (${n}).md`);
             const existing = this.ctx.plugin.app.vault.getAbstractFileByPath(candidate);
             if (existing instanceof TFile && await this.belongsToPdf(existing, pdfFile)) {
                 return candidate;
@@ -325,7 +390,10 @@ export class PdfReaderModule implements PluginModule {
     }
 
     async generateNoteContent(pdfFile: TFile): Promise<string> {
-        const date = new Date().toISOString().split('T')[0];
+        // 本地日期：旧实现用 toISOString() 按 UTC 取日，晚间会把 created 写成第二天
+        const now = new Date();
+        const pad = (n: number) => String(n).padStart(2, '0');
+        const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 
         let tags: string[] = [];
         try {
@@ -347,16 +415,13 @@ created: ${date}`;
 
         frontmatter += '\n---\n';
 
-        // 正文：三个引导问题，每点之间空一行
-        const body = [
-            '1.写出你的实验思路。',
-            '',
-            '2.从论文中获得的信息。',
-            '',
-            '3.发现的问题。',
-        ].join('\n');
+        // 正文：来自可配置模板（默认「## 信息 / ## 疑问」两个板块）
+        const bodyTpl = this.ctx.getSettings().readingNoteBodyTemplate;
+        const body = (bodyTpl && bodyTpl.trim())
+            ? bodyTpl.replace(/\r\n/g, '\n')
+            : DEFAULT_SETTINGS.readingNoteBodyTemplate;
 
-        return frontmatter + '\n' + body + '\n';
+        return frontmatter + body + '\n';
     }
 
     // ========== PDF 文本提取 ==========
@@ -726,10 +791,19 @@ created: ${date}`;
 
             // 文本层缺失/无 data-idx span/选区不在 data-idx span 内
             // （常见于标题、图表标注等 pdfjs 不分配 data-idx 的文本）：
-            // 已拿到页码，回退为仅页码链接（beginIndex=-1 标记无文本锚点），
-            // 避免完全丢失引用链接
+            // 已拿到页码，回退为“页面链接 + 选区矩形”。
+            // 用 DOM Range 的屏幕包围盒换算成归一化矩形，写入 &ocr= 参数，
+            // 使 OcrHighlightModule 也能在 PDF 上渲染持久高亮。
             if (textSpans.length === 0 || !startSpan || !endSpan) {
-                return { page: pageNumber, beginIndex: -1, beginOffset: 0, endIndex: -1, endOffset: 0 };
+                const fallbackRect = this.computeSelectionOcrRect(range, startPageDiv);
+                return {
+                    page: pageNumber,
+                    beginIndex: -1,
+                    beginOffset: 0,
+                    endIndex: -1,
+                    endOffset: 0,
+                    ...(fallbackRect ? { ocrRect: fallbackRect } : {}),
+                };
             }
 
             const textDivFirstIdx = parseInt(
@@ -751,6 +825,35 @@ created: ${date}`;
             return { page: pageNumber, beginIndex, beginOffset, endIndex, endOffset };
         } catch (e) {
             console.error('[PdfReader] 获取PDF选择信息失败:', e);
+            return null;
+        }
+    }
+
+    /**
+     * 计算无 data-idx 文本选区的归一化矩形（0-1，相对页面内边距框）。
+     * 用于标题/图表标注等文本层锚点缺失时的矩形持久高亮。
+     */
+    private computeSelectionOcrRect(
+        range: Range,
+        pageDiv: HTMLElement
+    ): { x: number; y: number; w: number; h: number } | null {
+        try {
+            const rect = range.getBoundingClientRect();
+            const pageRect = pageDiv.getBoundingClientRect();
+            const ox = pageRect.left + pageDiv.clientLeft;
+            const oy = pageRect.top + pageDiv.clientTop;
+            const pw = pageDiv.clientWidth;
+            const ph = pageDiv.clientHeight;
+            if (!pw || !ph || !rect.width || !rect.height) return null;
+            const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+            return {
+                x: clamp01((rect.left - ox) / pw),
+                y: clamp01((rect.top - oy) / ph),
+                w: clamp01(rect.width / pw),
+                h: clamp01(rect.height / ph),
+            };
+        } catch (e) {
+            console.warn('[PdfReader] 计算选区回退矩形失败:', e);
             return null;
         }
     }
@@ -867,8 +970,10 @@ created: ${date}`;
         try {
             const rectStr = rect.join(',');
             const embedLink = `![[${pdfFile.path}#page=${page}&rect=${rectStr}]]`;
-            const pageLink = `[[${pdfFile.path}#page=${page}|${pdfFile.basename}, 页面 ${page}]]`;
-            const block = `> [!pdf-annotation]\n> ${embedLink}\n> ${pageLink}\n> 笔记：`;
+            // 页面链接也携带 rect，点击后可精确定位到截图对应的 PDF 区域
+            const pageLink = `[[${pdfFile.path}#page=${page}&rect=${rectStr}|${this.linkLabel}]]`;
+            const prompt = this.notePrompt;
+            const block = `> [!pdf-annotation]\n> ${embedLink}\n> ${pageLink}\n${prompt}`;
             const annotation = '\n' + block + '\n';
             const cursorPos = this.getNoteCursorEditorPos(noteFile);
             let promptLine: number | null = null;
@@ -880,7 +985,7 @@ created: ${date}`;
             } else {
                 await this.ctx.plugin.app.vault.process(noteFile, (data) => data + annotation);
             }
-            await this.focusNotePrompt(noteFile, '> 笔记：', promptLine);
+            await this.focusNotePrompt(noteFile, prompt, promptLine);
             return true;
         } catch (e) {
             console.error('[PdfReader] 截图批注写入失败:', e);
@@ -908,11 +1013,21 @@ created: ${date}`;
                 return;
             }
             await this.appendAnnotationsToNote(noteFile, selections, pdfFile, this.shouldIncludeOriginalText());
-            // 批注写入后立即刷新 PDF 持久高亮（不依赖 pdf-plus）；
-            // OCR 批注无文本锚点（beginIndex < 0），跳过高亮
+            // 批注写入后立即刷新 PDF 持久高亮（不依赖 pdf-plus）。
+            // 有文本锚点的走文本选区高亮；无文本锚点但带有回退矩形的（标题/图表标注等）
+            // 走 OCR 矩形高亮通道，保证新批注也能立刻显示。
             this.refreshHighlights?.(
                 pdfFile,
                 selections.filter((sel) => sel.beginIndex >= 0)
+            );
+            this.refreshRectHighlights?.(
+                pdfFile,
+                selections
+                    .filter((sel) => sel.beginIndex < 0 && sel.ocrRect)
+                    .map((sel) => ({
+                        page: sel.page as number,
+                        rect: sel.ocrRect!,
+                    }))
             );
         } catch (e) {
             // 写入失败时恢复选区，避免数据丢失
@@ -977,12 +1092,12 @@ created: ${date}`;
         pdfFile: TFile,
         includeOriginalText = true
     ) {
-        // 「附带原文」关闭（默认，测试功能）：只写链接，无 callout 包围框、无「笔记：」提示行
+        // 「附带原文」关闭（测试功能）：只写链接，无 callout 包围框、无提示行
         if (!includeOriginalText) {
             await this.appendLinksOnly(noteFile, selections, pdfFile);
             return;
         }
-        const notePrompt = '> 笔记：';
+        const notePrompt = this.notePrompt;
         // 多段选中合并为一个批注 callout，每段之间空行分隔并带独立页码引用
         const items = selections.map((sel) => {
             // 拍平为单行：移除换行/回车/不可见控制字符、Unicode 换行符号，
@@ -1005,14 +1120,14 @@ created: ${date}`;
                     + `${fmtRectNum(sel.ocrRect.w)},${fmtRectNum(sel.ocrRect.h)}`
                     : '';
                 const link =
-                    `[[${pdfFile.path}#page=${sel.page}${rectParam}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+                    `[[${pdfFile.path}#page=${sel.page}${rectParam}|${this.linkLabel}]]`;
                 return `> ${flatText}\n> ${link}`;
             }
             const selectionParam =
                 `${sel.beginIndex},${sel.beginOffset},` +
                 `${sel.endIndex},${sel.endOffset}`;
             const link =
-                `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+                `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${this.linkLabel}]]`;
             return `> ${flatText}\n> ${link}`;
         });
         if (selections.some((sel) => sel.page === null)) {
@@ -1041,16 +1156,11 @@ created: ${date}`;
     }
 
     /**
-     * 「附带原文」关闭时的批注形式（测试功能，以后可能删除）：
-     * 只写 PDF 链接（多段选中每段一行），无 callout 包围框、无「> 笔记：」提示行。
+     * 「附带原文」关闭时的批注形式：
+     * 只写 PDF 链接，并把光标停在链接后，让用户直接按“定位 我打字的内容”的正序记录。
+     * 多重批注时所有「定位」按钮在同一行排列，如“定位 定位 定位”。
+     * 不再使用旧版“在链接上方留空行、笔记写在链接上方”的逆序机制。
      * 定位失败（page=null）的选区无链接可写，保留拍平文字行兜底，避免批注静默丢失。
-     * 该路径只被文字选中批注（handleAnnotation）调用；OCR / 截图批注不受影响。
-     *
-     * 写入策略：默认插入在笔记光标所在行末尾（支持从笔记中间批注，后面的内容不动）；
-     * 若光标行或其后两行内存在链接-only 批注的链接行（典型场景：光标停在上一条批注的
-     * 文字末尾或链接上方的空行），则改在该链接行之后插入，避免新链接插进上一条批注的
-     * 「批注文字」与「链接」之间。链接上方保留一个空行放光标，批注后直接输入的文字
-     * 写在链接上方（版式：文字在上、链接在下）。无编辑器时回退追加到文末。
      */
     private async appendLinksOnly(
         noteFile: TFile,
@@ -1067,50 +1177,37 @@ created: ${date}`;
                 return flatten(sel.text);
             }
             if (sel.beginIndex < 0) {
-                // 无文本锚点（防御分支，文字批注路径通常不会出现）：仅附页码链接
-                return `[[${pdfFile.path}#page=${sel.page}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+                // 无文本锚点（标题/图表标注等）：若拿到回退矩形则附带 &ocr= 持久高亮，
+                // 否则退化为仅页码链接
+                const rectParam = sel.ocrRect
+                    ? `&ocr=${fmtRectNum(sel.ocrRect.x)},${fmtRectNum(sel.ocrRect.y)},`
+                    + `${fmtRectNum(sel.ocrRect.w)},${fmtRectNum(sel.ocrRect.h)}`
+                    : '';
+                return `[[${pdfFile.path}#page=${sel.page}${rectParam}|${this.linkLabel}]]`;
             }
             const selectionParam =
                 `${sel.beginIndex},${sel.beginOffset},` +
                 `${sel.endIndex},${sel.endOffset}`;
-            return `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${pdfFile.basename}, 页面 ${sel.page}]]`;
+            return `[[${pdfFile.path}#page=${sel.page}&selection=${selectionParam}|${this.linkLabel}]]`;
         });
         if (lines.length === 0) return;
 
         const cursorPos = this.getNoteCursorEditorPos(noteFile);
         if (cursorPos) {
             const editor = cursorPos.editor;
-            const lastLine = editor.lastLine();
-            // 链接-only 批注的链接行（如 [[xxx.pdf#page=45&selection=...|别名]]；
-            // 不含 callout 的 > 前缀与嵌入的 ![[ 前缀）
-            const linkLineRegex = /^\[\[[^\]]*#page=\d+[^\]]*\]\]$/;
-            const isLinkLine = (line: number) =>
-                line >= 0 && line <= lastLine && linkLineRegex.test(editor.getLine(line));
-
-            // 插入锚点：默认光标所在行；若光标行或其后两行内是链接行（光标停在上一条
-            // 批注的文字末尾 / 链接上方空行 / 链接行上），改在该链接行之后插入
-            let anchor = cursorPos.line;
-            for (let i = 0; i < 3; i++) {
-                if (isLinkLine(anchor + i)) {
-                    anchor = anchor + i;
-                    break;
-                }
-            }
-
-            const anchorText = editor.getLine(anchor);
-            // 锚点行非空时多补一个空行，保证链接上方恰好有一个空行放光标
-            const prefix = anchorText.length === 0 ? '\n' : '\n\n';
-            const annotation = prefix + lines.join('\n') + '\n';
-            editor.replaceRange(annotation, { line: anchor, ch: anchorText.length });
-
-            // 光标落在链接上方的空行（首个链接行 = 锚点行 + 前缀空行数 + 1）
-            const firstLinkLine = anchor + (anchorText.length === 0 ? 1 : 2);
-            editor.setCursor({ line: firstLinkLine - 1, ch: 0 });
+            const startLine = cursorPos.line;
+            const startCh = cursorPos.ch;
+            // 多个「定位」按钮用空格连接成一行，末尾再留一个空格；
+            // 光标停在最后一个按钮后，用户直接输入即为“定位 我打字的内容”。
+            const inserted = lines.join(' ') + ' ';
+            editor.replaceRange(inserted, { line: startLine, ch: startCh });
+            editor.setCursor({ line: startLine, ch: startCh + inserted.length });
         } else {
             // 无编辑器（阅读模式/笔记未打开）：追加到文末
             await this.ctx.plugin.app.vault.process(noteFile, (data) => {
                 const endsWithNewline = data.endsWith('\n');
-                return data + (endsWithNewline ? '\n' : '\n\n') + lines.join('\n') + '\n';
+                const suffix = lines.join(' ') + ' ';
+                return data + (endsWithNewline ? '\n' : '\n\n') + suffix + '\n';
             });
         }
     }

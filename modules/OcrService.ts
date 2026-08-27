@@ -11,6 +11,8 @@ import { requestUrl, RequestUrlParam } from 'obsidian';
 export class OcrService {
     private baseUrl: string;
     private apiKey: string;
+    /** 是否清洗 OCR 输出（默认开启）；关闭时原样保留模型返回文本 */
+    private sanitizeOutput = true;
 
     constructor(baseUrl: string, apiKey?: string) {
         this.baseUrl = baseUrl.replace(/\/+$/, '');
@@ -25,6 +27,10 @@ export class OcrService {
         this.apiKey = key;
     }
 
+    setSanitizeOutput(value: boolean): void {
+        this.sanitizeOutput = value;
+    }
+
     /** 拉取服务器可用模型列表 */
     async listModels(): Promise<string[]> {
         const res = await this.request({
@@ -36,7 +42,7 @@ export class OcrService {
         return models.map((m: any) => typeof m === 'string' ? m : (m?.id ?? '')).filter(Boolean);
     }
 
-    /** 自动选择模型：设置指定 → 视觉模型按优先级（paddleocr-vl-1.6 首选） */
+    /** 自动选择模型：设置指定 → 视觉模型按优先级（推荐 paddleocr-vl-1.6 优先） */
     async resolveModel(configured: string): Promise<string> {
         if (configured.trim()) return configured.trim();
         const models = await this.listModels();
@@ -46,8 +52,14 @@ export class OcrService {
             const hit = models.find((id) => id.includes(key));
             if (hit) return hit;
         }
+        // 关键词兜底：仅匹配看起来是视觉模型的条目；
+        // 找不到时明确报错让用户手动填写，而不是静默选择第一个（可能是纯文本模型导致 OCR 必然失败）
         const preferred = models.find((m) => /ocr|vision|vl|qwen|llava|gemini/i.test(m));
-        return preferred ?? models[0];
+        if (preferred) return preferred;
+        const preview = models.slice(0, 10).join(', ') + (models.length > 10 ? ' …' : '');
+        throw new Error(
+            `服务器上未找到视觉模型，请在插件设置中手动填写「OCR 模型」。可用模型：${preview}`
+        );
     }
 
     /**
@@ -111,7 +123,7 @@ export class OcrService {
         const choice = res.json?.choices?.[0];
         const raw = choice?.message?.content ?? '';
         return {
-            text: sanitizeOcrText(raw),
+            text: this.sanitizeOutput ? sanitizeOcrText(raw) : raw,
             finishReason: choice?.finish_reason ?? null,
         };
     }

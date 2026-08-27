@@ -20,8 +20,9 @@
   position: absolute;
   box-sizing: content-box;
   pointer-events: none;
-  background-color: rgb(var(--text-highlight-bg-rgb));
-  opacity: 0.3;
+  /* 颜色/透明度由插件写入的 --pdf-reader-highlight-* 变量控制（设置「高亮颜色/高亮透明度」），
+     未设置或值无效时回退主题高亮色 */
+  background-color: rgba(var(--pdf-reader-highlight-rgb, var(--text-highlight-bg-rgb)), var(--pdf-reader-highlight-opacity, 0.3));
   padding: 0.1em;
   margin: -0.1em;
   border-radius: 0.1em;
@@ -46,6 +47,31 @@
 }
 .pdf-reader-jump-flash {
   animation: pdf-reader-jump-flash 1.2s ease-out 2;
+}
+
+/* 笔记编辑器内跳转定位的高亮提醒：不把光标移入链接，避免 Live Preview 展开 */
+@keyframes pdf-reader-note-flash {
+  0% {
+    opacity: 1;
+    background-color: rgba(124, 108, 240, 0.28);
+    box-shadow: 0 0 0 2px rgba(124, 108, 240, 0.35);
+  }
+  100% {
+    opacity: 0;
+    background-color: transparent;
+    box-shadow: none;
+  }
+}
+.pdf-reader-note-overlay {
+  position: absolute;
+  pointer-events: none;
+  z-index: 9999;
+  background-color: rgba(124, 108, 240, 0.22);
+  border: 2px solid rgba(124, 108, 240, 0.55);
+  border-radius: 4px;
+  box-sizing: border-box;
+  animation: pdf-reader-note-flash 2s ease-out 1;
+  animation-fill-mode: forwards;
 }
 
 
@@ -157,6 +183,77 @@
   border: none;
 }
 
+/* 浮窗边缘缩放手柄：绝对定位覆盖容器各边/角，挂在 content 之后保证可点击。
+   手柄位于边框外缘附近（负偏移吃掉圆角处的盲区），不遮挡页面交互。 */
+.deepseek-float-resize {
+  position: absolute;
+  z-index: 100000;
+}
+
+.deepseek-float-resize-n {
+  top: -3px;
+  left: 8px;
+  right: 8px;
+  height: 7px;
+  cursor: n-resize;
+}
+
+.deepseek-float-resize-s {
+  bottom: -3px;
+  left: 8px;
+  right: 8px;
+  height: 7px;
+  cursor: s-resize;
+}
+
+.deepseek-float-resize-e {
+  top: 8px;
+  bottom: 8px;
+  right: -3px;
+  width: 7px;
+  cursor: e-resize;
+}
+
+.deepseek-float-resize-w {
+  top: 8px;
+  bottom: 8px;
+  left: -3px;
+  width: 7px;
+  cursor: w-resize;
+}
+
+.deepseek-float-resize-ne {
+  top: -3px;
+  right: -3px;
+  width: 12px;
+  height: 12px;
+  cursor: nesw-resize;
+}
+
+.deepseek-float-resize-nw {
+  top: -3px;
+  left: -3px;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+}
+
+.deepseek-float-resize-se {
+  bottom: -3px;
+  right: -3px;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+}
+
+.deepseek-float-resize-sw {
+  bottom: -3px;
+  left: -3px;
+  width: 12px;
+  height: 12px;
+  cursor: nesw-resize;
+}
+
 
 /* ---------- 截图批注 ---------- */
 
@@ -188,11 +285,12 @@
 /* ---------- PDF 截图嵌入（无文件，实时渲染裁剪区域） ---------- */
 
 .pdf-crop-embed {
-  display: inline-block;
+  display: block;
   max-width: 100%;
 }
 
 .pdf-crop-embed img {
+  display: block;
   max-width: 100%;
   height: auto;
   border-radius: 4px;
@@ -275,14 +373,45 @@
 
 .ocr-crop-highlight {
   position: absolute;
-  border: 1px solid rgba(var(--text-highlight-bg-rgb), 0.5);
-  background: rgba(var(--text-highlight-bg-rgb), 0.3);
+  /* 与文字批注高亮共用同一组颜色/透明度设置（边框在填充基础上略加深） */
+  border: 1px solid rgba(var(--pdf-reader-highlight-rgb, var(--text-highlight-bg-rgb)), var(--pdf-reader-highlight-border-opacity, 0.5));
+  background: rgba(var(--pdf-reader-highlight-rgb, var(--text-highlight-bg-rgb)), var(--pdf-reader-highlight-opacity, 0.3));
   border-radius: 2px;
   pointer-events: none;
 }
 
 /* OCR 高亮区域可点击：跳转到笔记中对应批注 */
 .ocr-highlight-layer .ocr-crop-highlight {
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ---------- 截图批注区域持久高亮（黄色边框、内部不填充） ---------- */
+
+.pdf-screenshot-highlight-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 901;
+}
+
+.pdf-screenshot-crop-highlight {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid #f5c518;
+  background: transparent;
+  background-color: transparent;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+/* 截图批注高亮区域可点击：跳转到笔记中对应批注 */
+.pdf-screenshot-highlight-layer .pdf-screenshot-crop-highlight {
   pointer-events: auto;
   cursor: pointer;
   user-select: none;
@@ -329,4 +458,24 @@
 }
 .callout[data-callout="pdf-annotation"] .callout-content > :last-child {
   margin-bottom: 0;
+}
+
+/* 截图批注：让图片/裁剪嵌入与下方的紫色原文链接之间不产生额外空行 */
+.callout[data-callout="pdf-annotation"] .pdf-crop-embed {
+  margin-top: 0;
+  margin-bottom: -0.25em;
+}
+.callout[data-callout="pdf-annotation"] .pdf-crop-embed + *,
+.callout[data-callout="pdf-annotation"] .pdf-crop-embed ~ *,
+.callout[data-callout="pdf-annotation"] p:has(.pdf-crop-embed) + p,
+.callout[data-callout="pdf-annotation"] p:has(.pdf-crop-embed) {
+  margin-top: 0;
+}
+.callout[data-callout="pdf-annotation"] p:has(.pdf-crop-embed) {
+  margin-bottom: 0;
+}
+/* 若截图嵌入后存在空的段落节点，也一并隐藏，进一步压缩图片与链接之间的间隔 */
+.callout[data-callout="pdf-annotation"] .pdf-crop-embed + p:empty,
+.callout[data-callout="pdf-annotation"] p:has(.pdf-crop-embed) + p:empty {
+  display: none;
 }

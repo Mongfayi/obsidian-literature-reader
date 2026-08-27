@@ -1,5 +1,6 @@
 import { TFile, debounce, setIcon, setTooltip, normalizePath } from 'obsidian';
 import type { ModuleContext, PluginModule } from '../types';
+import { buildNoteBaseRegex } from './noteNaming';
 
 /**
  * 文件管理器标记模块
@@ -8,7 +9,10 @@ import type { ModuleContext, PluginModule } from '../types';
  *
  * 识别依据：
  *  1. 任意 Markdown 笔记 frontmatter 中的 `pdf: "[[xxx.pdf]]"` 字段；
- *  2. 兼容早期没有 pdf 字段的旧笔记：在阅读笔记文件夹内按 `{PDF名} 阅读.md` 命名匹配。
+ *  2. 兼容早期没有 pdf 字段的旧笔记：在阅读笔记文件夹内按命名模板（设置「阅读笔记命名模板」）
+ *     渲染出的文件名匹配。
+ *
+ * 可通过设置 fileMarkerEnabled 关闭；关闭后任何刷新都会清空既有标记。
  *
  * 实现方式：
  *  - 使用 metadataCache 建立 PDF 路径 -> 有笔记 的索引，避免逐个读文件；
@@ -72,9 +76,14 @@ export class ReadingNoteMarkerModule implements PluginModule {
 
     // ========== 索引建立 ==========
 
+    /** 标记开关（设置为 false 时隐藏全部标记） */
+    private markerEnabled(): boolean {
+        return this.ctx.getSettings().fileMarkerEnabled !== false;
+    }
+
     /**
      * 重建“PDF 路径 -> 已有阅读笔记”索引。
-     * 优先使用 frontmatter 的 pdf 字段；旧笔记无该字段时按命名规则在阅读笔记文件夹内兜底。
+     * 优先使用 frontmatter 的 pdf 字段；旧笔记无该字段时按命名模板在阅读笔记文件夹内兜底。
      */
     private async rebuildIndex(): Promise<void> {
         const next = new Set<string>();
@@ -89,6 +98,8 @@ export class ReadingNoteMarkerModule implements PluginModule {
         }
 
         const folderPath = normalizePath(this.ctx.getSettings().readingNoteFolder);
+        // 与「阅读笔记命名模板」设置保持同一套命名规则（含可选的 (n) 重名后缀）
+        const nameRegex = buildNoteBaseRegex(this.ctx.getSettings().readingNoteNameTemplate);
 
         for (const note of this.ctx.plugin.app.vault.getMarkdownFiles()) {
             const pdfPath = this.extractPdfPath(note);
@@ -97,11 +108,11 @@ export class ReadingNoteMarkerModule implements PluginModule {
                 continue;
             }
 
-            // 旧笔记没有 pdf 字段：仅匹配阅读笔记文件夹内的「xxx 阅读.md」
+            // 旧笔记没有 pdf 字段：仅匹配阅读笔记文件夹内按模板命名的笔记
             // （folderPath 为空表示 vault 根目录，此时所有笔记都在文件夹内）
             const inReadingFolder = !folderPath || note.path.startsWith(folderPath + '/');
             if (inReadingFolder) {
-                const m = note.basename.match(/^(.+) 阅读(?: \((\d+)\))?$/);
+                const m = note.basename.match(nameRegex);
                 if (!m) continue;
                 const matches = pdfsByBasename.get(m[1]);
                 if (matches?.length === 1) next.add(matches[0]);
@@ -124,8 +135,12 @@ export class ReadingNoteMarkerModule implements PluginModule {
 
     // ========== 文件管理器 DOM 装饰 ==========
 
-    /** 遍历所有文件管理器叶子，重新装饰所有 PDF 行 */
+    /** 遍历所有文件管理器叶子，重新装饰所有 PDF 行；关闭开关时清空标记 */
     private decorateAll(): void {
+        if (!this.markerEnabled()) {
+            this.clearAll();
+            return;
+        }
         for (const leaf of this.ctx.plugin.app.workspace.getLeavesOfType('file-explorer')) {
             const container = leaf.view.containerEl;
             if (!container) continue;

@@ -1,7 +1,7 @@
 {
     "id": "pdf-reader",
     "name": "文献阅读助手",
-    "version": "2.4.1",
+    "version": "2.5.0",
     "minAppVersion": "1.7.0",
     "description": "PDF 一键阅读、批注到笔记、自动提取关键词、截图 OCR 批注，并集成 DeepSeek 浮动窗口",
     "author": "mongfayi",

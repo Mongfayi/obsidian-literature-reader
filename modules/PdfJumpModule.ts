@@ -1,4 +1,4 @@
-import { TFile, WorkspaceLeaf, FileView, MarkdownView, Menu, Notice } from 'obsidian';
+import { TFile, WorkspaceLeaf, FileView, MarkdownView, Menu, Notice, Editor } from 'obsidian';
 import type { ModuleContext, PluginModule } from '../types';
 
 /**
@@ -209,6 +209,8 @@ export class PdfJumpModule implements PluginModule {
         const selRegex = /\[\[([^\]#|]+?)#page=(\d+)&selection=([\d,\s-]+)/g;
         // OCR 矩形链接：[[path#page=N&ocr=x,y,w,h|alias]]（含别名结尾）
         const ocrRegex = /\[\[([^\]#|]+?)#page=(\d+)&ocr=([\d.,\s-]+?)(?:\|[^\]]*)?\]\]/g;
+        // 截图批注嵌入链接：[[path#page=N&rect=x1,y1,x2,y2]]（含 ![[...]] 嵌入形式）
+        const rectRegex = /\[\[([^\]#|]+?)#page=(\d+)&rect=([\d.,\s-]+?)(?:\|[^\]]*)?\]\]/g;
 
         this.scanMatches(content, selRegex, pdfFile, sourcePath, index, (m) => {
             const sel = this.normalizeSelectionKey(m[3]);
@@ -221,6 +223,12 @@ export class PdfJumpModule implements PluginModule {
             if (!ocr) return null;
             const linktext = `${m[1].trim()}#page=${m[2]}&ocr=${ocr}`;
             return { page: parseInt(m[2], 10), key: `o:${ocr}`, linktext };
+        });
+        this.scanMatches(content, rectRegex, pdfFile, sourcePath, index, (m) => {
+            const rect = this.normalizeRectKey(m[3]);
+            if (!rect) return null;
+            const linktext = `${m[1].trim()}#page=${m[2]}&rect=${rect}`;
+            return { page: parseInt(m[2], 10), key: `r:${rect}`, linktext };
         });
     }
 
@@ -369,9 +377,9 @@ export class PdfJumpModule implements PluginModule {
         }
     }
 
-    /** 解析 #page=N&selection=… / #page=N&ocr=… 片段 */
+    /** 解析 #page=N&selection=… / #page=N&ocr=… / #page=N&rect=… 片段 */
     private parseFragment(fragment: string): ParsedFragment | null {
-        const m = fragment.match(/^#page=(\d+)(?:&(selection|ocr)=([\d.,\s-]+))?/);
+        const m = fragment.match(/^#page=(\d+)(?:&(selection|ocr|rect)=([\d.,\s-]+))?/);
         if (!m) return null;
         const page = parseInt(m[1], 10);
         if (!Number.isInteger(page)) return null;
@@ -384,6 +392,10 @@ export class PdfJumpModule implements PluginModule {
             const ocr = this.normalizeOcrKey(m[3] ?? '');
             if (!ocr) return null;
             key = `o:${ocr}`;
+        } else if (m[2] === 'rect') {
+            const rect = this.normalizeRectKey(m[3] ?? '');
+            if (!rect) return null;
+            key = `r:${rect}`;
         }
         return { page, key };
     }
@@ -396,6 +408,7 @@ export class PdfJumpModule implements PluginModule {
         if (!parsed.key) return; // 仅页码：Obsidian 原生已滚动到页
         const selAttr = parsed.key.startsWith('s:') ? parsed.key.slice(2) : null;
         const ocrAttr = parsed.key.startsWith('o:') ? parsed.key.slice(2) : null;
+        const rectAttr = parsed.key.startsWith('r:') ? parsed.key.slice(2) : null;
 
         const deadline = Date.now() + 8000;
         while (Date.now() < deadline) {
@@ -408,7 +421,9 @@ export class PdfJumpModule implements PluginModule {
                     ? `[data-pdf-jump-selection="${selAttr}"]`
                     : ocrAttr
                         ? `[data-pdf-jump-ocr="${ocrAttr}"]`
-                        : ''
+                        : rectAttr
+                            ? `[data-pdf-jump-rect="${rectAttr}"]`
+                            : ''
             ) ?? null;
             if (targetEl) {
                 targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -444,7 +459,14 @@ export class PdfJumpModule implements PluginModule {
         const page = parseInt(jumpEl.getAttribute('data-pdf-jump-page') || '', 10);
         const sel = jumpEl.getAttribute('data-pdf-jump-selection');
         const ocr = jumpEl.getAttribute('data-pdf-jump-ocr');
-        const key = sel ? `s:${sel}` : ocr ? `o:${this.normalizeOcrKey(ocr)}` : null;
+        const rect = jumpEl.getAttribute('data-pdf-jump-rect');
+        const key = sel
+            ? `s:${sel}`
+            : ocr
+                ? `o:${this.normalizeOcrKey(ocr)}`
+                : rect
+                    ? `r:${this.normalizeRectKey(rect)}`
+                    : null;
         if (!Number.isInteger(page) || !key) return;
 
         const occurrences = this.indexCache.get(pdfFile.path)?.get(page)?.get(key);
@@ -506,13 +528,18 @@ export class PdfJumpModule implements PluginModule {
                 await sleep(100);
             }
             if (editor.lastLine() >= occ.line) {
+                // 不要把光标放进链接内部：Live Preview 会把短链接「定位」展开为完整 wikilink。
+                // 这里只滚动到目标链接所在位置，并给该行/链接加临时高亮作为位置提醒。
                 const lineText = editor.getLine(occ.line);
-                editor.setCursor({ line: occ.line, ch: Math.min(occ.ch, lineText.length) });
+                const targetCh = Math.min(occ.ch, lineText.length);
                 editor.scrollIntoView(
-                    { from: { line: occ.line, ch: 0 }, to: { line: occ.line, ch: 1 } },
+                    {
+                        from: { line: occ.line, ch: targetCh },
+                        to: { line: occ.line, ch: Math.min(targetCh + 1, lineText.length) },
+                    },
                     true
                 );
-                editor.focus();
+                this.flashNoteInEditor(editor, occ);
             }
             return;
         }
@@ -528,6 +555,81 @@ export class PdfJumpModule implements PluginModule {
             }
             await sleep(100);
         }
+    }
+
+    /**
+     * 在编辑器（Live Preview / 源码模式）中高亮目标行，不把光标移入链接内，
+     * 避免 Obsidian Live Preview 将短链接「定位」展开为完整 wikilink。
+     *
+     * 这里不再给 CodeMirror 的行元素临时加 class（CM 重绘会清掉），
+     * 而是根据 CodeMirror 坐标在滚动容器里叠加一个临时高亮层。
+     */
+    private flashNoteInEditor(editor: Editor, occ: NoteOccurrence): void {
+        const cm = (editor as any).cm;
+        if (!cm || typeof editor.posToOffset !== 'function') return;
+
+        const lineText = editor.getLine(occ.line);
+        const targetCh = Math.min(occ.ch, lineText.length);
+        const offset = editor.posToOffset({ line: occ.line, ch: targetCh });
+
+        const showOverlay = (): boolean => {
+            try {
+                // 必须等目标位置已经进入 CodeMirror 绘制视口（不依赖被装饰隐藏的具体字符坐标）
+                const viewport = cm.viewport;
+                if (!viewport || offset < viewport.from || offset > viewport.to) return false;
+
+                const block = cm.lineBlockAt(offset);
+                const contentRect = cm.contentDOM?.getBoundingClientRect?.() ?? null;
+                const scrollerRect = cm.scrollDOM?.getBoundingClientRect?.() ?? null;
+                if (!scrollerRect) return false;
+
+                const scaleX = cm.scaleX || 1;
+                const scaleY = cm.scaleY || 1;
+                const screenLeft = contentRect?.left ?? scrollerRect.left;
+                const screenTop = cm.documentTop + block.top;
+                const screenBottom = screenTop + block.height;
+                // 确保高亮位置确实在编辑器可视范围内，避免把层放到屏幕外
+                if (screenBottom < scrollerRect.top || screenTop > scrollerRect.bottom) return false;
+
+                const left = screenLeft - scrollerRect.left + (cm.scrollDOM.scrollLeft || 0) * scaleX;
+                const top = screenTop - scrollerRect.top + (cm.scrollDOM.scrollTop || 0) * scaleY;
+                const width = contentRect?.width ?? scrollerRect.width ?? 0;
+                const height = block.height;
+
+                if (width <= 0 || height <= 0) return false;
+                this.showNoteOverlay(cm, left, top, width, height);
+                return true;
+            } catch (e) {
+                console.warn('[PdfJump] 创建笔记高亮覆盖层失败:', e);
+                return false;
+            }
+        };
+
+        if (showOverlay()) return;
+
+        // 滚动/渲染可能是异步的，稍等几帧后再尝试获取坐标
+        let tries = 0;
+        const timer = window.setInterval(() => {
+            tries++;
+            if (showOverlay() || tries >= 40) {
+                window.clearInterval(timer);
+            }
+        }, 50);
+    }
+
+    /** 在 CodeMirror 滚动容器内叠加一个临时的半透明高亮框，不依赖行 DOM 的 class 存活 */
+    private showNoteOverlay(cm: any, left: number, top: number, width: number, height: number): void {
+        // 移除上一次可能残留的高亮框
+        document.querySelectorAll('.pdf-reader-note-overlay').forEach((el) => el.remove());
+
+        const overlay = document.createElement('div');
+        overlay.className = 'pdf-reader-note-overlay';
+        overlay.style.left = `${left}px`;
+        overlay.style.top = `${top}px`;
+        overlay.style.width = `${width}px`;
+        overlay.style.height = `${height}px`;
+        cm.scrollDOM.appendChild(overlay);
+        window.setTimeout(() => overlay.remove(), 5000);
     }
 
     /** 在阅读模式渲染内容中查找与批注链接匹配的锚点 */
@@ -554,6 +656,13 @@ export class PdfJumpModule implements PluginModule {
 
     /** OCR 矩形 key 规范化：4 位小数去尾零，与笔记写入的 fmtRectNum 及高亮层一致 */
     private normalizeOcrKey(s: string): string {
+        const parts = s.split(',').map((p) => Number(Number(p.trim()).toFixed(4)));
+        if (parts.length !== 4 || parts.some((p) => Number.isNaN(p))) return '';
+        return parts.join(',');
+    }
+
+    /** 截图矩形 key 规范化：4 位小数去尾零，与截图高亮层 data-pdf-jump-rect 一致 */
+    private normalizeRectKey(s: string): string {
         const parts = s.split(',').map((p) => Number(Number(p.trim()).toFixed(4)));
         if (parts.length !== 4 || parts.some((p) => Number.isNaN(p))) return '';
         return parts.join(',');

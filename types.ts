@@ -1,4 +1,17 @@
 import type { Plugin } from 'obsidian';
+import { DEFAULT_NOTE_NAME_TEMPLATE } from './modules/noteNaming';
+
+/**
+ * DeepSeek 浮动窗口几何信息
+ * 用户拖拽移动或拖动边缘调整大小后持久化；
+ * null 表示未调整过，沿用 styles.css 的默认位置与尺寸
+ */
+export interface WindowGeometry {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}
 
 /**
  * 合并插件的统一设置接口
@@ -14,7 +27,7 @@ export interface PluginSettings {
     ocrServerUrl: string;
     /** LM Studio API Key（开启 Require Authentication 时必填） */
     ocrApiKey: string;
-    /** OCR 模型名（空 = 自动选择服务器列表内模型） */
+    /** OCR 模型名（空 = 自动选择服务器列表内视觉模型，推荐 paddleocr-vl-1.6） */
     ocrModel: string;
     /** 单次 OCR 请求超时（秒） */
     ocrRequestTimeoutSec: number;
@@ -22,6 +35,30 @@ export interface PluginSettings {
     ocrMaxTokens: number;
     /** OCR 提示词（PaddleOCR-VL 用任务词如 OCR:） */
     ocrPrompt: string;
+    /** 批注持久高亮填充色（#RRGGBB），文字批注与 OCR 区域高亮共用 */
+    highlightColor: string;
+    /** 批注持久高亮不透明度（0-1） */
+    highlightOpacity: number;
+    /** 文字批注是否默认附带原文（「附带原文」按钮的初始状态，切换按钮会同步保存） */
+    annotationIncludeOriginalText: boolean;
+    /** 批注回链 PDF 的链接显示文字（写入用户笔记正文） */
+    annotationLinkLabel: string;
+    /** 批注 callout 末尾的提示行（写入用户笔记正文） */
+    annotationPromptLine: string;
+    /** 阅读笔记文件名模板，{name} 为 PDF 文件名（不含扩展名） */
+    readingNoteNameTemplate: string;
+    /** 新建阅读笔记的正文模板 */
+    readingNoteBodyTemplate: string;
+    /** OCR 截图放大目标短边像素（区域短边不足时等比放大；0 = 关闭放大） */
+    ocrMinSidePx: number;
+    /** OCR 截图放大的倍率上限 */
+    ocrMaxUpscaleFactor: number;
+    /** 是否清洗 OCR 输出（去 HTML/LaTeX 包装等；关闭 = 原样保留模型输出） */
+    ocrSanitizeOutput: boolean;
+    /** 是否在文件管理器为已有阅读笔记的 PDF 显示小图标 */
+    fileMarkerEnabled: boolean;
+    /** DeepSeek 浮动窗口几何（拖拽/缩放后自动保存） */
+    deepseekWindowGeometry: WindowGeometry | null;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -33,6 +70,19 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     ocrRequestTimeoutSec: 120,
     ocrMaxTokens: 8192,
     ocrPrompt: 'OCR:',
+    // 与旧版本遗留 data.json 及 README 承诺一致的经典黄色高亮
+    highlightColor: '#FFFF00',
+    highlightOpacity: 0.4,
+    annotationIncludeOriginalText: false,
+    annotationLinkLabel: '定位',
+    annotationPromptLine: '> 笔记：',
+    readingNoteNameTemplate: DEFAULT_NOTE_NAME_TEMPLATE,
+    readingNoteBodyTemplate: '## 信息\n\n## 疑问',
+    ocrMinSidePx: 512,
+    ocrMaxUpscaleFactor: 4,
+    ocrSanitizeOutput: true,
+    fileMarkerEnabled: true,
+    deepseekWindowGeometry: null,
 };
 
 /**
