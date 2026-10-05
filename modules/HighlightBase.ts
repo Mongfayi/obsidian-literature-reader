@@ -76,6 +76,21 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
                 }
             })
         );
+        // 链接解析完成后补一次：`changed` 触发时 resolvedLinks 尚未更新（仍是编辑前
+        // 的快照），因此「新增」PDF 链接拿不到，只有「删除」恰好能覆盖。手工粘贴或
+        // 其它插件写入的链接此前要等重新打开该 PDF 才出高亮。
+        // 注意：必须与上面的「只重建已打开 PDF」过滤同时生效，否则启动期会逐文件触发
+        // 全库重建风暴。
+        this.ctx.plugin.registerEvent(
+            app.metadataCache.on('resolve', (file: TFile) => {
+                const links = app.metadataCache.resolvedLinks[file.path];
+                if (!links) return;
+                const affected = Object.keys(links).filter((t) => t.endsWith('.pdf'));
+                if (affected.length > 0) {
+                    this.scheduleRebuildForPdfs(affected);
+                }
+            })
+        );
         this.ctx.plugin.registerEvent(
             app.metadataCache.on('deleted', () => this.scheduleRebuild())
         );
@@ -90,6 +105,7 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
     }
 
     unload(): void {
+        this.cleanupHighlightLayers();
         this.attachedLeaves.clear();
         this.attachRetries.clear();
         this.indexCache.clear();
@@ -100,6 +116,20 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
             window.clearTimeout(this.rebuildTimer);
             this.rebuildTimer = null;
         }
+    }
+
+    /** 清理本插件插入 PDF 页面的持久高亮 DOM 层，避免插件卸载后残留 */
+    private cleanupHighlightLayers(): void {
+        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view.getViewType() !== 'pdf') return;
+            leaf.view.containerEl
+                .querySelectorAll(
+                    '.pdf-reader-highlight-layer, ' +
+                    '.pdf-screenshot-highlight-layer, ' +
+                    '.ocr-highlight-layer'
+                )
+                .forEach((el) => el.remove());
+        });
     }
 
     /** 重建单个 PDF 的索引（子类解析笔记内容并填充索引） */
@@ -176,8 +206,13 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
      * 防抖窗口内多次请求会合并路径；已被全量请求（'full'）覆盖时维持全量。
      */
     protected scheduleRebuildForPdfs(pdfPaths: string[]): void {
-        if (pdfPaths.length === 0) return;
-        this.scheduleTimer(pdfPaths);
+        // 与已打开集合求交：未打开的 PDF 不必重建（打开时 file-open 会补建），
+        // 否则每次笔记编辑都要对每个受影响 PDF 全表扫一遍 resolvedLinks
+        // 并读取其全部链接笔记 —— 且 4 个模块各做一遍
+        const open = this.getOpenPdfPaths();
+        const filtered = pdfPaths.filter((p) => open.has(p));
+        if (filtered.length === 0) return;
+        this.scheduleTimer(filtered);
     }
 
     /** 统一防抖调度：合并窗口内请求，'full' 请求优先且不可被局部请求降级 */
@@ -326,8 +361,11 @@ export abstract class BasePdfHighlightModule<T> implements PluginModule {
         }
     }
 
-    /** 读取笔记内容：优先打开中的编辑器缓冲，其次磁盘 */
+    /** 读取笔记内容：优先打开中的编辑器缓冲，其次磁盘（共享缓存可用时复用一次读取） */
     protected async readNoteContent(sourceFile: TFile): Promise<string> {
+        if (this.ctx.readNoteContent) {
+            return await this.ctx.readNoteContent(sourceFile);
+        }
         const app = this.ctx.plugin.app;
         let editorContent: string | null = null;
         app.workspace.getLeavesOfType('markdown').forEach((leaf) => {

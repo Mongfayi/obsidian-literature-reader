@@ -11,21 +11,21 @@ import { toolbarPoller, pruneStaleLeaves } from './toolbarPoller';
  *    用户按“定位 我打字的内容”正序记录。
  *  - 开启：文字选中批注附带原文，格式为“原文 / 定位 / 笔记：”。
  *
- * 该开关只影响「文字选中批注」（有文本层锚点 beginIndex>=0 的选区）；
- * OCR 批注（beginIndex<0）与截图批注的写入格式不受影响。
+ * 该开关对「文字选中批注」「截图 OCR 批注」「截图批注」三种方式均生效：
+ *  - 关闭（默认）：文字批注只写定位链接；OCR 批注只写识别文字；截图批注只写图片。
+ *  - 开启：文字批注写“原文 / 定位 / 笔记：”；OCR 批注写“识别文字 / 定位 / 笔记：”；
+ *    截图批注写“图片 / 定位 / 笔记：”。
  *
  * 开关状态持久化在插件设置 annotationIncludeOriginalText 中：
  * 插件加载时从设置初始化；经按钮/命令切换时同步写回设置，重载插件或重启后保持。
  *
- * 工具条按钮注入范式与 MainArticleModule 一致：
+ * 工具条按钮注入范式与 ScreenshotModule / OcrModule 一致：
  *  监听 layout-change / active-leaf-change + 2s 轮询兜底，经 viewer.child.toolbar.pageNumberEl.after(btn) 插入。
  */
 export class AnnotationModeModule implements PluginModule {
     private ctx: ModuleContext;
     private pdfModule: PdfReaderModule;
 
-    /** 「附带原文」开关（内存镜像；真实状态持久化于设置 annotationIncludeOriginalText） */
-    private includeOriginalText = false;
     /** 已注入按钮的叶子 → 按钮元素 */
     private toolbarButtons = new Map<WorkspaceLeaf, HTMLElement>();
     /** 本模块创建过的全部按钮（含多标签页下未进 map 的隐藏按钮），用于卸载清理 */
@@ -41,11 +41,11 @@ export class AnnotationModeModule implements PluginModule {
     load(): void {
         const plugin = this.ctx.plugin;
 
-        // 从持久化设置初始化开关（默认关闭）
-        this.includeOriginalText = this.ctx.getSettings().annotationIncludeOriginalText === true;
-
-        // 向 PdfReaderModule 注入原文附带模式提供者：批注入口按当前开关决定是否写原文
-        this.pdfModule.setIncludeOriginalTextProvider(() => this.includeOriginalText);
+        // 向 PdfReaderModule 注入原文附带模式提供者：批注入口按当前开关决定是否写原文。
+        // 直接读取设置对象作为唯一数据源，使设置面板修改也能立即生效。
+        this.pdfModule.setIncludeOriginalTextProvider(
+            () => this.ctx.getSettings().annotationIncludeOriginalText === true
+        );
 
         plugin.registerEvent(
             plugin.app.workspace.on('layout-change', () => {
@@ -61,7 +61,7 @@ export class AnnotationModeModule implements PluginModule {
         );
 
         // PDF 视图可能被重建，事件驱动注入不可靠，用轻量定时轮询兜底（幂等）；
-        // 与截图/OCR/主文献模块共享同一轮询器
+        // 与截图/OCR/标签等模块共享同一轮询器
         this.removePollTask = toolbarPoller.add(() => {
             this.injectToolbarButtons();
             this.refreshAllButtonStates();
@@ -97,17 +97,15 @@ export class AnnotationModeModule implements PluginModule {
         this.removePollTask = null;
         this.toolbarButtons.clear();
         this.createdButtons.clear();
-        // 仅清理内存镜像；开关状态已持久化在设置中，重载后从设置恢复
-        this.includeOriginalText = false;
     }
 
     // ========== 模式状态 ==========
 
     /** 切换「附带原文」开关，同步写入设置并持久化 */
     private toggleMode(): void {
-        this.includeOriginalText = !this.includeOriginalText;
-        // 写回共享设置对象（同步可见）并异步落盘，重载插件后保持该模式
-        this.ctx.getSettings().annotationIncludeOriginalText = this.includeOriginalText;
+        // 设置对象是唯一数据源：直接从当前设置取反，避免内存镜像与设置面板不一致
+        const settings = this.ctx.getSettings();
+        settings.annotationIncludeOriginalText = !settings.annotationIncludeOriginalText;
         void this.ctx.saveSettings().catch((e) => {
             console.error('[AnnotationMode] 保存「附带原文」开关失败:', e);
         });
@@ -151,7 +149,6 @@ export class AnnotationModeModule implements PluginModule {
             btn.addClass('clickable-icon');
             btn.addClass('pdfreader-annotation-mode-button');
             setIcon(btn, 'link');
-            btn.createSpan({ text: '附带原文' });
             btn.addEventListener('click', (evt: MouseEvent) => {
                 evt.stopPropagation();
                 this.toggleMode();
@@ -183,13 +180,13 @@ export class AnnotationModeModule implements PluginModule {
 
     /** 按当前开关切换激活态与提示文案（提示中的链接标签跟随设置） */
     private applyButtonState(btn: HTMLElement): void {
-        const on = this.includeOriginalText;
+        const on = this.ctx.getSettings().annotationIncludeOriginalText === true;
         const label = this.ctx.getSettings().annotationLinkLabel || '定位';
         btn.toggleClass('is-active', on);
         if (on) {
-            setTooltip(btn, `附带原文已开启（点击关闭）\n批注格式：原文 / ${label} / 笔记：`);
+            setTooltip(btn, `附带原文已开启（点击关闭）\n文字：原文 / ${label} / 笔记：\nOCR：识别文字 / ${label} / 笔记：\n截图：图片 / ${label} / 笔记：`);
         } else {
-            setTooltip(btn, `附带原文已关闭（默认，点击开启）\n批注格式：${label} + 你输入的内容`);
+            setTooltip(btn, `附带原文已关闭（默认，点击开启）\n文字：仅${label}\nOCR：仅识别文字\n截图：仅图片`);
         }
     }
 }

@@ -83,6 +83,7 @@ export class ScreenshotHighlightModule extends BasePdfHighlightModule<PdfScreens
 
         const newIndex: PdfScreenshotIndex = new Map();
         const app = this.ctx.plugin.app;
+        let readFailed = false;
 
         for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
             if (!links[pdfPath]) continue;
@@ -92,10 +93,14 @@ export class ScreenshotHighlightModule extends BasePdfHighlightModule<PdfScreens
                 const content = await this.readNoteContent(sourceFile);
                 this.extractRectLinks(content, pdfFile, sourcePath, newIndex);
             } catch (e) {
+                readFailed = true;
                 console.warn('[ScreenshotHighlight] 读取笔记失败:', sourcePath, e);
             }
         }
 
+        // 任何一篇笔记读取失败时保留上次成功扫描的索引：用残缺结果覆盖会把
+        // 已显示的高亮整篇抹掉（删除路径见 renderPageHighlights），待下次重建修正
+        if (readFailed && this.indexCache.has(pdfPath)) return;
         this.indexCache.set(pdfPath, newIndex);
     }
 
@@ -139,7 +144,10 @@ export class ScreenshotHighlightModule extends BasePdfHighlightModule<PdfScreens
         const pageNumber = parseInt(pageDiv.dataset.pageNumber ?? '0', 10) || 0;
 
         const index = this.indexCache.get(pdfPath);
-        const pageMap = index?.get(pageNumber);
+        // 索引未建成（PDF 刚打开/重建仍在防抖或扫描）：无选区是瞬态而非权威，
+        // 保留已有高亮层，重建完成后 renderForPdf 会重放
+        if (!index) return;
+        const pageMap = index.get(pageNumber);
         if (!pageMap || pageMap.size === 0) {
             pageDiv.querySelector('.pdf-screenshot-highlight-layer')?.remove();
             return;

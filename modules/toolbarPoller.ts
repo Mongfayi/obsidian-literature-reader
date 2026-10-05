@@ -3,12 +3,14 @@ import { App, WorkspaceLeaf } from 'obsidian';
 /**
  * 共享轮询调度器
  *
- * 截图批注 / OCR 批注 / 主文献三个模块都需要 2s 轮询兜底注入工具条按钮。
+ * 截图批注 / OCR 批注 / 附带原文 / 快速标签等模块都需要 2s 轮询兜底注入工具条按钮。
  * 共享一个 setInterval 避免每模块独立定时器；任务全部移除时自动停止。
  */
 export class SharedPoller {
     private timer: number | null = null;
     private readonly tasks = new Set<() => void>();
+    /** 门控：返回 false 时本轮跳过全部任务（如无打开的 PDF 视图、窗口隐藏时零开销） */
+    private gate: (() => boolean) | null = null;
 
     constructor(private readonly intervalMs: number) { }
 
@@ -18,10 +20,17 @@ export class SharedPoller {
         return () => this.remove(task);
     }
 
+    /** 设置轮询门控（插件加载时调用一次；返回 false 时本轮 tick 直接跳过） */
+    setGate(gate: (() => boolean) | null): void {
+        this.gate = gate;
+    }
+
     /** 启动定时器（已有定时器或没有任务时不重复启动；幂等） */
     start(): void {
         if (this.timer !== null || this.tasks.size === 0) return;
         this.timer = window.setInterval(() => {
+            if (this.gate && !this.gate()) return;
+            if (document.hidden) return;
             for (const task of this.tasks) {
                 try {
                     task();

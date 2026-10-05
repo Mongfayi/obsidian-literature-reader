@@ -40,6 +40,7 @@ export class OcrModule extends BaseCropModeModule {
     protected readonly buttonTooltip = '截图 OCR 批注到笔记';
     protected readonly commandId = 'ocr-screenshot-annotate';
     protected readonly commandName = '截图 OCR 批注到笔记';
+    protected readonly busyNotice = '正在识别中，请等识别完成后再框选';
 
     /** 高亮模块刷新回调（批注成功后触发即时高亮），由 main.ts 注入 */
     private refreshHighlights: ((file: TFile, entries: OcrHighlightEntry[]) => void) | null = null;
@@ -62,13 +63,17 @@ export class OcrModule extends BaseCropModeModule {
         pageDiv: HTMLElement,
         pageRect: { x: number; y: number; width: number; height: number }
     ): Promise<void> {
-        // 外层兜底：基类 void 调用本方法，任何未捕获异常都会成为
-        // unhandled rejection 且用户无感知，统一转为 Notice
+        // 识别 + 写入期间置忙碌态：禁用工具条按钮并拒绝再次进入截图模式。
+        // 否则连续框选会并发发起 OCR —— 本地 LM Studio 单卡串行，每个请求都会
+        // 跑满超时；且两次写入同一光标位置会互相插队，批注顺序不确定。
+        this.setBusy(true);
         try {
             await this.doCaptureAndAnnotate(leaf, pageDiv, pageRect);
         } catch (e) {
             console.error('[Ocr] 截图批注失败:', e);
             new Notice(`截图批注失败: ${(e as Error).message}`);
+        } finally {
+            this.setBusy(false);   // 必须在 finally 清除，否则按钮永久禁用
         }
     }
 
@@ -130,7 +135,7 @@ export class OcrModule extends BaseCropModeModule {
 
         const ok = await this.ocrAndAnnotate(leaf, imageDataUrl, pageNum, ocrRect);
         // 批注成功后触发高亮模块即时渲染（笔记已写入 &ocr= 链接，删除批注后会同步消失）
-        if (ok && ocrRect) {
+        if (ok && ocrRect && this.pdfModule.shouldIncludeOriginalText()) {
             const file = (leaf.view as FileView).file;
             if (file) {
                 this.refreshHighlights?.(file, [{ page: pageNum, rect: ocrRect }]);
@@ -177,11 +182,20 @@ export class OcrModule extends BaseCropModeModule {
 
         const notice = new Notice('OCR 识别中…', 0);
         try {
-            const { text } = await this.service.ocrText(
+            const { text, finishReason } = await this.service.ocrText(
                 imageDataUrl, model, settings.ocrPrompt,
                 settings.ocrRequestTimeoutSec, settings.ocrMaxTokens
             );
             notice.hide();
+            if (finishReason === 'length') {
+                // 输出被 max_tokens 截断：不提示的话笔记里会静默少一段文字，
+                // 用户不知道该调大上限还是缩小框选
+                new Notice(
+                    'OCR 输出已达「最大输出令牌」上限，识别文本可能被截断'
+                        + '（可在设置中调大该值，或缩小框选范围）',
+                    8000
+                );
+            }
             if (!text.trim()) {
                 new Notice('未识别到文字，请调整框选区域后重试');
                 return false;

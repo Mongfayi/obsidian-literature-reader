@@ -2,3 +2,11 @@ node_modules/
 data.json
 .DS_Store
 *.map
+pdfjs-fallback.mjs
+pdf.worker.min.mjs
+# 旧版标签同步备份（含笔记全文，切勿提交）
+tag-sync-backup.json
+# 本地临时目录（调试残留、AI 工具会话）
+.tmp-bugcheck/
+.zcode/
+.zcodeignore

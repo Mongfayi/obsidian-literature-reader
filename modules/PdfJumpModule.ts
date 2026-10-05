@@ -1,4 +1,4 @@
-import { TFile, WorkspaceLeaf, FileView, MarkdownView, Menu, Notice, Editor } from 'obsidian';
+import { TFile, WorkspaceLeaf, FileView, MarkdownView, Menu, Notice, Editor, EditorPosition } from 'obsidian';
 import type { ModuleContext, PluginModule } from '../types';
 
 /**
@@ -27,8 +27,10 @@ interface NoteOccurrence {
     notePath: string;
     /** 链接所在行（0 起） */
     line: number;
-    /** 链接起点列（0 起） */
+    /** 链接起点列（0 起，指向 “[[" 的第一个字符） */
     ch: number;
+    /** 链接终点列（0 起，不含；指向 “]]" 之后），用于精确高亮链接文本 */
+    endCh?: number;
     /** 笔记原文中的链接目标（path#page=…），用于阅读模式定位渲染出的锚点 */
     linktext: string;
 }
@@ -47,14 +49,54 @@ interface ParsedFragment {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 笔记内跳转定位高亮样式 class（编辑模式 addHighlights 与阅读模式共用，见 styles.css） */
+const NOTE_FLASH_MARK_CLASS = 'pdf-reader-note-flash-mark';
+/** 笔记内跳转定位高亮的持续时长：1s 淡出动画 + 100ms 余量（与 styles.css 动画同步） */
+const NOTE_FLASH_MS = 1100;
+
+/**
+ * Obsidian 未写入官方 d.ts 的原生编辑器高亮 API。
+ * 核心的搜索结果 / 大纲跳转闪烁（is-flashing）即基于它实现：
+ * 按 class 维护一组 mark decoration，作用于编辑器 state（不依赖 DOM 存活），
+ * 并可自动展开折叠区间，是编辑模式下做「定位闪烁」最可靠的通道。
+ */
+interface HighlightCapableEditor {
+    addHighlights?: (
+        ranges: { from: EditorPosition; to: EditorPosition }[],
+        className: string,
+        /** true = 按 class 替换注册进 state（随后可用 removeHighlights(class) 注销） */
+        addToState?: boolean,
+        /** true = 自动展开横跨高亮区间的折叠 */
+        unfoldFolds?: boolean
+    ) => void;
+    removeHighlights?: (className?: string) => void;
+}
+
 export class PdfJumpModule implements PluginModule {
     private ctx: ModuleContext;
     /** pdfPath → 跳转索引 */
     private indexCache = new Map<string, PdfJumpIndex>();
+    /**
+     * 每个 PDF 一条重建串行链。
+     *
+     * 点击路径会同步触发重建，与防抖路径可能并发；rebuildIndex 内部有多次 await，
+     * 两个并发调用各自读到不同时刻的笔记内容，**后完成的那个写入 indexCache**，
+     * 与启动顺序无关 —— 结果可能是刚写入的批注链接查不到。
+     * HighlightBase 有同样的机制，这里此前缺失。
+     */
+    private rebuildChains = new Map<string, Promise<void>>();
     /** 索引重建防抖定时器 */
     private rebuildTimer: number | null = null;
     /** 防抖窗口内待重建的 PDF：'full' = 全量，string[] = 局部路径集，null = 无待办 */
     private pendingRebuild: 'full' | string[] | null = null;
+    /** 编辑器内高亮提醒：递增令牌，保证旧的清除定时器不会抹掉新一轮高亮 */
+    private noteFlashToken = 0;
+    private noteFlashClearTimer: number | null = null;
+    /** 当前持有编辑器内高亮的编辑器（用于到期/卸载时按 class 注销） */
+    private noteFlashEditor: Editor | null = null;
+    /** 阅读模式高亮提醒：当前闪烁的链接元素与清除定时器 */
+    private lastReadingFlashEl: HTMLElement | null = null;
+    private readingFlashClearTimer: number | null = null;
 
     constructor(ctx: ModuleContext) {
         this.ctx = ctx;
@@ -76,6 +118,19 @@ export class PdfJumpModule implements PluginModule {
         // 笔记修改（批注写入/删除）→ 防抖重建受影响的 PDF
         this.ctx.plugin.registerEvent(
             app.metadataCache.on('changed', (file: TFile) => {
+                const links = app.metadataCache.resolvedLinks[file.path];
+                if (!links) return;
+                const affected = Object.keys(links).filter((t) => t.endsWith('.pdf'));
+                if (affected.length > 0) {
+                    this.scheduleRebuildForPdfs(affected);
+                }
+            })
+        );
+        // 链接解析完成后补一次：`changed` 触发时 resolvedLinks 尚未更新（仍是编辑前
+        // 的快照），「新增」PDF 链接拿不到，只有「删除」恰好能覆盖。手工粘贴或其它插件
+        // 写入的链接此前无法立即建立跳转索引。必须配合下面的「只重建已打开 PDF」过滤。
+        this.ctx.plugin.registerEvent(
+            app.metadataCache.on('resolve', (file: TFile) => {
                 const links = app.metadataCache.resolvedLinks[file.path];
                 if (!links) return;
                 const affected = Object.keys(links).filter((t) => t.endsWith('.pdf'));
@@ -110,6 +165,45 @@ export class PdfJumpModule implements PluginModule {
             window.clearTimeout(this.rebuildTimer);
             this.rebuildTimer = null;
         }
+        this.clearNoteFlashState();
+    }
+
+    /** 清理两种笔记模式下的高亮提醒状态（定时器 + 编辑器/阅读模式残留 class） */
+    private clearNoteFlashState(): void {
+        if (this.noteFlashClearTimer !== null) {
+            window.clearTimeout(this.noteFlashClearTimer);
+            this.noteFlashClearTimer = null;
+        }
+        if (this.readingFlashClearTimer !== null) {
+            window.clearTimeout(this.readingFlashClearTimer);
+            this.readingFlashClearTimer = null;
+        }
+        this.clearEditorNoteFlash();
+        if (this.lastReadingFlashEl?.isConnected) {
+            this.lastReadingFlashEl.removeClass(NOTE_FLASH_MARK_CLASS);
+        }
+        this.lastReadingFlashEl = null;
+        this.noteFlashToken++;
+        if (this.jumpFlashTimer !== null) {
+            window.clearTimeout(this.jumpFlashTimer);
+            this.jumpFlashTimer = null;
+        }
+        if (this.lastJumpFlashEl?.isConnected) {
+            this.lastJumpFlashEl.removeClass('pdf-reader-jump-flash');
+        }
+        this.lastJumpFlashEl = null;
+    }
+
+    /** 移除编辑器内的跳转定位高亮（Obsidian addHighlights 按 class 注销） */
+    private clearEditorNoteFlash(): void {
+        const editor = this.noteFlashEditor;
+        this.noteFlashEditor = null;
+        if (!editor) return;
+        try {
+            (editor as unknown as HighlightCapableEditor).removeHighlights?.(NOTE_FLASH_MARK_CLASS);
+        } catch {
+            // 编辑器视图可能已关闭/销毁，忽略
+        }
     }
 
     // ========== 索引维护 ==========
@@ -120,9 +214,25 @@ export class PdfJumpModule implements PluginModule {
     }
 
     /** 精确重建指定 PDF（笔记编辑的常规路径），防抖合并 */
+    /** 当前已打开的 PDF 路径集合 */
+    private getOpenPdfPaths(): Set<string> {
+        const paths = new Set<string>();
+        this.ctx.plugin.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view.getViewType() === 'pdf') {
+                const file = (leaf.view as FileView).file;
+                if (file) paths.add(file.path);
+            }
+        });
+        return paths;
+    }
+
     private scheduleRebuildForPdfs(pdfPaths: string[]): void {
-        if (pdfPaths.length === 0) return;
-        this.scheduleTimer(pdfPaths);
+        // 与已打开集合求交：未打开的 PDF 不必重建（打开时 file-open 会补建），
+        // 否则每次笔记编辑都要对每个受影响 PDF 全表扫一遍 resolvedLinks
+        const open = this.getOpenPdfPaths();
+        const filtered = pdfPaths.filter((p) => open.has(p));
+        if (filtered.length === 0) return;
+        this.scheduleTimer(filtered);
     }
 
     private scheduleTimer(request: 'full' | string[]): void {
@@ -176,6 +286,18 @@ export class PdfJumpModule implements PluginModule {
      * metadataCache 不记录指向 PDF 的正文链接，因此通过 resolvedLinks 反查
      * 链接到该 PDF 的笔记，再读取笔记原文提取带页码/锚点的链接并记录行号。
      */
+    /** 串行化入口：同一 PDF 的重建排队执行，避免旧结果覆盖新结果 */
+    private rebuildIndexSerialized(pdfPath: string): Promise<void> {
+        const prev = this.rebuildChains.get(pdfPath) ?? Promise.resolve();
+        const next = prev.catch(() => undefined).then(() => this.rebuildIndex(pdfPath));
+        // 链尾不再挂后续任务时清掉，避免 Map 无界增长
+        this.rebuildChains.set(pdfPath, next.catch(() => undefined));
+        void next.finally(() => {
+            if (this.rebuildChains.get(pdfPath) === next) this.rebuildChains.delete(pdfPath);
+        });
+        return next;
+    }
+
     private async rebuildIndex(pdfPath: string): Promise<void> {
         const pdfFile = this.ctx.plugin.app.vault.getAbstractFileByPath(pdfPath);
         if (!(pdfFile instanceof TFile)) return;
@@ -243,6 +365,23 @@ export class PdfJumpModule implements PluginModule {
     ): void {
         const app = this.ctx.plugin.app;
         let m: RegExpExecArray | null;
+
+        // 行号用「增量推进」而非每次 content.slice(0, m.index).split('\n')：
+        // exec 的 m.index 单调递增，后者会为每个匹配复制并切分前缀字符串，
+        // 一篇 500KB、上千条批注链接的笔记单次重建就是数百 MB 的瞬时垃圾（且本方法跑三遍）
+        let scanned = 0;
+        let line = 0;
+        let lineStart = 0;
+        const advanceTo = (idx: number) => {
+            for (let i = scanned; i < idx; i++) {
+                if (content.charCodeAt(i) === 10 /* \n */) {
+                    line++;
+                    lineStart = i + 1;
+                }
+            }
+            scanned = idx;
+        };
+
         while ((m = regex.exec(content)) !== null) {
             const linkpath = m[1].trim();
             const target = app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
@@ -251,20 +390,28 @@ export class PdfJumpModule implements PluginModule {
             const entry = makeEntry(m);
             if (!entry || !Number.isInteger(entry.page)) continue;
 
-            const line = content.slice(0, m.index).split('\n').length - 1;
-            const lineStart = content.lastIndexOf('\n', m.index - 1) + 1;
+            advanceTo(m.index);
             const ch = m.index - lineStart;
+            // 链接终点 = 完整 wikilink 的 "]]" 之后（含别名文字）。
+            // 必须覆盖到别名：Live Preview 只渲染别名（[[path| 前缀被隐藏），
+            // 若 endCh 止于别名前的 "|"，编辑模式的定位高亮会全部落在隐藏文本上而不可见。
+            // 链接路径与别名均不可含 "]]"，首个 "]]" 即本链接闭合括号。
+            const closeIdx = content.indexOf(']]', m.index);
+            const endCh = closeIdx >= 0 ? closeIdx + 2 : ch + m[0].length;
 
             const pageIndex = index.get(entry.page) ?? new Map<string, NoteOccurrence[]>();
             const list = pageIndex.get(entry.key) ?? [];
-            list.push({ notePath: sourcePath, line, ch, linktext: entry.linktext });
+            list.push({ notePath: sourcePath, line, ch, endCh, linktext: entry.linktext });
             pageIndex.set(entry.key, list);
             index.set(entry.page, pageIndex);
         }
     }
 
-    /** 读取笔记内容：优先打开中的编辑器缓冲（仅编辑模式，缓冲与磁盘一致），其次磁盘 */
+    /** 读取笔记内容：优先打开中的编辑器缓冲（仅编辑模式，缓冲与磁盘一致），其次磁盘（共享缓存） */
     private async readNoteContent(sourceFile: TFile): Promise<string> {
+        if (this.ctx.readNoteContent) {
+            return await this.ctx.readNoteContent(sourceFile, { editorMode: 'source' });
+        }
         const app = this.ctx.plugin.app;
         let editorContent: string | null = null;
         app.workspace.getLeavesOfType('markdown').forEach((leaf) => {
@@ -342,7 +489,10 @@ export class PdfJumpModule implements PluginModule {
         evt.stopImmediatePropagation();
 
         const sourceLeaf = this.findLeafContaining(target) ?? this.ctx.plugin.app.workspace.activeLeaf;
-        this.jumpToPdf(pdfFile, fragment, sourceLeaf);
+        void this.jumpToPdf(pdfFile, fragment, sourceLeaf).catch((e) => {
+            console.error('[PdfJump] 跳转 PDF 失败:', e);
+            new Notice('跳转 PDF 失败');
+        });
     };
 
     /**
@@ -442,7 +592,8 @@ export class PdfJumpModule implements PluginModule {
      * data-pdf-jump-selection / data-pdf-jump-ocr 属性，点击后经索引
      * 找到笔记中的批注位置并跳转；多个笔记命中时弹出菜单选择。
      */
-    private handleHighlightClick = (evt: MouseEvent): void => {
+    private handleHighlightClick = async (evt: MouseEvent): Promise<void> => {
+        try {
         if (evt.button !== 0) return;
         if (evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey) return;
         const target = evt.target as HTMLElement | null;
@@ -469,7 +620,19 @@ export class PdfJumpModule implements PluginModule {
                     : null;
         if (!Number.isInteger(page) || !key) return;
 
-        const occurrences = this.indexCache.get(pdfFile.path)?.get(page)?.get(key);
+        let occurrences = this.indexCache.get(pdfFile.path)?.get(page)?.get(key);
+        if (!occurrences || occurrences.length === 0) {
+            // 索引可能尚未建好（刚打开 PDF / 插件加载后的防抖窗口内点击）：
+            // 同步重建该 PDF 的索引再查一次，避免偶发「点不动」
+            try {
+                await this.rebuildIndexSerialized(pdfFile.path);
+            } catch (e) {
+                console.error('[PdfJump] 重建跳转索引失败:', e);
+                new Notice('跳转索引重建失败');
+                return;
+            }
+            occurrences = this.indexCache.get(pdfFile.path)?.get(page)?.get(key);
+        }
         if (!occurrences || occurrences.length === 0) {
             new Notice('未在笔记中找到对应的批注链接');
             return;
@@ -483,7 +646,10 @@ export class PdfJumpModule implements PluginModule {
         const notes = [...byNote.values()];
 
         if (notes.length === 1) {
-            this.jumpToNoteOccurrence(pdfFile, leaf, notes[0]);
+            void this.jumpToNoteOccurrence(pdfFile, leaf, notes[0]).catch((e) => {
+                console.error('[PdfJump] 跳转批注失败:', e);
+                new Notice('跳转批注失败');
+            });
         } else {
             const menu = new Menu();
             for (const occ of notes) {
@@ -491,10 +657,19 @@ export class PdfJumpModule implements PluginModule {
                 menu.addItem((item) =>
                     item
                         .setTitle(noteFile instanceof TFile ? noteFile.basename : occ.notePath)
-                        .onClick(() => this.jumpToNoteOccurrence(pdfFile, leaf, occ))
+                        .onClick(() => {
+                            void this.jumpToNoteOccurrence(pdfFile, leaf, occ).catch((e) => {
+                                console.error('[PdfJump] 跳转批注失败:', e);
+                                new Notice('跳转批注失败');
+                            });
+                        })
                 );
             }
             menu.showAtMouseEvent(evt);
+        }
+        } catch (e) {
+            console.error('[PdfJump] PDF 高亮跳转失败:', e);
+            new Notice('PDF 高亮跳转失败');
         }
     };
 
@@ -529,13 +704,14 @@ export class PdfJumpModule implements PluginModule {
             }
             if (editor.lastLine() >= occ.line) {
                 // 不要把光标放进链接内部：Live Preview 会把短链接「定位」展开为完整 wikilink。
-                // 这里只滚动到目标链接所在位置，并给该行/链接加临时高亮作为位置提醒。
+                // 这里只滚动到目标链接所在位置，并仅给链接本身加临时高亮作为位置提醒。
                 const lineText = editor.getLine(occ.line);
                 const targetCh = Math.min(occ.ch, lineText.length);
+                const linkEndCh = Math.min(this.resolveLinkEndCh(occ, lineText, targetCh), lineText.length);
                 editor.scrollIntoView(
                     {
                         from: { line: occ.line, ch: targetCh },
-                        to: { line: occ.line, ch: Math.min(targetCh + 1, lineText.length) },
+                        to: { line: occ.line, ch: linkEndCh },
                     },
                     true
                 );
@@ -544,13 +720,13 @@ export class PdfJumpModule implements PluginModule {
             return;
         }
 
-        // 阅读模式：等待渲染后定位链接锚点（链接在 callout 内，滚动整个 callout）
+        // 阅读模式：等待渲染后定位链接锚点，仅对链接本身滚动，并使用与编辑模式一致的高亮提醒
         const container = (view as any).previewMode?.containerEl ?? view.contentEl;
         for (let i = 0; i < 30; i++) {
             const el = this.findRenderedNoteLink(container, occ);
             if (el) {
                 el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                this.flashElement(el.closest('.callout') ?? el);
+                this.flashNoteLinkInReadingView(el);
                 return;
             }
             await sleep(100);
@@ -558,78 +734,87 @@ export class PdfJumpModule implements PluginModule {
     }
 
     /**
-     * 在编辑器（Live Preview / 源码模式）中高亮目标行，不把光标移入链接内，
-     * 避免 Obsidian Live Preview 将短链接「定位」展开为完整 wikilink。
+     * 在编辑器（Live Preview / 源码模式）中只高亮目标链接本身（而非整行），
+     * 不把光标移入链接内，避免 Obsidian Live Preview 将短链接「定位」展开为完整 wikilink。
      *
-     * 这里不再给 CodeMirror 的行元素临时加 class（CM 重绘会清掉），
-     * 而是根据 CodeMirror 坐标在滚动容器里叠加一个临时高亮层。
+     * 使用 Obsidian 原生 Editor.addHighlights（未写入官方 d.ts，核心的搜索结果 /
+     * 大纲跳转闪烁即由它实现）。高亮由 mark decoration 挂在编辑器 state 上，
+     * 随文本渲染、天然与链接对齐，不受缩放/内边距/可读行宽影响，且按 class
+     * 注册进 state 后可精确注销，滚动重绘也不会丢失。
+     *
+     * 弃用的旧方案（自定义 CM StateField + registerEditorExtension + effect 分发）
+     * 依赖插件动态注入编辑器状态，实测 effect 会被静默忽略，导致编辑模式下
+     * 高亮提醒完全不显示。
      */
     private flashNoteInEditor(editor: Editor, occ: NoteOccurrence): void {
-        const cm = (editor as any).cm;
-        if (!cm || typeof editor.posToOffset !== 'function') return;
+        const capable = editor as unknown as HighlightCapableEditor;
+        if (typeof capable.addHighlights !== 'function') {
+            console.warn('[PdfJump] 当前 Obsidian 版本缺少 Editor.addHighlights，无法点亮笔记跳转高亮');
+            return;
+        }
 
         const lineText = editor.getLine(occ.line);
         const targetCh = Math.min(occ.ch, lineText.length);
-        const offset = editor.posToOffset({ line: occ.line, ch: targetCh });
+        const endCh = Math.max(targetCh, Math.min(this.resolveLinkEndCh(occ, lineText, targetCh), lineText.length));
+        if (endCh <= targetCh) return; // 空行无从高亮
 
-        const showOverlay = (): boolean => {
-            try {
-                // 必须等目标位置已经进入 CodeMirror 绘制视口（不依赖被装饰隐藏的具体字符坐标）
-                const viewport = cm.viewport;
-                if (!viewport || offset < viewport.from || offset > viewport.to) return false;
+        const token = ++this.noteFlashToken;
+        try {
+            // 先注销旧高亮再重新添加：Obsidian 对同一 class 复用同一个缓存的 mark
+            // decoration，相同区间重复 add 时 CM 判定装饰未变、不重建 DOM，
+            // CSS 动画不会重播；两次独立 dispatch 会先移除旧 span 再重建新 span，
+            // 保证连续点击时动画每次都从头播放。
+            capable.removeHighlights?.(NOTE_FLASH_MARK_CLASS);
+            capable.addHighlights(
+                [{ from: { line: occ.line, ch: targetCh }, to: { line: occ.line, ch: endCh } }],
+                NOTE_FLASH_MARK_CLASS,
+                true,
+                true
+            );
+        } catch (e) {
+            console.warn('[PdfJump] 点亮笔记跳转高亮失败:', e);
+            return;
+        }
+        this.noteFlashEditor = editor;
 
-                const block = cm.lineBlockAt(offset);
-                const contentRect = cm.contentDOM?.getBoundingClientRect?.() ?? null;
-                const scrollerRect = cm.scrollDOM?.getBoundingClientRect?.() ?? null;
-                if (!scrollerRect) return false;
-
-                const scaleX = cm.scaleX || 1;
-                const scaleY = cm.scaleY || 1;
-                const screenLeft = contentRect?.left ?? scrollerRect.left;
-                const screenTop = cm.documentTop + block.top;
-                const screenBottom = screenTop + block.height;
-                // 确保高亮位置确实在编辑器可视范围内，避免把层放到屏幕外
-                if (screenBottom < scrollerRect.top || screenTop > scrollerRect.bottom) return false;
-
-                const left = screenLeft - scrollerRect.left + (cm.scrollDOM.scrollLeft || 0) * scaleX;
-                const top = screenTop - scrollerRect.top + (cm.scrollDOM.scrollTop || 0) * scaleY;
-                const width = contentRect?.width ?? scrollerRect.width ?? 0;
-                const height = block.height;
-
-                if (width <= 0 || height <= 0) return false;
-                this.showNoteOverlay(cm, left, top, width, height);
-                return true;
-            } catch (e) {
-                console.warn('[PdfJump] 创建笔记高亮覆盖层失败:', e);
-                return false;
-            }
-        };
-
-        if (showOverlay()) return;
-
-        // 滚动/渲染可能是异步的，稍等几帧后再尝试获取坐标
-        let tries = 0;
-        const timer = window.setInterval(() => {
-            tries++;
-            if (showOverlay() || tries >= 40) {
-                window.clearInterval(timer);
-            }
-        }, 50);
+        if (this.noteFlashClearTimer !== null) window.clearTimeout(this.noteFlashClearTimer);
+        this.noteFlashClearTimer = window.setTimeout(() => {
+            this.noteFlashClearTimer = null;
+            if (this.noteFlashToken !== token) return; // 已被新一轮高亮接管，不抹掉
+            this.clearEditorNoteFlash();
+        }, NOTE_FLASH_MS);
     }
 
-    /** 在 CodeMirror 滚动容器内叠加一个临时的半透明高亮框，不依赖行 DOM 的 class 存活 */
-    private showNoteOverlay(cm: any, left: number, top: number, width: number, height: number): void {
-        // 移除上一次可能残留的高亮框
-        document.querySelectorAll('.pdf-reader-note-overlay').forEach((el) => el.remove());
+    /** 计算链接在行内的终点列：行内实时扫描 "]]" 优先（不受索引陈旧影响），退化用索引记录值 */
+    private resolveLinkEndCh(occ: NoteOccurrence, lineText: string, targetCh: number): number {
+        if (lineText.slice(targetCh, targetCh + 2) === '[[') {
+            const close = lineText.indexOf(']]', targetCh + 2);
+            if (close >= 0) return close + 2;
+        }
+        if (typeof occ.endCh === 'number' && occ.endCh > targetCh) return occ.endCh;
+        return Math.min(targetCh + 1, lineText.length);
+    }
 
-        const overlay = document.createElement('div');
-        overlay.className = 'pdf-reader-note-overlay';
-        overlay.style.left = `${left}px`;
-        overlay.style.top = `${top}px`;
-        overlay.style.width = `${width}px`;
-        overlay.style.height = `${height}px`;
-        cm.scrollDOM.appendChild(overlay);
-        window.setTimeout(() => overlay.remove(), 5000);
+    /** 阅读模式下的链接闪烁：与编辑模式共用同一套样式（pdf-reader-note-flash-mark），保证效果一致 */
+    private flashNoteLinkInReadingView(el: HTMLElement): void {
+        if (this.lastReadingFlashEl && this.lastReadingFlashEl !== el && this.lastReadingFlashEl.isConnected) {
+            this.lastReadingFlashEl.removeClass(NOTE_FLASH_MARK_CLASS);
+        }
+        // 连续点击同一链接：addClass 对已有 class 是 no-op、动画不会重播，
+        // 先移除 class 并强制重排（读取 offsetWidth 触发样式重算）再加回，保证每次点击都重播动画
+        el.removeClass(NOTE_FLASH_MARK_CLASS);
+        void el.offsetWidth;
+        el.addClass(NOTE_FLASH_MARK_CLASS);
+        this.lastReadingFlashEl = el;
+
+        if (this.readingFlashClearTimer !== null) window.clearTimeout(this.readingFlashClearTimer);
+        this.readingFlashClearTimer = window.setTimeout(() => {
+            this.readingFlashClearTimer = null;
+            if (this.lastReadingFlashEl?.isConnected) {
+                this.lastReadingFlashEl.removeClass(NOTE_FLASH_MARK_CLASS);
+            }
+            this.lastReadingFlashEl = null;
+        }, NOTE_FLASH_MS);
     }
 
     /** 在阅读模式渲染内容中查找与批注链接匹配的锚点 */
@@ -668,10 +853,28 @@ export class PdfJumpModule implements PluginModule {
         return parts.join(',');
     }
 
-    /** 闪烁提示元素 */
+    /** PDF 高亮矩形脉冲提醒：当前闪烁元素与清除定时器（同一时刻只保留一个） */
+    private lastJumpFlashEl: HTMLElement | null = null;
+    private jumpFlashTimer: number | null = null;
+
+    /** 闪烁提示元素（连续点击同一高亮时动画重播：先移除 class 强制重排再加回） */
     private flashElement(el: HTMLElement): void {
+        if (this.jumpFlashTimer !== null) window.clearTimeout(this.jumpFlashTimer);
+        if (this.lastJumpFlashEl?.isConnected && this.lastJumpFlashEl !== el) {
+            this.lastJumpFlashEl.removeClass('pdf-reader-jump-flash');
+        }
+        this.lastJumpFlashEl = el;
+        el.removeClass('pdf-reader-jump-flash');
+        void el.offsetWidth;
         el.addClass('pdf-reader-jump-flash');
-        window.setTimeout(() => el.removeClass('pdf-reader-jump-flash'), 2400);
+
+        this.jumpFlashTimer = window.setTimeout(() => {
+            this.jumpFlashTimer = null;
+            if (this.lastJumpFlashEl?.isConnected) {
+                this.lastJumpFlashEl.removeClass('pdf-reader-jump-flash');
+            }
+            this.lastJumpFlashEl = null;
+        }, 2400);
     }
 
     /** 查找包含指定节点的叶子 */

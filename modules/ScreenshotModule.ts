@@ -3,6 +3,7 @@ import type { ModuleContext } from '../types';
 import type { PdfReaderModule } from './PdfReaderModule';
 import type { ScreenshotHighlightEntry } from './ScreenshotHighlightModule';
 import { BaseCropModeModule } from './BaseCropModeModule';
+import { loadPdfjsLib, type PdfjsLib } from './pdfjsLoader';
 
 /**
  * 截图批注模块
@@ -23,6 +24,12 @@ export class ScreenshotModule extends BaseCropModeModule {
     private pdfModule: PdfReaderModule;
     /** 截图批注写入后的高亮刷新回调（由主入口注入 ScreenshotHighlightModule.refresh） */
     private refreshHighlights: ((file: TFile, entries: ScreenshotHighlightEntry[]) => void) | null = null;
+    /**
+     * pdfjs 获取器（模块创建时绑定本插件上下文）。
+     * 独立成函数是给 CropEmbed 用的：嵌入创建器只拿到 Obsidian 的嵌入上下文，
+     * 拿不到插件实例与 manifest.dir，无法自行定位插件目录做回退加载。
+     */
+    private pdfjsResolver: (() => Promise<PdfjsLib>) | null = null;
 
     /** 原始 PDF EmbedCreator（注册自定义裁剪嵌入前保存，卸载时恢复） */
     private originalPdfEmbedCreator: any = null;
@@ -94,11 +101,11 @@ export class ScreenshotModule extends BaseCropModeModule {
         }
 
         // 屏幕坐标 → PDF 空间坐标（供嵌入链接 &rect= 参数使用）
-        // 依赖 Obsidian 内部结构（viewer.child.getPage、window.pdfjsLib），
+        // 依赖 Obsidian 内部结构（viewer.child.getPage）与 pdfjs 的 Util，
         // 结构变动/缺失时可能抛错，单独捕获并提示，不产生未处理 rejection
         let rect: number[] | null = null;
         try {
-            rect = this.screenToPdfRect(leaf, pageDiv, pageRect);
+            rect = await this.screenToPdfRect(leaf, pageDiv, pageRect);
         } catch (e) {
             console.warn('[Screenshot] 坐标转换失败:', e);
         }
@@ -112,7 +119,7 @@ export class ScreenshotModule extends BaseCropModeModule {
             const ok = await this.pdfModule.annotateScreenshot(file, pageNum, rect);
             notice.hide();
             if (ok) {
-                // 批注成功后触发截图批注高亮模块即时渲染（笔记已写入 &rect= 链接）
+                // 图片来源的 &rect= 嵌入始终写入笔记，因此始终触发持久高亮
                 this.refreshHighlights?.(file, [{ page: pageNum, rect }]);
                 new Notice('截图批注已写入笔记');
             }
@@ -127,11 +134,11 @@ export class ScreenshotModule extends BaseCropModeModule {
      * 使用 pdfjs pageView.getPagePoint 进行视口→PDF 坐标转换，
      * 与 pdf-plus 的矩形选择实现一致。
      */
-    private screenToPdfRect(
+    private async screenToPdfRect(
         leaf: WorkspaceLeaf,
         pageDiv: HTMLElement,
         pageRect: { x: number; y: number; width: number; height: number }
-    ): number[] | null {
+    ): Promise<number[] | null> {
         const child = (leaf.view as any).viewer?.child;
         const pageNum = parseInt(pageDiv.dataset?.pageNumber ?? '0', 10);
         const pageView = child?.getPage?.(pageNum);
@@ -151,11 +158,20 @@ export class ScreenshotModule extends BaseCropModeModule {
 
         // getPagePoint(x, y) 接收视口坐标，返回 PDF 坐标 [pdfX, pdfY]
         // PDF 坐标 y 轴向上：左下角 (left, bottom) → 右上角 (right, top)
-        const pdfjsLib = (window as any).pdfjsLib;
-        const rect = pdfjsLib.Util.normalizeRect([
+        const pdfjsLib = await (this.pdfjsResolver ? this.pdfjsResolver() : Promise.resolve(window.pdfjsLib));
+        const points = [
             ...pageView.getPagePoint(left, bottom),
             ...pageView.getPagePoint(right, top),
-        ]);
+        ];
+        // 归一化矩形（左下/右上）：pdfjs 暴露 Util 时用它，缺失时等价地取 min/max
+        const rect = pdfjsLib?.Util?.normalizeRect
+            ? pdfjsLib.Util.normalizeRect(points)
+            : [
+                Math.min(points[0], points[2]),
+                Math.min(points[1], points[3]),
+                Math.max(points[0], points[2]),
+                Math.max(points[1], points[3]),
+            ];
         return rect.map((n: number) => Math.round(n));
     }
 
@@ -167,6 +183,8 @@ export class ScreenshotModule extends BaseCropModeModule {
      */
     private registerCropEmbedCreator(): void {
         const app = this.ctx.plugin.app as any;
+        // 绑定插件上下文：裁剪嵌入渲染时用它获取 pdfjs（宿主未暴露 window.pdfjsLib 时回退）
+        this.pdfjsResolver = () => loadPdfjsLib(this.ctx.plugin);
         // embedRegistry 为未公开内部 API：缺失/结构变化时降级跳过裁剪嵌入注册，
         // 不影响其余功能（框选照常写入链接，仅嵌入渲染不可用）
         try {
@@ -185,7 +203,7 @@ export class ScreenshotModule extends BaseCropModeModule {
                 const pageNumber = parseInt(params.get('page')!);
                 const rect = params.get('rect')!.split(',').map((n) => parseFloat(n));
                 if (Number.isInteger(pageNumber) && rect.length === 4 && rect.every((n) => !isNaN(n))) {
-                    return new CropEmbed(ctx, file, pageNumber, rect);
+                    return new CropEmbed(ctx, file, pageNumber, rect, this.pdfjsResolver ?? undefined);
                 }
             }
             return this.originalPdfEmbedCreator
@@ -228,7 +246,9 @@ class CropEmbed extends Component {
         ctx: any,
         private file: TFile,
         private pageNumber: number,
-        private pdfRect: number[]
+        private pdfRect: number[],
+        /** pdfjs 获取器（由 ScreenshotModule 注入；缺失时回退为读 window.pdfjsLib） */
+        private resolvePdfjs?: () => Promise<PdfjsLib>
     ) {
         super();
         this.app = ctx.app;
@@ -260,12 +280,25 @@ class CropEmbed extends Component {
 
     /** 加载 PDF → 渲染整页 → 裁剪目标区域 → 返回 PNG dataURL */
     private async renderCropRegion(): Promise<string> {
-        // 复用文档缓存，避免同一 PDF 被多个裁剪嵌入重复加载
-        const doc = await pdfDocCache.get(this.file, this.app);
-        const pdfjs = (window as any).pdfjsLib;
+        // 先拿到可用的 pdfjs（宿主未暴露 window.pdfjsLib 时回退插件自带副本），
+        // 再加载文档、渲染整页、裁剪目标区域
+        const pdfjs = await this.loadPdfjs();
+        const doc = await pdfDocCache.get(this.file, this.app, () => this.loadPdfjs());
         const page = await doc.getPage(this.pageNumber);
         const fullCanvas = await this.renderFullPage(page, pdfjs);
         return this.cropToRect(fullCanvas, page, pdfjs);
+    }
+
+    /**
+     * 取得渲染用 pdfjs：优先宿主自带的 window.pdfjsLib，缺失时回退插件自带的副本。
+     * 编辑模式（Live Preview）下打开笔记、且当前没有 PDF 视图时，宿主不会暴露 pdfjsLib，
+     * 这里必须走回退，否则渲染直接抛错、嵌入区显示「PDF 截图加载失败」。
+     */
+    private loadPdfjs(): Promise<PdfjsLib> {
+        if (this.resolvePdfjs) return this.resolvePdfjs();
+        const appPdfjs = window.pdfjsLib;
+        if (appPdfjs?.getDocument) return Promise.resolve(appPdfjs);
+        return Promise.reject(new Error('pdfjs 不可用：未注入获取器且宿主未暴露 window.pdfjsLib'));
     }
 
     /** 以 2x 缩放渲染整页到离屏 canvas */
@@ -318,13 +351,18 @@ class PdfDocCache {
     private pending = new Map<string, Promise<any>>();
     /** 空闲后存活时长（ms），到期销毁释放内存 */
     private readonly ttlMs: number;
+    /** 在途加载代数；clear() 时递增，用于丢弃清空后才完成的加载 */
+    private generation = 0;
 
     constructor(ttlMs = 60000) {
         this.ttlMs = ttlMs;
     }
 
-    /** 获取或加载 PDF 文档代理；并发请求共享同一加载 Promise */
-    async get(file: TFile, app: import('obsidian').App): Promise<any> {
+    /**
+     * 获取或加载 PDF 文档代理；并发请求共享同一加载 Promise。
+     * @param resolvePdfjs pdfjs 获取器（宿主暴露则直接用，缺失时回退插件自带副本）
+     */
+    async get(file: TFile, app: import('obsidian').App, resolvePdfjs: () => Promise<PdfjsLib>): Promise<any> {
         const path = file.path;
         const cached = this.cache.get(path);
         if (cached) {
@@ -338,9 +376,10 @@ class PdfDocCache {
         const loading = this.pending.get(path);
         if (loading) return loading;
 
+        const generation = this.generation;
         const promise = (async () => {
             const buffer = await app.vault.readBinary(file);
-            const pdfjs = (window as any).pdfjsLib;
+            const pdfjs = await resolvePdfjs();
             const task = pdfjs.getDocument({
                 data: buffer,
                 cMapPacked: true,
@@ -353,6 +392,14 @@ class PdfDocCache {
                 standardFontDataUrl: '/lib/pdfjs/standard_fonts/',
             });
             const doc = await task.promise;
+
+            // 加载期间如果执行过 clear()，说明缓存已被销毁/放弃；丢弃本次结果，
+            // 避免卸载后重新向缓存写入文档和定时器。
+            if (generation !== this.generation) {
+                doc.destroy().catch(() => {});
+                throw new Error('PDF cache was cleared during load');
+            }
+
             const evictTimer = window.setTimeout(() => this.evict(path), this.ttlMs);
             this.cache.set(path, { doc, evictTimer });
             return doc;
@@ -360,11 +407,14 @@ class PdfDocCache {
 
         this.pending.set(path, promise);
         // 无论加载成功或失败都清除在途标记：失败时若保留，后续所有 get() 都会复用
-        // 同一个 rejected Promise，该 PDF 的截图嵌入将永久失败（直到插件重载）
-        promise.then(
-            () => this.pending.delete(path),
-            () => this.pending.delete(path)
-        );
+        // 同一个 rejected Promise，该 PDF 的截图嵌入将永久失败（直到插件重载）。
+        // 只清理“自己”的 pending 项，避免旧请求在 clear() 后误删新请求的标记。
+        const removePending = () => {
+            if (this.pending.get(path) === promise) {
+                this.pending.delete(path);
+            }
+        };
+        promise.then(removePending, removePending);
         return promise;
     }
 
@@ -378,6 +428,7 @@ class PdfDocCache {
 
     /** 清空全部缓存（插件卸载时调用） */
     clear(): void {
+        this.generation++;
         for (const { doc, evictTimer } of this.cache.values()) {
             window.clearTimeout(evictTimer);
             doc.destroy().catch(() => {});
