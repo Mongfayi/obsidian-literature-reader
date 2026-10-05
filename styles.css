@@ -193,6 +193,30 @@ body:has(> .modal-container) .deepseek-float-container {
   border: none;
 }
 
+/* 拖拽中的交互状态：用类切换而不是内联样式，方便主题覆盖 */
+.deepseek-float-container.is-visible {
+  display: flex;
+}
+
+/* 边缘缩放后转为左上角锚定（覆盖 CSS 的 right 默认定位） */
+.deepseek-float-container.is-left-anchored {
+  right: auto;
+}
+
+.deepseek-float-container.is-dragging {
+  cursor: grabbing;
+  transition: none;
+}
+
+.deepseek-float-container.is-resizing {
+  transition: none;
+}
+
+.deepseek-float-container.is-dragging .deepseek-float-content,
+.deepseek-float-container.is-resizing .deepseek-float-content {
+  pointer-events: none;
+}
+
 /* 浮窗边缘缩放手柄：绝对定位覆盖容器各边/角，挂在 content 之后保证可点击。
    手柄位于边框外缘附近（负偏移吃掉圆角处的盲区），不遮挡页面交互。 */
 .deepseek-float-resize {
@@ -748,6 +772,11 @@ body:has(> .modal-container) .deepseek-float-container {
   font-size: var(--font-ui-small);
 }
 
+/* 隐藏态：嵌套编辑器（表格单元格就地编辑）不生成工具栏，用类切换替代内联 display */
+.pdfreader-md-toolbar.is-hidden {
+  display: none;
+}
+
 /* 按钮主体复用 Obsidian 的 .clickable-icon，与 PDF 工具条按钮同尺寸、同悬停/激活反馈 */
 .pdfreader-md-toolbar-btn.is-active {
   color: var(--interactive-accent);
@@ -786,4 +815,44 @@ body:has(> .modal-container) .deepseek-float-container {
 
 .pdfreader-md-annotate-floating-btn.is-visible {
   display: block;
+}
+
+/* PDF 选区浮动按钮：与 Markdown 浮动按钮同一套外观（此前样式全部内联在 TS 里，
+   CSS 类名是空壳，主题无法覆盖） */
+.pdfreader-pdf-annotate-floating-btn {
+  position: fixed;
+  z-index: 9999;
+  display: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  user-select: none;
+  -webkit-user-select: none;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+
+.pdfreader-pdf-annotate-floating-btn.is-visible {
+  display: block;
+}
+
+.pdfreader-pdf-annotate-floating-btn:hover {
+  opacity: 0.85;
+}
+
+.pdfreader-pdf-annotate-floating-btn .pdfreader-pdf-annotate-badge {
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-on-accent);
+  display: none;
+}
+
+.pdfreader-pdf-annotate-floating-btn .pdfreader-pdf-annotate-badge.is-visible {
+  display: inline;
 }

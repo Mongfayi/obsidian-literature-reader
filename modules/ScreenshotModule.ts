@@ -270,12 +270,12 @@ class CropEmbed extends Component {
 
     private showStatus(text: string): void {
         this.containerEl.empty();
-        this.containerEl.createEl('div', { text, cls: 'pdf-crop-embed-loading' });
+        this.containerEl.createDiv({ text, cls: 'pdf-crop-embed-loading' });
     }
 
     private showError(): void {
         this.containerEl.empty();
-        this.containerEl.createEl('div', { text: 'PDF 截图加载失败', cls: 'pdf-crop-embed-error' });
+        this.containerEl.createDiv({ text: 'PDF 截图加载失败', cls: 'pdf-crop-embed-error' });
     }
 
     /** 加载 PDF → 渲染整页 → 裁剪目标区域 → 返回 PNG dataURL */
@@ -304,7 +304,7 @@ class CropEmbed extends Component {
     /** 以 2x 缩放渲染整页到离屏 canvas */
     private async renderFullPage(page: any, _pdfjs: any): Promise<HTMLCanvasElement> {
         const viewport = page.getViewport({ scale: 2 });
-        const canvas = document.createElement('canvas');
+        const canvas = createEl('canvas');
         canvas.width = Math.floor(viewport.width);
         canvas.height = Math.floor(viewport.height);
         const ctx = canvas.getContext('2d')!;
@@ -328,7 +328,7 @@ class CropEmbed extends Component {
         const srcWidth = (this.pdfRect[2] - this.pdfRect[0]) * ratioX;
         const srcHeight = (this.pdfRect[3] - this.pdfRect[1]) * ratioY;
 
-        const result = document.createElement('canvas');
+        const result = createEl('canvas');
         result.width = Math.max(1, Math.round(srcWidth));
         result.height = Math.max(1, Math.round(srcHeight));
         const ctx = result.getContext('2d')!;

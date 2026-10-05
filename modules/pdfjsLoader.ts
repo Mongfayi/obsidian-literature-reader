@@ -39,23 +39,24 @@ function resolvePluginDir(pluginDir?: string | null): string {
  */
 export function loadFallbackPdfjs(
   pluginDirName: string,
-  adapter: Pick<DataAdapter, 'getResourcePath'>
+  adapter: Pick<DataAdapter, 'getResourcePath'>,
+  configDir = '.obsidian'
 ): Promise<PdfjsLib> {
   if (fallbackPdfjsPromise)
     return fallbackPdfjsPromise;
 
-  const base = `.obsidian/plugins/${resolvePluginDir(pluginDirName)}`;
+  // 配置目录名可被用户改写（vault.configDir），不能硬编码 .obsidian
+  const base = `${configDir}/plugins/${resolvePluginDir(pluginDirName)}`;
   const libUrl = adapter.getResourcePath(`${base}/pdfjs-fallback.mjs`);
   const workerUrl = adapter.getResourcePath(`${base}/pdf.worker.min.mjs`);
 
   fallbackPdfjsPromise = (async () => {
     await new Promise<void>((resolve, reject) => {
-      const script = document.createElement('script');
+      const script = document.head.createEl('script');
       script.type = 'module';
       script.src = libUrl;
       script.onload = () => resolve();
       script.onerror = () => reject(new Error(`加载 pdfjs-fallback.mjs 失败: ${libUrl}`));
-      document.head.appendChild(script);
     });
     const lib = window.__pdfReaderFallbackLib;
     if (!lib?.getDocument) {
@@ -89,6 +90,7 @@ export async function loadPdfjsLib(plugin: Plugin): Promise<PdfjsLib> {
     return appPdfjs;
   return loadFallbackPdfjs(
     resolvePluginDir(plugin.manifest.dir),
-    plugin.app.vault.adapter
+    plugin.app.vault.adapter,
+    plugin.app.vault.configDir
   );
 }

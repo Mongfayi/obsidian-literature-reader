@@ -174,7 +174,7 @@ export abstract class BaseCropModeModule implements PluginModule {
                 this.cropButtons.delete(leaf);
             }
 
-            const btn = document.createElement('div');
+            const btn = createDiv();
             btn.addClass('clickable-icon');
             btn.addClass(this.buttonClass);
             setIcon(btn, this.buttonIcon);

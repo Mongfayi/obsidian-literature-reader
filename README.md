@@ -2,7 +2,7 @@
 
 一个面向文献阅读的 Obsidian 桌面端插件：PDF 一键阅读、批注到笔记、关键词自动提取、批注持久高亮、截图 OCR 批注，并集成 DeepSeek 浮动窗口/标签页。
 
-> 插件 ID：`pdf-reader` · 仅桌面端（依赖 Electron / PDF.js）
+> 插件 ID：`pdf-reader` · 仅桌面端（依赖 Electron / PDF.js）· 需要 **Obsidian 1.12.7** 或更高版本
 
 ## 功能特性
 
@@ -83,6 +83,24 @@ npm run build   # 产出 main.js，并自动复制 cmaps/
 
 ## 安全说明
 
+### 网络访问（须知的联网行为）
+
+本插件的**核心阅读、批注、高亮、标签功能完全离线**，不发起任何网络请求。只有下面两条功能会联网，且都需要你主动触发：
+
+| 功能 | 目标服务 | 何时发起 | 发送了什么 |
+|------|----------|----------|------------|
+| DeepSeek 窗口 / 标签页 | `https://chat.deepseek.com`（可在设置里改成你的自建地址） | 只有在你点击左侧栏机器人图标或执行「打开 DeepSeek」命令后，才创建 `webview` 并加载该网页 | 与在浏览器里打开该网页完全相同：你的聊天内容与登录态由 DeepSeek 处理。点「加载文件」时才把**当前 PDF / 笔记内容**上传到聊天框 |
+| 截图 OCR 批注 | 你在设置里填的 LM Studio 地址（默认 `http://127.0.0.1:1234`，本机回环地址） | 只有在你点击工具条「截图 OCR 批注」并完成框选后 | 框选区域的 PNG 截图，以及设置里的提示词 |
+
+- 插件**不含任何遥测 / 埋点**，不会统计、上报或回传你的 vault 内容、文件名或使用行为。
+- 除上述两项外，插件不会读取 vault 之外的任何文件，也不会自行下载或执行远程代码。
+
+### 其他
+
+- **系统要求**：Obsidian **1.12.7+**、桌面端。`manifest.json` 已声明 `minAppVersion: "1.12.7"` 与 `isDesktopOnly: true`；低于该版本的 Obsidian 不会加载本插件。
+  - 之所以要求 1.12.7 而不是更低：插件使用了 `Workspace.revealLeaf`（1.7.2+）、`Node.instanceOf`（跨窗口安全判断）、`Vault.configDir`（支持自定义配置目录）等 API，并已按 1.12 系列的 API 面做过完整性核对。
+  - 插件的设置面板使用命令式 `PluginSettingTab.display()`。Obsidian **1.13.0** 起新增了声明式设置 API（`getSettingDefinitions()`），能让设置项出现在设置页搜索里；本插件为保持对 1.12 系列的兼容暂未采用，因此在 1.13+ 上按设置名搜索不会命中本插件。
+- **PDF 阅读、批注、高亮、标签等核心功能完全离线**，不依赖任何网络服务。
 - **OCR API Key 以明文存储**：LM Studio API Key 保存在插件目录的 `data.json`（即 vault 的 `.obsidian/plugins/pdf-reader/data.json`）中，Obsidian 插件 API 不提供加密存储。
 - 如果你的 vault 通过 iCloud / OneDrive / Syncthing / git 等同步，密钥会随之传播。建议：不使用 LM Studio 鉴权时留空该字段；使用鉴权时定期在 LM Studio 中轮换密钥，并考虑在同步配置中排除 `.obsidian/plugins/pdf-reader/data.json`（排除后需在本机重新填写一次）。
 - 插件依赖 Electron 专有 `webview` 标签与部分 Obsidian 内部 API，**仅支持桌面端**（`manifest.json` 已声明 `isDesktopOnly: true`）。
@@ -90,9 +108,23 @@ npm run build   # 产出 main.js，并自动复制 cmaps/
 ## 技术说明
 
 - 基于 [PDF.js](https://github.com/mozilla/pdf.js)（pdfjs-dist，Apache-2.0）、[pdf-lib](https://github.com/Hopding/pdf-lib)（MIT）、[fflate](https://github.com/101arrowz/fflate)（MIT）
-- `main.js` 由 esbuild 打包，PDF.js worker 内联；`cmaps/` 在构建时从 `node_modules/pdfjs-dist/cmaps` 自动复制
+- `main.js` 由 esbuild 打包，PDF.js worker（`pdf.worker.min.mjs`）与回退库（`pdfjs-fallback.mjs`）作为独立文件按需加载；`cmaps/` 在构建时从 `node_modules/pdfjs-dist/cmaps` 自动复制
 
 ## 更新记录
+
+### 2.6.0
+
+- 变更：**最低支持版本提升到 Obsidian 1.12.7**（`minAppVersion`），不再兼容更早版本；`versions.json` 同步新增 `2.6.0 → 1.12.7` 映射。
+- 合规：按 Obsidian 官方规范（`obsidian-sample-plugin` + 官方 `eslint-plugin-obsidianmd`）做了一轮完整检查与修复，详见 [COMPLIANCE-REPORT.md](COMPLIANCE-REPORT.md)。主要修复：
+  - 修复 `SettingsTab` 覆写了不存在的钩子 `onClose()`（`PluginSettingTab` 的真实钩子是 `hide()`），导致「关闭设置页时冲刷未落盘的防抖保存」从未执行、最后 500ms 的改动会静默丢失。
+  - 修复 `minAppVersion` 声明低于代码实际所需（`Workspace.revealLeaf` 需 1.7.2）。
+  - 7 处已废弃的 `workspace.activeLeaf` 全部改用 `getActiveViewOfType()` / `getMostRecentLeaf()`。
+  - 「缩短批注链接」命令改写当前笔记改用 Editor API（`editorCheckCallback` + `editor.setValue()`），不再用 `vault.modify`，从而保住光标、撤销栈与折叠状态。
+  - 设置面板 6 处裸 `<h2>` 改为官方 `new Setting(el).setName(…).setHeading()`。
+  - 浮动批注按钮的 18 项内联样式下沉到 `styles.css`（原类名在 CSS 中没有任何规则，主题无法覆盖），交互态改用类切换。
+  - 修复写死的 `.obsidian` 路径，改用 `vault.configDir`（自定义配置目录名时不再失效）。
+  - 去掉 `innerHTML`、5 处 `console.log`；`document.createElement` 改用 `createDiv`/`createSpan`/`createEl`；`instanceof` 改用跨窗口安全的 `node.instanceOf()`。
+  - README 补上「网络访问」披露（DeepSeek 网页与 LM Studio 两个联网点、触发时机、发送内容，并声明无遥测）。
 
 - 新增：**右键 Markdown 也能「开始阅读」：左边读文献，右边记笔记**。此前只有 PDF 有该菜单项。现在右键一篇待读的 md（例如 `reference/GWAS中文版/` 下的章节原文）→「开始阅读」会在右边按命名模板建/复用 `{md名} 阅读.md`（frontmatter 写 `source:` 指向这篇 md），左边打开这篇 md 本身，并把该 md 标记为「正在阅读的文献」，选中文字即可批注进右侧笔记；再次右键同一篇 md 会复用已有笔记，不重复创建。
 - 补充规则：**已经是阅读笔记的 md**（位于阅读笔记文件夹内，或名字就叫「… 阅读」）不会被再套一层「阅读」，右键它打开的是它对应的文献 + 这篇笔记本身。判据不是「有没有 pdf 字段」——精读版章节原文也带 pdf 字段，但它们是文献不是笔记。
