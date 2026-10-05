@@ -32,15 +32,38 @@
 
 ### 手动安装
 
-1. 下载`main.js`、`manifest.json`、`styles.css`（及 `cmaps/` 目录，仓库内已附带）
-2. 放入 vault 的 `.obsidian/plugins/pdf-reader/` 目录
-3. 重启 Obsidian，在「设置 → 第三方插件」中启用「文献阅读助手」
+从 [Releases 页面](https://github.com/Mongfayi/obsidian-literature-reader/releases) 下载以下文件，全部放入 vault 的 `.obsidian/plugins/pdf-reader/` 目录：
+
+| 文件 | 是否必需 | 说明 |
+|------|----------|------|
+| `main.js` | 必需 | 插件主体 |
+| `manifest.json` | 必需 | 插件清单 |
+| `styles.css` | 必需 | 样式（主题可覆盖） |
+| `pdf-reader-<版本>-cmaps.zip` | 中文 PDF 必需 | CMap 字符映射表，**解压到该目录下形成 `cmaps/` 子目录** |
+| `pdf.worker.min.mjs` | 建议 | PDF.js worker；缺失时自动回退到内置副本 |
+| `pdfjs-fallback.mjs` | 建议 | 回退用 PDF.js 库；缺失时自动回退到 Obsidian 自带 pdf.js |
+
+目录结构应形如：
+
+```
+.obsidian/plugins/pdf-reader/
+├── main.js
+├── manifest.json
+├── styles.css
+├── pdf.worker.min.mjs
+├── pdfjs-fallback.mjs
+└── cmaps/            ← 由 cmaps.zip 解压而来，共 169 个 .bcmap
+```
+
+重启 Obsidian，在「设置 → 第三方插件」中启用「文献阅读助手」。
+
+> **为什么 cmaps 单独打包？** CMap 是中日韩等 CID 字体的字符映射表。缺少它时，中文 PDF 的**文本提取**（关键词提取、批注定位）会失败或乱码。它一共 169 个文件，逐一下载不现实，因此打包为单个 zip（约 0.95 MB）。仓库内已附带该目录，直接从仓库克隆的使用者无需再解压。
 
 ### 从源码构建
 
 ```bash
 npm install
-npm run build   # 产出 main.js，并自动复制 cmaps/
+npm run build   # 产出 main.js，并自动从 node_modules/pdfjs-dist/cmaps 复制 cmaps/
 ```
 
 ## 使用
