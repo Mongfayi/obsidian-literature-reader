@@ -77,6 +77,7 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
 
         const newIndex = new Map<number, Set<SelectionId>>();
         const app = this.ctx.plugin.app;
+        let readFailed = false;
 
         for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
             if (!links[pdfPath]) continue;
@@ -87,10 +88,14 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
                 const content = await this.readNoteContent(sourceFile);
                 this.extractLinksFromContent(content, pdfFile, sourcePath, newIndex);
             } catch (e) {
+                readFailed = true;
                 console.warn('[PdfHighlight] 读取笔记失败:', sourcePath, e);
             }
         }
 
+        // 任何一篇笔记读取失败时保留上次成功扫描的索引：用残缺结果覆盖会把
+        // 已显示的高亮整篇抹掉（删除路径见 renderPageHighlights），待下次重建修正
+        if (readFailed && this.indexCache.has(pdfPath)) return;
         this.indexCache.set(pdfPath, newIndex);
     }
 
@@ -128,6 +133,11 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
         const index = this.indexCache.get(pdfPath);
         const selections = index?.get(pageNumber);
 
+        // 索引未建成（PDF 刚打开/重建防抖或扫描仍在进行，如 pdf-search 跳页触发
+        // 的提前渲染）：无选区是瞬态而非权威，保留已有高亮层，重建完成后
+        // renderForPdf 会按新索引重放，避免高亮被误删后永不恢复
+        if (!index) return;
+
         const textLayerBuilder = pageView.textLayer;
         const textLayer = textLayerBuilder?.textLayer;
         const textDivs: HTMLElement[] = textLayer?.textDivs ?? [];
@@ -136,7 +146,7 @@ export class PdfHighlightModule extends BasePdfHighlightModule<PdfHighlightIndex
         // 等待 textlayerrendered 事件就绪后重放，避免在中间态误删已放置的高亮
         if (!textLayer || textDivs.length === 0) return;
 
-        // 无选区：权威索引为空（笔记中已无该页批注）→ 删除旧高亮层
+        // 无选区：权威索引存在且该页无批注 → 删除旧高亮层
         if (!selections || selections.size === 0) {
             pageView.div.querySelector('.pdf-reader-highlight-layer')?.remove();
             return;

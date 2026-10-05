@@ -49,28 +49,30 @@
   animation: pdf-reader-jump-flash 1.2s ease-out 2;
 }
 
-/* 笔记编辑器内跳转定位的高亮提醒：不把光标移入链接，避免 Live Preview 展开 */
+/* 笔记内跳转定位的高亮提醒：编辑模式（Obsidian addHighlights mark）与阅读模式（链接 class）
+   共用同一套样式，保证各模式效果一致；不把光标移入链接，避免 Live Preview 展开；
+   紫色半透明底 + 描边圆角，1s 淡出——只淡出底色与描边（不动画 opacity），链接文字全程可见；
+   用 box-shadow 描边而非 border，避免行内元素布局抖动 */
 @keyframes pdf-reader-note-flash {
-  0% {
-    opacity: 1;
-    background-color: rgba(124, 108, 240, 0.28);
-    box-shadow: 0 0 0 2px rgba(124, 108, 240, 0.35);
+  from {
+    background-color: rgba(124, 108, 240, 0.4);
+    box-shadow: 0 0 0 2px rgba(124, 108, 240, 0.65);
   }
-  100% {
-    opacity: 0;
-    background-color: transparent;
-    box-shadow: none;
+  to {
+    background-color: rgba(124, 108, 240, 0);
+    box-shadow: 0 0 0 2px rgba(124, 108, 240, 0);
   }
 }
-.pdf-reader-note-overlay {
-  position: absolute;
-  pointer-events: none;
-  z-index: 9999;
-  background-color: rgba(124, 108, 240, 0.22);
-  border: 2px solid rgba(124, 108, 240, 0.55);
+/* 两个跳转方向各用一个 class，视觉共用同一套动画，但名字必须不同：
+   Obsidian 原生的 `Editor.addHighlights/removeHighlights(className)` 是按 class 维护
+   **整份**装饰的，同名时一边的清理会连带抹掉另一边正在播放的闪烁
+   （点 PDF 高亮闪笔记 callout 的同时点了「定位」链接闪来源 == 就会互相打断）。
+   .pdf-reader-note-flash-mark —— PdfJumpModule：PDF 高亮 → 笔记批注
+   .pdfreader-md-note-flash-mark —— MarkdownReadingModule：「定位」链接 → 来源 == 高亮 */
+.pdf-reader-note-flash-mark,
+.pdfreader-md-note-flash-mark {
   border-radius: 4px;
-  box-sizing: border-box;
-  animation: pdf-reader-note-flash 2s ease-out 1;
+  animation: pdf-reader-note-flash 1s ease-out 1;
   animation-fill-mode: forwards;
 }
 
@@ -83,6 +85,7 @@
   right: 24px;
   width: 420px;
   height: 740px;
+  /* 无对话框时保持最高层级：压过 PDF 批注/OCR 高亮层等页面元素 */
   z-index: 99999;
   display: none;
   flex-direction: column;
@@ -92,6 +95,13 @@
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
   overflow: hidden;
   animation: deepseek-float-in 0.2s ease-out;
+}
+
+/* 有模态对话框（设置窗口、插件弹窗等）打开时，浮窗降到 Obsidian 模态层
+   （--layer-modal: 50）之下，保证对话框始终在最前；对话框关闭后恢复 99999。
+   模态容器由 Obsidian 直接挂在 body 下，故用直接子代 :has()，避免全文档失效重算。 */
+body:has(> .modal-container) .deepseek-float-container {
+  z-index: 40;
 }
 
 @keyframes deepseek-float-in {
@@ -255,6 +265,25 @@
 }
 
 
+/* ---------- DeepSeek 标签页 ---------- */
+
+.deepseek-tab-view {
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
+
+.deepseek-tab-webview {
+  width: 100%;
+  height: 100%;
+}
+
+.deepseek-tab-webview webview {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
 /* ---------- 截图批注 ---------- */
 
 /* 截图模式：crosshair 光标，禁止文本选中（不遮滚动条、不拦截滚轮） */
@@ -318,27 +347,232 @@
   background-color: var(--background-modifier-active-hover);
 }
 
-/* 工具条「主文献」按钮激活态（已设为主文献时高亮） */
-.pdfreader-main-article-button.is-active {
-  color: var(--interactive-accent);
-  background-color: var(--background-modifier-active-hover);
+/* 识别/写入进行中：按钮置灰并禁用指针事件，避免连框并发发起 OCR */
+.ocr-toolbar-button.is-disabled,
+.pdfreader-screenshot-button.is-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+  cursor: default;
 }
 
 /* ---------- 批注原文附带模式（测试功能，以后可能删除） ---------- */
 
-/* 工具条「附带原文」按钮：图标 + 文字标签；开启（附带原文）时高亮 */
+/* 工具条「附带原文」按钮：仅图标，靠 tooltip 说明状态；开启（附带原文）时高亮 */
 .pdfreader-annotation-mode-button {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 6px;
-  font-size: 12px;
-  white-space: nowrap;
 }
 
 .pdfreader-annotation-mode-button.is-active {
   color: var(--interactive-accent);
   background-color: var(--background-modifier-active-hover);
+}
+
+/* ---------- 快速添加标签 ---------- */
+
+/* 工具条「标签」按钮：仅图标，与「附带原文」按钮风格一致 */
+.pdfreader-quick-tag-button {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* 标签选择器条目：第一行标签名，第二行凡例说明 */
+.pdfreader-quick-tag-suggestion {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pdfreader-quick-tag-name {
+  font-weight: 600;
+}
+
+.pdfreader-quick-tag-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.3;
+}
+
+/* ---------- 标签管理（设置面板） ---------- */
+
+.pdfreader-tag-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.pdfreader-tag-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pdfreader-tag-hash {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.pdfreader-tag-name {
+  flex: 0 0 30%;
+  min-width: 100px;
+  font-weight: 600;
+}
+
+.pdfreader-tag-desc {
+  flex: 1 1 auto;
+  min-width: 120px;
+}
+
+.pdfreader-tag-row-buttons {
+  display: flex;
+  gap: 2px;
+}
+
+.pdfreader-tag-icon-btn {
+  padding: 2px 8px;
+  line-height: 1.4;
+}
+
+.pdfreader-tag-icon-btn.is-danger:hover {
+  color: var(--text-error);
+}
+
+.pdfreader-tag-add {
+  margin-bottom: 6px;
+}
+
+.pdfreader-tag-hint {
+  margin: 4px 0 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pdfreader-tag-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.pdfreader-tag-synced {
+  color: var(--text-muted);
+}
+
+.pdfreader-tag-changes {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+}
+
+.pdfreader-tag-changes h4 {
+  margin: 0 0 8px;
+}
+
+.pdfreader-tag-change-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pdfreader-tag-change-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pdfreader-tag-change-row.is-info {
+  color: var(--text-muted);
+  padding-left: 24px;
+  font-size: 13px;
+}
+
+.pdfreader-tag-change-text {
+  font-weight: 600;
+}
+
+.pdfreader-tag-change-warn {
+  font-size: 12px;
+  color: var(--text-warning, #d08b00);
+}
+
+/* ---------- 标签同步确认框 ---------- */
+
+.pdfreader-tag-preview-list {
+  max-height: 45vh;
+  overflow-y: auto;
+  margin: 10px 0;
+}
+
+.pdfreader-tag-preview-file {
+  margin-bottom: 12px;
+}
+
+.pdfreader-tag-preview-path {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.pdfreader-tag-preview-row {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 2px 8px;
+  padding: 3px 0 3px 12px;
+  border-left: 2px solid var(--background-modifier-border);
+}
+
+.pdfreader-tag-preview-line {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.pdfreader-tag-preview-diff {
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* 只把真正变化的标签片段标出来，行内其余文字保持普通样式 */
+.pdfreader-tag-preview-removed {
+  color: var(--text-error);
+  text-decoration: line-through;
+}
+
+.pdfreader-tag-preview-arrow {
+  color: var(--text-muted);
+  padding: 0 6px;
+}
+
+.pdfreader-tag-preview-added {
+  color: var(--text-success, #2e7d32);
+  font-weight: 600;
+}
+
+.pdfreader-tag-preview-more {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding-left: 12px;
+}
+
+.pdfreader-tag-typing-hint {
+  color: var(--text-warning, #d08b00);
+}
+
+.pdfreader-tag-typing-input {
+  width: 100%;
+}
+
+.pdfreader-tag-modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.pdfreader-tag-modal-buttons button.is-disabled {
+  opacity: 0.5;
 }
 
 /* 截图模式：crosshair 光标，禁止文本选中（不遮滚动条、不拦截滚轮） */
@@ -421,17 +655,26 @@
 
 /* ---------- 文件管理器：已有阅读笔记的 PDF 标记 ---------- */
 
+/* 图标悬挂在标题左侧留白中：占位盒宽度为 0（负 margin 挂出 + 等宽回补），
+   标题位置不受影响，所有行保持左对齐；svg 必须绝对定位脱离文档流，
+   否则其内容尺寸会泄漏进 flex 行布局，重新把标题推右 */
 .pdf-reader-has-note .pdf-reader-has-note-marker {
   display: inline-flex;
-  align-items: center;
-  margin-right: 4px;
-  margin-left: 0;
+  position: relative;
+  width: 0;
+  min-width: 0;
+  overflow: visible;
+  margin-left: -18px;
+  margin-right: 18px;
   flex-shrink: 0;
   color: var(--interactive-accent);
   opacity: 0.85;
 }
 
 .pdf-reader-has-note .pdf-reader-has-note-marker svg {
+  position: absolute;
+  left: 0;
+  bottom: -2px; /* 贴基线会偏高：中文墨迹延伸到基线下方，下移 2px 与文字视觉居中 */
   width: 14px;
   height: 14px;
 }
@@ -478,4 +721,69 @@
 .callout[data-callout="pdf-annotation"] .pdf-crop-embed + p:empty,
 .callout[data-callout="pdf-annotation"] p:has(.pdf-crop-embed) + p:empty {
   display: none;
+}
+
+/* ============================================================
+ * Markdown 批注：编辑器顶部工具栏 + 选区右上角浮动按钮
+ * ============================================================ */
+
+/* Live Preview 就地编辑表格单元格时，Obsidian 会在 <td> 里创建嵌套编辑器（.table-cell-wrapper）；
+   工具栏属于整个笔记，不应出现在单元格里，这里做 CSS 兜底（JS 侧已不生成按钮）。
+
+   用 :has() 收窄到「装有本插件工具栏」的外壳：这条规则以前是无条件命中所有 .cm-panels 的，
+   会连带隐藏**其它插件**注入到表格单元格里的 CM6 面板。 */
+.table-cell-wrapper .cm-panels:has(> .pdfreader-md-toolbar) {
+  display: none;
+}
+
+.pdfreader-md-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-1);
+  box-sizing: border-box;
+  padding: var(--size-4-1) var(--size-4-3);
+  border-bottom: 1px solid var(--background-modifier-border);
+  /* 与 Obsidian PDF 工具条（.pdf-toolbar）保持一致 */
+  background-color: var(--background-primary);
+  font-size: var(--font-ui-small);
+}
+
+/* 按钮主体复用 Obsidian 的 .clickable-icon，与 PDF 工具条按钮同尺寸、同悬停/激活反馈 */
+.pdfreader-md-toolbar-btn.is-active {
+  color: var(--interactive-accent);
+  background-color: var(--background-modifier-active-hover);
+}
+
+.pdfreader-md-toolbar-target {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pdfreader-md-toolbar-target.is-empty {
+  opacity: 0.7;
+}
+
+.pdfreader-md-annotate-floating-btn {
+  position: fixed;
+  z-index: 9999;
+  display: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  user-select: none;
+  -webkit-user-select: none;
+  white-space: nowrap;
+}
+
+.pdfreader-md-annotate-floating-btn.is-visible {
+  display: block;
 }

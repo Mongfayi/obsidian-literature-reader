@@ -42,3 +42,22 @@ export function buildNoteBaseRegex(template: string): RegExp {
 function escapeRegExp(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+/**
+ * 清洗「批注链接别名」使其可以安全地放进 wikilink 的别名位置。
+ *
+ * 该别名会被拼进 `[[路径#锚点|别名]]`（见 PdfReaderModule 的多处写入），
+ * 因此 Obsidian 语法里有特殊含义的字符必须去掉，否则会破坏生成的链接：
+ *  - `|`  → 别名提前结束，后半截被当成正文
+ *  - `]`  → 提前闭合 `]]`，链接目标被截断
+ *  - `[`  → 可能开启嵌套链接
+ *  - 换行/回车 → callout 与链接被拆行
+ * 返回清洗结果；全部被清掉时调用方应回退到默认别名。
+ */
+export function sanitizeLinkAlias(label: string): string {
+    return (label ?? '')
+        .replace(/[\r\n\u2028\u2029]/g, ' ')
+        .replace(/[[\]|]/g, '')
+        .trim();
+}
+

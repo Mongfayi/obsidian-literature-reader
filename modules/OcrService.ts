@@ -192,10 +192,18 @@ export class OcrService {
     }
 }
 
-/** 是否属于可重试的 HTTP 4xx 客户端错误（模板/内容顺序类问题，换顺序后重试可能成功） */
+/**
+ * 是否属于可重试的 HTTP 错误。
+ *
+ * 只重试 400 / 422 —— 这两类多是模型对「内容顺序/模板」的拒绝，交换 image/text
+ * 顺序通常可解决。404（模型不存在）、401（Key 错）、429（限流）重试毫无帮助，
+ * 只会让用户白等一轮并拿到不指向根因的错误信息。
+ */
 function isRetryableHttpError(err: unknown): boolean {
-    const msg = (err as Error).message ?? '';
-    return msg.startsWith('HTTP 4');
+    const m = /^HTTP (\d{3})/.exec((err as Error).message ?? '');
+    if (!m) return false;
+    const status = Number(m[1]);
+    return status === 400 || status === 422;
 }
 
 /** 清洗 OCR 文本：去掉 HTML 标签、markdown 装饰、幻觉噪音，保留真实文字内容 */

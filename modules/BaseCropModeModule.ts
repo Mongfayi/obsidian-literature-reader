@@ -39,6 +39,11 @@ export abstract class BaseCropModeModule implements PluginModule {
     private toolbarLeaves = new Set<WorkspaceLeaf>();
     /** 各叶子工具条按钮（激活态高亮用） */
     private cropButtons = new Map<WorkspaceLeaf, HTMLElement>();
+    /**
+     * 忙碌标志：识别/写入进行中时禁止再次进入截图模式，并禁用工具条按钮。
+     * 由子类用 setBusy() 置位（如 OCR 识别期间）。
+     */
+    private busy = false;
     /** 轮询任务移除函数（卸载时注销共享轮询） */
     private removePollTask: (() => void) | null = null;
     /** 截图模式激活的视图容器（非 null = 截图模式中） */
@@ -66,6 +71,8 @@ export abstract class BaseCropModeModule implements PluginModule {
     protected abstract readonly buttonIcon: string;
     /** 工具条按钮 tooltip */
     protected abstract readonly buttonTooltip: string;
+    /** 忙碌期间再次进入截图模式时的提示（子类可覆写） */
+    protected readonly busyNotice: string = '正在处理上一次框选，请稍候再试';
     /** 命令 ID */
     protected abstract readonly commandId: string;
     /** 命令名称 */
@@ -94,7 +101,13 @@ export abstract class BaseCropModeModule implements PluginModule {
             id: this.commandId,
             name: this.commandName,
             checkCallback: (checking) => {
-                const leaf = plugin.app.workspace.getLeavesOfType('pdf')[0];
+                // 优先最近活动的 PDF 叶子：固定取 leaves[0] 会在多 PDF 时
+                // 「武装在不可见的 A 上，却在正看着的 B 上框选」
+                const ws = plugin.app.workspace;
+                const recent = ws.getMostRecentLeaf();
+                const leaf = recent && recent.view.getViewType() === 'pdf'
+                    ? recent
+                    : ws.getLeavesOfType('pdf')[0];
                 if (!leaf) return false;
                 if (!checking) this.startCropMode(leaf);
                 return true;
@@ -168,6 +181,7 @@ export abstract class BaseCropModeModule implements PluginModule {
             setTooltip(btn, this.buttonTooltip);
             btn.addEventListener('click', (evt: MouseEvent) => {
                 evt.stopPropagation();
+                if (this.busy) return;   // startCropMode 内也有拦截，这里避免无谓的缓存重指
                 // 确保缓存指向当前可见按钮（多标签页场景下 map 可能指到隐藏标签页）
                 this.cropButtons.set(leaf, btn);
                 this.startCropMode(leaf);
@@ -178,7 +192,11 @@ export abstract class BaseCropModeModule implements PluginModule {
 
             this.toolbarLeaves.add(leaf);
             this.cropButtons.set(leaf, btn);
-            // 工具条可能被 Obsidian 重建：若该叶子正处于截图模式，恢复激活态
+            // 工具条可能被 Obsidian 重建：恢复忙碌态与激活态
+            if (this.busy) {
+                btn.toggleClass('is-disabled', true);
+                btn.setAttribute('aria-disabled', 'true');
+            }
             if (this.cropLeaf === leaf && this.cropRoot) {
                 btn.addClass('is-active');
             }
@@ -187,8 +205,32 @@ export abstract class BaseCropModeModule implements PluginModule {
 
     // ========== 截图模式 ==========
 
+    /**
+     * 置位/清除忙碌态：忙碌时禁用所有工具条按钮并拒绝再次进入截图模式。
+     * 必须在 finally 中清除，否则按钮会永久禁用。
+     */
+    protected setBusy(busy: boolean): void {
+        this.busy = busy;
+        for (const btn of this.cropButtons.values()) {
+            btn.toggleClass('is-disabled', busy);
+            btn.setAttribute('aria-disabled', busy ? 'true' : 'false');
+        }
+        // 忙碌期间主动退出截图模式，视觉上与「不可点击」一致
+        if (busy) this.cancelCropMode();
+    }
+
+    /** 当前是否处于忙碌态（子类可查询） */
+    protected get isBusy(): boolean {
+        return this.busy;
+    }
+
     /** 进入/退出截图模式：不遮挡视图，在页面上拖拽框选，可随时滚动页面 */
     protected startCropMode(leaf: WorkspaceLeaf): void {
+        // 上一次识别/写入尚未结束：直接拒绝，避免并发请求与并发写入同一光标位置
+        if (this.busy) {
+            new Notice(this.busyNotice);
+            return;
+        }
         // 已处于截图模式：同一视图 → 取消；另一视图 → 切换过去
         if (this.cropRoot) {
             if (this.cropLeaf === leaf) {
@@ -224,6 +266,10 @@ export abstract class BaseCropModeModule implements PluginModule {
             const target = e.target as HTMLElement;
             const pageEl = target.closest?.('[data-page-number]') as HTMLElement | null;
             if (!pageEl || !pageEl.isConnected) return;
+            // 必须校验页面归属本次进入截图模式的视图：pointerdown 挂在 window 上，
+            // 不校验归属就会在另一个 PDF 视图里框选时，把对方的页面/页码/坐标
+            // 错配到 this.cropLeaf（= 本视图）上，静默写出指向错误 PDF 的批注
+            if (!this.cropRoot || !this.cropRoot.contains(pageEl)) return;
             e.preventDefault();
             this.startDrag(win, e, pageEl);
         };
