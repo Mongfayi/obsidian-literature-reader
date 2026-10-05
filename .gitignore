@@ -10,3 +10,8 @@ tag-sync-backup.json
 .tmp-bugcheck/
 .zcode/
 .zcodeignore
+# 发布用打包产物（cmaps 已随仓库附在 cmaps/ 目录内）
+pdf-reader-*-cmaps.zip
+# ESLint 本地缓存
+.npm-cache/
+.eslintcache
