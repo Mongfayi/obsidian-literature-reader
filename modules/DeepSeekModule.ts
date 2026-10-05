@@ -57,6 +57,8 @@ export class DeepSeekModule implements PluginModule {
     unload(): void {
         this.floatingWindow?.destroy();
         this.floatingWindow = null;
+        // 自定义视图必须在卸载时摘除：视图类型随 registerView 一起失效，
+        // 留下的标签页下次启动会因类型未注册而无法还原（官方 Workspace.detachLeavesOfType）
         this.ctx.plugin.app.workspace.detachLeavesOfType(DEEPSEEK_TAB_VIEW_TYPE);
     }
 
@@ -98,9 +100,10 @@ export class DeepSeekModule implements PluginModule {
      * 否则使用浮动窗口（懒创建并显示）。
      */
     private async addCurrentFileToChat(): Promise<void> {
-        const activeLeaf = this.ctx.plugin.app.workspace.activeLeaf;
-        if (activeLeaf?.view instanceof DeepSeekTabView) {
-            await activeLeaf.view.addCurrentFileToChat();
+        // activeLeaf 已被官方标记为 deprecated，改用 getActiveViewOfType
+        const activeTab = this.ctx.plugin.app.workspace.getActiveViewOfType(DeepSeekTabView);
+        if (activeTab) {
+            await activeTab.addCurrentFileToChat();
             return;
         }
         const tab = this.getTabView();
@@ -373,7 +376,7 @@ class DeepSeekFloatingWindow {
         const titleBar = container.createDiv({ cls: 'deepseek-float-titlebar' });
 
         const titleLeft = titleBar.createDiv({ cls: 'deepseek-float-title-left' });
-        titleLeft.innerHTML = '<span>DeepSeek</span>';
+        titleLeft.createSpan({ text: 'DeepSeek' });
 
         // 右侧按钮容器：上传文件 + 最小化
         const titleRight = titleBar.createDiv({ cls: 'deepseek-float-title-right' });
@@ -419,9 +422,8 @@ class DeepSeekFloatingWindow {
             const rect = container.getBoundingClientRect();
             this.dragOffset.x = e.clientX - rect.left;
             this.dragOffset.y = e.clientY - rect.top;
-            container.style.cursor = 'grabbing';
-            container.style.transition = 'none';
-            content.style.pointerEvents = 'none';
+            // 交互态交给 CSS 类（.is-dragging），不写内联样式
+            container.addClass('is-dragging');
         });
 
         const onMouseMove = (e: MouseEvent) => {
@@ -434,9 +436,7 @@ class DeepSeekFloatingWindow {
         const onMouseUp = () => {
             if (this.isDragging) {
                 this.isDragging = false;
-                container.style.cursor = '';
-                container.style.transition = '';
-                content.style.pointerEvents = '';
+                container.removeClass('is-dragging');
                 // 拖拽结束：持久化窗口位置（含大小），重启后恢复
                 this.persistGeometry();
             }
@@ -498,7 +498,7 @@ class DeepSeekFloatingWindow {
         this.refreshWebviewIfUrlChanged();
         // 先恢复显示，否则 display:none 下 getBoundingClientRect 恒为 0，
         // 会误判为「已拖出视口」而清空上次拖拽位置（导致隐藏后再显示位置丢失）
-        this.container.style.display = 'flex';
+        this.container.addClass('is-visible');
         // 若面板已被完全拖出 Obsidian 可视区域，复位到 CSS 默认位置与尺寸，避免无法找回；
         // 同时清除持久化几何，否则下次创建窗口又会回到屏幕外
         const rect = this.container.getBoundingClientRect();
@@ -511,7 +511,7 @@ class DeepSeekFloatingWindow {
 
     hide() {
         if (!this.container) return;
-        this.container.style.display = 'none';
+        this.container.removeClass('is-visible');
         this.isVisible = false;
     }
 
@@ -543,7 +543,7 @@ class DeepSeekFloatingWindow {
         container.style.left = `${geom!.left}px`;
         container.style.top = `${geom!.top}px`;
         // 覆盖 CSS 中的 right 定位（left/right 同时生效会拉伸元素）
-        container.style.right = 'auto';
+        container.addClass('is-left-anchored');
     }
 
     /** 把当前窗口几何写入设置并落盘 */
@@ -581,6 +581,7 @@ class DeepSeekFloatingWindow {
 
     /** 清空全部内联几何样式，回退到 CSS 默认定位与尺寸 */
     private resetGeometryStyles(container: HTMLElement): void {
+        container.removeClass('is-left-anchored');
         container.style.left = '';
         container.style.top = '';
         container.style.right = '';
@@ -608,8 +609,7 @@ class DeepSeekFloatingWindow {
         const startY = e.clientY;
         let resized = false;
 
-        container.style.transition = 'none';
-        content.style.pointerEvents = 'none';
+        container.addClass('is-resizing');
 
         const MIN_W = MIN_WINDOW_WIDTH;
         const MIN_H = MIN_WINDOW_HEIGHT;
@@ -643,7 +643,7 @@ class DeepSeekFloatingWindow {
             container.style.width = `${Math.round(width)}px`;
             container.style.height = `${Math.round(height)}px`;
             // 一旦缩放即转为左上角锚定，覆盖 CSS 的 right 默认定位
-            container.style.right = 'auto';
+            container.addClass('is-left-anchored');
             container.style.left = `${Math.round(left)}px`;
             container.style.top = `${Math.round(top)}px`;
         };
@@ -651,8 +651,7 @@ class DeepSeekFloatingWindow {
         const finish = () => {
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', finish);
-            container.style.transition = '';
-            content.style.pointerEvents = '';
+            container.removeClass('is-resizing');
             this.resizeCleanup = null;
             if (resized) this.persistGeometry();
         };

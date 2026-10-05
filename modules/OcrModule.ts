@@ -235,7 +235,7 @@ export class OcrModule extends BaseCropModeModule {
         // 按屏幕显示尺寸渲染（无 canvas 可参考，取 2x 保证清晰）
         const scale = 2;
         const viewport = page.getViewport({ scale });
-        const canvas = document.createElement('canvas');
+        const canvas = createEl('canvas');
         canvas.width = Math.floor(viewport.width);
         canvas.height = Math.floor(viewport.height);
         const ctx = canvas.getContext('2d');
@@ -305,7 +305,7 @@ function cropCanvasRegion(
         );
     }
 
-    const out = document.createElement('canvas');
+    const out = createEl('canvas');
     out.width = Math.max(1, Math.round(cw * scale));
     out.height = Math.max(1, Math.round(ch * scale));
     const ctx = out.getContext('2d');

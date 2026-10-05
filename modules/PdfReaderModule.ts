@@ -15,6 +15,8 @@ type RectHighlightEntry = { page: number; rect: NormRect };
 
 /** 相邻文本项 Y 坐标差超过该阈值视为换行 */
 const LINE_BREAK_THRESHOLD = 5;
+/** 「PDF名, 页面 N」式冗长批注链接别名（缩短为短标签时匹配） */
+const LONG_PDF_LINK_RE = /\[\[([^\]|]+?\.pdf#[^\]|]*?)\|[^\]|]*?[,，]\s*页面\s*\d+\]\]/g;
 export class PdfReaderModule implements PluginModule {
   private floatingBtn: HTMLElement | null;
   private floatingBadge: HTMLElement | null;
@@ -149,13 +151,14 @@ export class PdfReaderModule implements PluginModule {
     plugin.addCommand({
       id: "shorten-pdf-annotation-links",
       name: `将当前笔记中的 PDF 批注链接显示文字改为「${this.linkLabel}」`,
-      checkCallback: (checking) => {
-        const file = plugin.app.workspace.getActiveFile();
-        if (!file || file.extension !== "md")
+      // 命令改写的是「当前正在编辑的笔记」，因此用 editorCheckCallback + Editor API：
+      // 直接写 vault 会丢掉光标位置、撤销栈与折叠状态（官方指南：活动文件优先用 Editor API）
+      editorCheckCallback: (checking, editor) => {
+        const content = editor.getValue();
+        if (!LONG_PDF_LINK_RE.test(content))
           return false;
-        if (!checking) {
-          void this.shortenPdfAnnotationLinks(file);
-        }
+        if (!checking)
+          this.shortenPdfAnnotationLinksInEditor(editor, content);
         return true;
       }
     });
@@ -200,12 +203,10 @@ export class PdfReaderModule implements PluginModule {
    * 无可用文件时返回 null
    */
   async getCurrentFileForUpload(): Promise<FileUploadData | null> {
-    const activeLeaf = this.ctx.plugin.app.workspace.activeLeaf;
-    if (!activeLeaf)
-      return null;
-    const view = activeLeaf.view;
-    if (view.getViewType() === "pdf") {
-      const pdfFile = (view as FileView).file;
+    // 用 getActiveViewOfType 取当前视图（activeLeaf 已被官方标记为 deprecated）
+    const pdfView = this.ctx.plugin.app.workspace.getActiveViewOfType(FileView);
+    if (pdfView && pdfView.getViewType() === "pdf") {
+      const pdfFile = pdfView.file;
       if (!pdfFile)
         return null;
       try {
@@ -216,11 +217,12 @@ export class PdfReaderModule implements PluginModule {
         return null;
       }
     }
-    if (view instanceof MarkdownView) {
-      const file2 = view.file;
+    const mdView = this.ctx.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+    if (mdView) {
+      const file2 = mdView.file;
       if (!file2)
         return null;
-      const text = view.getMode() === "source" && view.editor ? view.editor.getValue() : await this.ctx.plugin.app.vault.read(file2);
+      const text = mdView.getMode() === "source" && mdView.editor ? mdView.editor.getValue() : await this.ctx.plugin.app.vault.read(file2);
       return {
         data: new TextEncoder().encode(text).buffer,
         name: file2.name,
@@ -246,23 +248,49 @@ export class PdfReaderModule implements PluginModule {
     const label = this.linkLabel;
     try {
       const content = await this.ctx.plugin.app.vault.read(file);
-      // 必须用函数式替换：替换「字符串」里的 $&、$1、$`、$' 会被 String.replace
-      // 当成替换模式展开，别名含 $ 时会把匹配到的整段链接再抄一遍、写坏笔记正文。
-      // 改用函数后 $ 只作普通字符，输出恒等于 [[路径|别名]]。
-      const updated = content.replace(
-        /\[\[([^\]|]+?\.pdf#[^\]|]*?)\|[^\]|]*?[,，]\s*页面\s*\d+\]\]/g,
-        (_match, target: string) => `[[${target}|${label}]]`
-      );
+      const updated = this.replaceLongPdfLinks(content, label);
       if (updated === content) {
         new Notice("当前笔记中没有找到可缩短的 PDF 批注链接");
         return;
       }
-      await this.ctx.plugin.app.vault.modify(file, updated);
+      await this.ctx.plugin.app.vault.process(file, () => updated);
       new Notice(`已将该笔记中的 PDF 批注链接显示文字改为「${label}」`);
     } catch (e) {
       console.error("[PdfReader] 缩短批注链接失败:", e);
       new Notice("缩短批注链接失败");
     }
+  }
+  /**
+   * 把编辑器中的冗长 PDF 批注链接就地改成短标签，走 Editor API 以保留光标/撤销栈。
+   * 命令入口使用（见 addCommand 的 editorCheckCallback）。
+   */
+  shortenPdfAnnotationLinksInEditor(editor: Editor, content: string): void {
+    const label = this.linkLabel;
+    const updated = this.replaceLongPdfLinks(content, label);
+    if (updated === content) {
+      new Notice("当前笔记中没有找到可缩短的 PDF 批注链接");
+      return;
+    }
+    try {
+      editor.setValue(updated);
+      new Notice(`已将该笔记中的 PDF 批注链接显示文字改为「${label}」`);
+    } catch (e) {
+      console.error("[PdfReader] 缩短批注链接失败:", e);
+      new Notice("缩短批注链接失败");
+    }
+  }
+  /**
+   * 批量改写「XXX, 页面 12」式链接别名。
+   *
+   * 必须用函数式替换：替换「字符串」里的 $&、$1、$`、$' 会被 String.replace
+   * 当成替换模式展开，别名含 $ 时会把匹配到的整段链接再抄一遍、写坏笔记正文。
+   * 改用函数后 $ 只作普通字符，输出恒等于 [[路径|别名]]。
+   */
+  private replaceLongPdfLinks(content: string, label: string): string {
+    return content.replace(
+      LONG_PDF_LINK_RE,
+      (_match, target: string) => `[[${target}|${label}]]`
+    );
   }
   // ========== 开始阅读主流程 ==========
   /**
@@ -408,7 +436,7 @@ export class PdfReaderModule implements PluginModule {
   }
   // ========== 阅读笔记创建 ==========
   async createReadingNote(sourceFile: TFile): Promise<TFile | null> {
-    const folderPath = this.ctx.getSettings().readingNoteFolder as string;
+    const folderPath = normalizePath(this.ctx.getSettings().readingNoteFolder as string);
     const folder = this.ctx.plugin.app.vault.getAbstractFileByPath(folderPath);
     if (folder instanceof TFile) {
       new Notice(`阅读笔记文件夹被同名文件占用：${folderPath}`);
@@ -515,11 +543,8 @@ export class PdfReaderModule implements PluginModule {
     const field = this.sourceFieldName(sourceFile);
     try {
       await this.ctx.plugin.app.vault.process(noteFile, (data) => {
-        const fixed = this.replaceSourceField(data, sourceFile.path, field);
-        if (fixed !== data) {
-          console.log(`[PdfReader] 修复笔记 ${noteFile.path} 的 ${field} 字段 \u2192 ${sourceFile.path}`);
-        }
-        return fixed;
+        // 静默修复：这里只做字段归一，不必往控制台输出（官方指南：避免无谓日志）
+        return this.replaceSourceField(data, sourceFile.path, field);
       });
     } catch (e) {
       console.warn("[PdfReader] 修复文献字段失败:", e);
@@ -534,9 +559,7 @@ export class PdfReaderModule implements PluginModule {
     if (sourceFile.extension === "pdf") {
       try {
         const text = await this.extractPdfText(sourceFile);
-        console.log(`[PdfReader] 成功提取PDF文本，总长度: ${text.length} 字符`);
         tags = this.extractKeywords(text);
-        console.log(`[PdfReader] 关键词提取结果: ${tags.length > 0 ? tags.join(", ") : "未找到关键词"}`);
       } catch (e) {
         console.warn("[PdfReader] 提取PDF关键词失败，将生成不带 tags 的笔记:", e);
       }
@@ -589,7 +612,9 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     // DataAdapter.getBasePath 是桌面端专有方法（Obsidian 类型未公开），仅桌面端使用
     const vaultPath = (this.ctx.plugin.app.vault.adapter as any).getBasePath();
     const pluginDir = (this.ctx.plugin.manifest.dir ?? "pdf-reader").split("/").pop() ?? "pdf-reader";
-    const cMapBaseUrl = "file:///" + vaultPath.replace(/\\/g, "/") + "/.obsidian/plugins/" + pluginDir + "/cmaps/";
+    // 配置目录名可被用户改写（vault.configDir），不能硬编码 .obsidian
+    const configDir = this.ctx.plugin.app.vault.configDir || ".obsidian";
+    const cMapBaseUrl = "file:///" + vaultPath.replace(/\\/g, "/") + "/" + configDir + "/plugins/" + pluginDir + "/cmaps/";
     const lib = await loadPdfjsLib(this.ctx.plugin);
     const loadingTask = lib.getDocument({
       data: arrayBuffer,
@@ -765,7 +790,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       const singleKeywordMode =
         !/[；;，,、·•‧・]/.test(content) &&
         !/\s/.test(content) &&
-        /^[A-Za-z][A-Za-z0-9()\-]*$/.test(content);
+        /^[A-Za-z][A-Za-z0-9()-]*$/.test(content);
       const rest = source.slice((match.index ?? 0) + match[0].length);
       const lines = rest.split("\n");
       const maxLines = singleKeywordMode ? 10 : 2;
@@ -889,36 +914,12 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
 
   // ========== 浮动批注按钮 ==========
   initFloatingButton(): void {
-    this.floatingBtn = document.createElement("div");
-    this.floatingBtn.className = "pdf-annotate-floating-btn";
-    Object.assign(this.floatingBtn.style, {
-      position: "fixed",
-      zIndex: "9999",
-      padding: "6px 14px",
-      background: "var(--interactive-accent)",
-      color: "var(--text-on-accent)",
-      borderRadius: "6px",
-      cursor: "pointer",
-      fontSize: "13px",
-      fontWeight: "500",
-      boxShadow: "0 2px 8px rgba(0,0,0,0.18)",
-      display: "none",
-      userSelect: "none",
-      transition: "opacity 0.15s",
-      whiteSpace: "nowrap"
-    });
-    const label = document.createElement("span");
-    label.textContent = "批注到笔记";
-    this.floatingBtn.appendChild(label);
-    const badge = document.createElement("sup");
-    badge.style.marginLeft = "4px";
-    badge.style.fontSize = "11px";
-    badge.style.fontWeight = "700";
-    badge.style.color = "var(--text-on-accent)";
-    badge.style.display = "none";
+    // 外观全部交给 styles.css 的 .pdfreader-pdf-annotate-floating-btn，
+    // 内联样式会让主题/片段无法覆盖（官方指南：禁止硬编码样式）
+    this.floatingBtn = document.body.createDiv({ cls: "pdfreader-pdf-annotate-floating-btn" });
+    const label = this.floatingBtn.createSpan({ text: "批注到笔记" });
+    const badge = this.floatingBtn.createEl("sup", { cls: "pdfreader-pdf-annotate-badge" });
     this.floatingBadge = badge;
-    this.floatingBtn.appendChild(badge);
-    document.body.appendChild(this.floatingBtn);
     this.ctx.plugin.registerDomEvent(this.floatingBtn, "click", () => {
       this.handleAnnotation();
       // 隐藏按钮的同时清掉原生文字选区（内部先清选区再置 display:none）：
@@ -926,14 +927,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       // 且 handlePdfMouseUp 的 150ms 延迟回调会把选区重新塞回缓存、把按钮重新显示出来
       this.hideFloatingButton();
     });
-    this.ctx.plugin.registerDomEvent(this.floatingBtn, "mouseenter", () => {
-      if (this.floatingBtn)
-        this.floatingBtn.style.opacity = "0.85";
-    });
-    this.ctx.plugin.registerDomEvent(this.floatingBtn, "mouseleave", () => {
-      if (this.floatingBtn)
-        this.floatingBtn.style.opacity = "1";
-    });
+    // 悬停变淡交给 CSS :hover，不再逐次改内联 opacity
   }
   removeFloatingButton(): void {
     this.stopFollowTimer();
@@ -953,13 +947,13 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       return;
     }
     this.trackedRange = range;
-    this.floatingBtn.style.display = "block";
+    this.floatingBtn.addClass("is-visible");
     if (this.floatingBadge) {
       if (this.savedSelections.length > 1) {
         this.floatingBadge.textContent = `${this.savedSelections.length}`;
-        this.floatingBadge.style.display = "inline";
+        this.floatingBadge.addClass("is-visible");
       } else {
-        this.floatingBadge.style.display = "none";
+        this.floatingBadge.removeClass("is-visible");
       }
     }
     this.repositionFloatingButton();
@@ -1110,7 +1104,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       const bbox = range.getBoundingClientRect();
       if (bbox && (bbox.width > 0 || bbox.height > 0))
         return bbox;
-      const startEl = range.startContainer instanceof Element ? range.startContainer : range.startContainer?.parentElement ?? null;
+      const startEl = range.startContainer?.instanceOf(Element) ? range.startContainer : range.startContainer?.parentElement ?? null;
       if (startEl) {
         const er = startEl.getBoundingClientRect();
         if (er.width > 0 || er.height > 0)
@@ -1156,12 +1150,12 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
   hideFloatingButton(): void {
     // 仅当确实在收起「由 PDF 选区唤起的批注按钮」时才清选区；
     // 全局 mousedown / mouseup 回调在无关位置调用本方法时，不应改动任何选区状态。
-    const wasActive = this.trackedRange !== null || this.floatingBtn?.style.display === "block";
+    const wasActive = this.trackedRange !== null || this.floatingBtn?.hasClass("is-visible") === true;
     if (wasActive) this.clearNativeSelection();
     this.stopFollowTimer();
     this.trackedRange = null;
     if (this.floatingBtn) {
-      this.floatingBtn.style.display = "none";
+      this.floatingBtn.removeClass("is-visible");
     }
   }
   // ========== PDF 选区检测 ==========
@@ -1175,23 +1169,23 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
    * 它内部有 wasActive 保护，不会误清笔记自己的选区。
    */
   handlePdfMouseUp(evt: MouseEvent): void {
-    const activeLeafNow = this.ctx.plugin.app.workspace.activeLeaf;
-    if (!activeLeafNow || activeLeafNow.view.getViewType() !== "pdf") {
+    const activeLeafNow = this.ctx.plugin.app.workspace.getActiveViewOfType(FileView);
+    if (!activeLeafNow || activeLeafNow.getViewType() !== "pdf") {
       this.hideFloatingButton();
       return;
     }
-    setTimeout(() => {
+    const timer = window.setTimeout(() => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
         this.hideFloatingButton();
         return;
       }
-      const activeLeaf = this.ctx.plugin.app.workspace.activeLeaf;
-      if (!activeLeaf || activeLeaf.view.getViewType() !== "pdf") {
+      const activeLeaf = this.ctx.plugin.app.workspace.getActiveViewOfType(FileView);
+      if (!activeLeaf || activeLeaf.getViewType() !== "pdf") {
         this.hideFloatingButton();
         return;
       }
-      const pdfFile = (activeLeaf.view as FileView).file;
+      const pdfFile = activeLeaf.file;
       if (!pdfFile) {
         this.hideFloatingButton();
         return;
@@ -1215,6 +1209,8 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
         }
       }
     }, 150);
+    // 插件卸载时清掉待触发的回调，避免卸载后仍操作选区/按钮
+    this.ctx.plugin.register(() => window.clearTimeout(timer));
   }
   getPdfSelectionInfo(): Omit<SavedSelectionInfo, "text"> | null {
     const sel = window.getSelection();
@@ -1309,7 +1305,7 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
   }
   /** 向上查找选区端点所在的带 data-idx 的文本 span（文本锚点的最小单位） */
   findParentTextSpan(node: Node, textLayer: Element): HTMLElement | null {
-    let current = node instanceof HTMLElement ? node : node.parentElement;
+    let current = node.instanceOf(HTMLElement) ? node : node.parentElement;
     while (current && current !== textLayer) {
       if (current.tagName === "SPAN" && current.hasAttribute("data-idx")) {
         return current;
@@ -1431,10 +1427,10 @@ ${prompt}`;
   async handleAnnotation(): Promise<void> {
     if (this.savedSelections.length === 0)
       return;
-    const activeLeaf = this.ctx.plugin.app.workspace.activeLeaf;
-    if (!activeLeaf || activeLeaf.view.getViewType() !== "pdf")
+    const activeLeaf = this.ctx.plugin.app.workspace.getActiveViewOfType(FileView);
+    if (!activeLeaf || activeLeaf.getViewType() !== "pdf")
       return;
-    const pdfFile = (activeLeaf.view as FileView).file;
+    const pdfFile = activeLeaf.file;
     if (!pdfFile)
       return;
     const selections = [...this.savedSelections];
@@ -1650,7 +1646,7 @@ ${notePrompt}`;
           return;
         }
       }
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await new Promise((resolve) => window.setTimeout(resolve, 25));
     }
   }
   /**

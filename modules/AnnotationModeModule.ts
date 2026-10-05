@@ -72,8 +72,9 @@ export class AnnotationModeModule implements PluginModule {
             id: 'toggle-include-original-text',
             name: '切换「附带原文」批注模式（默认关闭；开启时批注包含原文）',
             checkCallback: (checking) => {
-                const leaf = plugin.app.workspace.activeLeaf;
-                if (!leaf || leaf.view.getViewType() !== 'pdf') return false;
+                // activeLeaf 已被官方标记为 deprecated，改用 getActiveViewOfType
+                const view = plugin.app.workspace.getActiveViewOfType(FileView);
+                if (!view || view.getViewType() !== 'pdf') return false;
                 if (!checking) this.toggleMode();
                 return true;
             },
@@ -145,7 +146,7 @@ export class AnnotationModeModule implements PluginModule {
                 this.toolbarButtons.delete(leaf);
             }
 
-            const btn = document.createElement('div');
+            const btn = createDiv();
             btn.addClass('clickable-icon');
             btn.addClass('pdfreader-annotation-mode-button');
             setIcon(btn, 'link');

@@ -47,7 +47,7 @@ interface ParsedFragment {
     key: string | null;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 /** 笔记内跳转定位高亮样式 class（编辑模式 addHighlights 与阅读模式共用，见 styles.css） */
 const NOTE_FLASH_MARK_CLASS = 'pdf-reader-note-flash-mark';
@@ -438,7 +438,7 @@ export class PdfJumpModule implements PluginModule {
         if (evt.button !== 0) return;
         if (evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey) return;
         const target = evt.target as HTMLElement | null;
-        if (!target || !(target instanceof Element)) return;
+        if (!target || !target.instanceOf(Element)) return;
 
         let linktext: string | null = null;
         let sourcePath = '';
@@ -488,7 +488,8 @@ export class PdfJumpModule implements PluginModule {
         evt.stopPropagation();
         evt.stopImmediatePropagation();
 
-        const sourceLeaf = this.findLeafContaining(target) ?? this.ctx.plugin.app.workspace.activeLeaf;
+        // 找不到链接所在叶子时退回最近活动的叶子（activeLeaf 已被官方标记为 deprecated）
+        const sourceLeaf = this.findLeafContaining(target) ?? this.ctx.plugin.app.workspace.getMostRecentLeaf();
         void this.jumpToPdf(pdfFile, fragment, sourceLeaf).catch((e) => {
             console.error('[PdfJump] 跳转 PDF 失败:', e);
             new Notice('跳转 PDF 失败');
@@ -597,7 +598,7 @@ export class PdfJumpModule implements PluginModule {
         if (evt.button !== 0) return;
         if (evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey) return;
         const target = evt.target as HTMLElement | null;
-        if (!target || !(target instanceof Element)) return;
+        if (!target || !target.instanceOf(Element)) return;
 
         const jumpEl = target.closest<HTMLElement>('[data-pdf-jump-page]');
         if (!jumpEl) return;

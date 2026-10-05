@@ -78,7 +78,7 @@ const NOTE_FLASH_MS = 1100;
 const SOURCE_FLASH_WAIT_MS = 8000;
 /** 等待来源笔记就绪时的轮询间隔 */
 const SOURCE_FLASH_POLL_MS = 120;
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 /**
  * 点击「定位」链接后要点亮的来源 `==…==` 高亮。
@@ -137,6 +137,8 @@ export class MarkdownReadingModule implements PluginModule {
     /** 「定位」跳转代次：新跳转与卸载时自增，用于中止在途的滚动等待 */
     private flashRunId: number;
     private sourceFlashTimer: number | null;
+    /** 选区检查的 150ms 延迟句柄（卸载时清除，避免卸载后仍操作 DOM） */
+    private selectionCheckTimer: number | null;
     private sourceFlashEl: HTMLElement | null;
     /** 编辑器模式下持有跳转高亮的编辑器（到期/卸载时按 class 注销） */
     private sourceFlashEditor: Editor | null;
@@ -156,6 +158,7 @@ export class MarkdownReadingModule implements PluginModule {
         this.toolbarViews = new Map();
         this.flashRunId = 0;
         this.sourceFlashTimer = null;
+        this.selectionCheckTimer = null;
         this.sourceFlashEl = null;
         this.sourceFlashEditor = null;
         this.annotationSync = new MarkdownAnnotationSync(ctx);
@@ -222,9 +225,9 @@ export class MarkdownReadingModule implements PluginModule {
         });
         plugin.registerDomEvent(document, 'mousedown', (evt) => {
             if (evt.button !== 0) return;
-            const target = evt.target;
-            if (this.floatingBtn != null && this.floatingBtn.contains(target as Node)) return;
-            if (target instanceof Element && target.closest('.menu') != null) return;
+            const target = evt.target as Node | null;
+            if (this.floatingBtn != null && target != null && this.floatingBtn.contains(target)) return;
+            if (target != null && target.instanceOf(Element) && target.closest('.menu') != null) return;
             this.hideFloatingButton();
         });
         plugin.registerDomEvent(document, 'scroll', () => this.repositionFloatingButton(), { capture: true });
@@ -239,6 +242,10 @@ export class MarkdownReadingModule implements PluginModule {
     unload(): void {
         this.sourcePath = null;
         this.pdfModule.setAnnotationTargetExclusionProvider(null);
+        if (this.selectionCheckTimer !== null) {
+            window.clearTimeout(this.selectionCheckTimer);
+            this.selectionCheckTimer = null;
+        }
         this.removeFloatingButton();
         this.clearSourceFlash();
         this.flashRunId++; // 模块卸载：中止在途的「定位」滚动等待
@@ -249,14 +256,13 @@ export class MarkdownReadingModule implements PluginModule {
     // ========== 编辑器顶部工具栏 ==========
 
     private createEditorToolbar(view: EditorView): { dom: HTMLElement; top: boolean; mount?: () => void; destroy: () => void } {
-        const dom = document.createElement('div');
-        dom.className = 'pdfreader-md-toolbar';
+        const dom = createDiv({ cls: 'pdfreader-md-toolbar' });
 
         // Obsidian 的 Live Preview 表格支持「就地编辑单元格」：点击单元格时会临时创建一个
         // 嵌套在 <td> 里的 CM6 编辑器（TableCellEditor）。registerEditorExtension 是全局注册的，
         // 面板会被一起塞进单元格，撑破笔记里的表格——这类嵌套编辑器一律不生成工具栏。
         if (this.isNestedEditorView(view)) {
-            dom.style.display = 'none';
+            dom.addClass('is-hidden');
             return {
                 dom,
                 top: true,
@@ -265,7 +271,7 @@ export class MarkdownReadingModule implements PluginModule {
             };
         }
 
-        const markBtn = document.createElement('div');
+        const markBtn = createDiv();
         markBtn.addClass('clickable-icon');
         markBtn.addClass('pdfreader-md-toolbar-btn');
         markBtn.addClass('pdfreader-md-mark-btn');
@@ -279,7 +285,7 @@ export class MarkdownReadingModule implements PluginModule {
         });
 
         // 与 PDF 工具条「附带原文」按钮保持同图标、同视觉。
-        const originalBtn = document.createElement('div');
+        const originalBtn = createDiv();
         originalBtn.addClass('clickable-icon');
         originalBtn.addClass('pdfreader-md-toolbar-btn');
         originalBtn.addClass('pdfreader-md-original-btn');
@@ -291,7 +297,7 @@ export class MarkdownReadingModule implements PluginModule {
         });
 
         // 与 PDF 工具条「标签」按钮保持同图标、同视觉。
-        const tagBtn = document.createElement('div');
+        const tagBtn = createDiv();
         tagBtn.addClass('clickable-icon');
         tagBtn.addClass('pdfreader-md-toolbar-btn');
         tagBtn.addClass('pdfreader-md-tag-btn');
@@ -302,8 +308,7 @@ export class MarkdownReadingModule implements PluginModule {
             this.quickTagModule.openTagPicker();
         });
 
-        const targetEl = document.createElement('span');
-        targetEl.className = 'pdfreader-md-toolbar-target';
+        const targetEl = createSpan({ cls: 'pdfreader-md-toolbar-target' });
 
         dom.append(markBtn, originalBtn, tagBtn, targetEl);
         this.toolbarViews.set(dom, view);
@@ -342,9 +347,9 @@ export class MarkdownReadingModule implements PluginModule {
         if (wrapper == null) return;
         // 外壳里只有本插件这一个面板时才隐藏，避免连带影响其它插件的面板
         if (wrapper.classList.contains('cm-panels') && wrapper.childElementCount <= 1) {
-            wrapper.style.display = 'none';
+            wrapper.addClass('is-hidden');
         } else {
-            dom.style.display = 'none';
+            dom.addClass('is-hidden');
         }
     }
 
@@ -452,8 +457,8 @@ export class MarkdownReadingModule implements PluginModule {
     private handleAnnotationLinkClick = (evt: MouseEvent): void => {
         if (evt.button !== 0) return;
         if (evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey) return;
-        const target = evt.target;
-        if ((target instanceof Element) === false) return;
+        const target = evt.target as Node | null;
+        if (target == null || target.instanceOf(Element) === false) return;
 
         // 阅读模式（及所有渲染出的 internal-link 锚点）
         const anchor = target.closest<HTMLElement>('a.internal-link');
@@ -928,9 +933,7 @@ export class MarkdownReadingModule implements PluginModule {
     // ========== 浮动批注按钮 ==========
 
     private initFloatingButton(): void {
-        const btn = document.createElement('div');
-        btn.className = 'pdfreader-md-annotate-floating-btn';
-        btn.textContent = '批注到笔记';
+        const btn = createDiv({ cls: 'pdfreader-md-annotate-floating-btn', text: '批注到笔记' });
         btn.addEventListener('mousedown', (evt) => evt.preventDefault());
         btn.addEventListener('click', () => {
             const snapshot = this.pendingSelection;
@@ -953,16 +956,20 @@ export class MarkdownReadingModule implements PluginModule {
     }
 
     private scheduleSelectionCheck(): void {
-        window.setTimeout(() => this.checkSelectionForFloatingButton(), 150);
+        if (this.selectionCheckTimer !== null) window.clearTimeout(this.selectionCheckTimer);
+        this.selectionCheckTimer = window.setTimeout(() => {
+            this.selectionCheckTimer = null;
+            this.checkSelectionForFloatingButton();
+        }, 150);
     }
 
     private checkSelectionForFloatingButton(): void {
         if (Date.now() < this.suppressCheckUntil) return;
 
         const plugin = this.ctx.plugin;
-        const leaf = plugin.app.workspace.activeLeaf;
-        const view = leaf?.view;
-        if ((view instanceof MarkdownView) === false) {
+        // activeLeaf 已被官方标记为 deprecated，改用 getActiveViewOfType
+        const view = plugin.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view === null) {
             this.hideFloatingButton();
             return;
         }
@@ -993,7 +1000,7 @@ export class MarkdownReadingModule implements PluginModule {
         }
         const range = selection.getRangeAt(0);
         const node = range.commonAncestorContainer;
-        const element = node instanceof Element ? node : node.parentElement;
+        const element = node.instanceOf(Element) ? node : node.parentElement;
         if (element == null || element.closest('.cm-content') == null) {
             this.hideFloatingButton();
             return;

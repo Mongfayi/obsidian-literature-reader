@@ -70,18 +70,26 @@ export class UnifiedSettingTab extends PluginSettingTab {
     /** 500ms 防抖后保存设置 */
     private scheduleSave(): void {
         if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
-        this.saveTimer = window.setTimeout(async () => {
+        this.saveTimer = window.setTimeout(() => {
             this.saveTimer = null;
-            try {
-                await this.saveSettings();
-            } catch (e) {
-                console.error('[pdf-reader] 保存设置失败:', e);
-                new Notice('设置保存失败，改动未写入磁盘，请检查 data.json 是否可写', 8000);
-            }
+            void (async () => {
+                try {
+                    await this.saveSettings();
+                } catch (e) {
+                    console.error('[pdf-reader] 保存设置失败:', e);
+                    new Notice('设置保存失败，改动未写入磁盘，请检查 data.json 是否可写', 8000);
+                }
+            })();
         }, 500);
     }
 
-    onClose(): void {
+    /**
+     * 设置页关闭/隐藏时的清理。
+     *
+     * 注意：PluginSettingTab 没有 onClose（那是 Modal 的钩子），真正的钩子是 hide()。
+     * 此前写成 onClose 导致定时器从未被清理、最后一次防抖保存也不会冲刷。
+     */
+    hide(): void {
         if (this.saveTimer !== null) {
             window.clearTimeout(this.saveTimer);
             this.saveTimer = null;
@@ -90,6 +98,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 console.error('[pdf-reader] 关闭设置页时保存失败:', e);
             });
         }
+        super.hide();
     }
 
     /**
@@ -243,7 +252,8 @@ export class UnifiedSettingTab extends PluginSettingTab {
         if (pending.length === 0) return;
 
         const box = host.createDiv({ cls: 'pdfreader-tag-changes' });
-        box.createEl('h4', { text: `${pending.length} 项改名待同步到笔记` });
+        // 官方指南：标题用 setHeading()，不要直接写 <h1>/<h2>（否则与其他插件样式不一致）
+        new Setting(box).setName(`${pending.length} 项改名待同步到笔记`).setHeading();
 
         const list = box.createDiv({ cls: 'pdfreader-tag-change-list' });
         for (const p of pending) {
@@ -273,7 +283,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         // ===== PDF 阅读设置 =====
-        containerEl.createEl('h2', { text: 'PDF 阅读设置' });
+        new Setting(containerEl).setName('PDF 阅读').setHeading();
 
         new Setting(containerEl)
             .setName('阅读笔记文件夹')
@@ -336,8 +346,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         // ===== 批注格式与界面 =====
-        containerEl.createEl('hr');
-        containerEl.createEl('h2', { text: '批注格式与界面' });
+        new Setting(containerEl).setName('批注格式与界面').setHeading();
 
         new Setting(containerEl)
             .setName('批注链接别名')
@@ -404,8 +413,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         // ===== 标签管理 =====
-        containerEl.createEl('hr');
-        containerEl.createEl('h2', { text: '标签管理' });
+        new Setting(containerEl).setName('标签').setHeading();
 
         containerEl.createEl('p', {
             text: '每个标签有一个不会改变的内部 id，因此改名是可精确记录的，不需要任何猜测配对。'
@@ -440,8 +448,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
 
 
         // ===== 搜索增强 =====
-        containerEl.createEl('hr');
-        containerEl.createEl('h2', { text: '搜索增强' });
+        new Setting(containerEl).setName('搜索增强').setHeading();
 
         new Setting(containerEl)
             .setName('忽略链接')
@@ -455,8 +462,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         // ===== DeepSeek 设置 =====
-        containerEl.createEl('hr');
-        containerEl.createEl('h2', { text: 'DeepSeek 窗口设置' });
+        new Setting(containerEl).setName('DeepSeek 窗口').setHeading();
         containerEl.createEl('p', {
             text: '提示：选择「浮动窗口」时可拖动标题栏移动、拖动边缘调整大小，位置与大小自动记住；选择「标签页」时在 Obsidian 工作区中以标签页打开。',
             cls: 'setting-item-description',
@@ -496,8 +502,7 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         // ===== 截图 OCR 批注设置 =====
-        containerEl.createEl('hr');
-        containerEl.createEl('h2', { text: '截图 OCR 批注设置' });
+        new Setting(containerEl).setName('截图 OCR 批注').setHeading();
 
         new Setting(containerEl)
             .setName('LM Studio 服务器地址')

@@ -51,7 +51,8 @@ export interface PendingRename {
 
 /** 生成标签 id：优先用 crypto.randomUUID，不可用时回退到时间戳+随机串 */
 export function newTagId(): string {
-    const c = (globalThis as { crypto?: Crypto }).crypto;
+    // 用 window 而非 globalThis：弹出窗口场景下 activeWindow 才是正确的宿主
+    const c = (window as { crypto?: Crypto }).crypto;
     if (c && typeof c.randomUUID === 'function') return c.randomUUID();
     return `t${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -289,7 +290,7 @@ export function applyTagOps(text: string, ops: TagOp[]): { text: string; count: 
     // 标签名后不能紧跟标签字符，否则 #方向性 会被误当成 #方向。
     // 注意：这两个正则都是模块级复用且带 test()，绝不能加 g 标志 —— 带 g 时 lastIndex
     // 会在多次调用之间累积，导致同一片段里后面的标签被随机跳过。
-    const TAG_CHAR = /[\p{L}\p{N}_\-\/]/u;
+    const TAG_CHAR = /[\p{L}\p{N}_\-/]/u;
 
     let count = 0;
     const out = mapLines(text, (line) => outsideInlineCode(line, (seg) => {
@@ -397,7 +398,7 @@ export function collectTagsFromText(text: string): Map<string, number> {
     const counts = new Map<string, number>();
     mapLines(text, (line) => {
         outsideInlineCode(line, (seg) => {
-            const re = /(?:^|\s)#([\p{L}\p{N}_\-\/]+)/gu;
+            const re = /(?:^|\s)#([\p{L}\p{N}_\-/]+)/gu;
             let m: RegExpExecArray | null;
             while ((m = re.exec(seg)) !== null) {
                 counts.set(m[1], (counts.get(m[1]) ?? 0) + 1);

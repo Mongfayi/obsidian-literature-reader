@@ -224,7 +224,6 @@ export class QuickTagModule implements PluginModule {
                 delete settings.quickTagText;
                 delete settings.quickTagApplied;
                 await this.ctx.saveSettings();
-                console.log('[QuickTag] 已清理旧版标签遗留字段（quickTagText / quickTagApplied）');
             }
             return;
         }
@@ -256,7 +255,6 @@ export class QuickTagModule implements PluginModule {
         delete settings.quickTagText;
         delete settings.quickTagApplied;
         await this.ctx.saveSettings();
-        console.log(`[QuickTag] 已迁移 ${entries.length} 个标签到稳定 id 存储`);
     }
 
     // ========== 主流程 ==========
@@ -356,7 +354,7 @@ export class QuickTagModule implements PluginModule {
                 this.toolbarButtons.delete(leaf);
             }
 
-            const btn = document.createElement('div');
+            const btn = createDiv();
             btn.addClass('clickable-icon');
             btn.addClass('pdfreader-quick-tag-button');
             setIcon(btn, 'tags');
