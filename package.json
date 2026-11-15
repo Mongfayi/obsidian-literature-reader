@@ -1,6 +1,6 @@
 {
     "name": "obsidian-literature-reader",
-    "version": "2.6.0",
+    "version": "2.7.0",
     "scripts": {
         "dev": "node esbuild.config.mjs",
         "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
@@ -11,7 +11,7 @@
         "@esbuild/darwin-arm64": "^0.28.1",
         "@types/node": "^20.0.0",
         "esbuild": "^0.20.0",
-        "obsidian": "latest",
+        "obsidian": "^1.14.4",
         "typescript": "^5.0.0"
     },
     "dependencies": {

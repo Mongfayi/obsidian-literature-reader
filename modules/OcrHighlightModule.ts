@@ -1,6 +1,7 @@
 import { TFile } from 'obsidian';
 import type { ModuleContext } from '../types';
 import { BasePdfHighlightModule } from './HighlightBase';
+import { notesLinkingToPdf } from './pdfLinkIndex';
 
 /**
  * 截图 OCR 区域持久高亮模块
@@ -94,8 +95,7 @@ export class OcrHighlightModule extends BasePdfHighlightModule<PdfOcrIndex> {
         const app = this.ctx.plugin.app;
         let readFailed = false;
 
-        for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
-            if (!links[pdfPath]) continue;
+        for (const sourcePath of notesLinkingToPdf(app, pdfPath)) {
             const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
             if (!(sourceFile instanceof TFile)) continue;
             try {

@@ -34,6 +34,8 @@ export class MarkdownAnnotationSync {
     private readonly syncTimers = new Map<string, number>();
     private readonly syncingTargets = new Set<string>();
     private initialSyncTimer: number | null = null;
+    /** 记录变更的防抖落盘：每条批注都整份 saveSettings 会随记录增长越来越重 */
+    private saveTimer: number | null = null;
 
     constructor(private readonly ctx: ModuleContext) {}
 
@@ -67,7 +69,7 @@ export class MarkdownAnnotationSync {
             createdAt: Date.now(),
         };
         this.getRecords().push(record);
-        void this.saveSafely();
+        this.saveSoon();
     }
 
     /**
@@ -148,7 +150,7 @@ export class MarkdownAnnotationSync {
                 }
             }
         }
-        if (changed) void this.saveSafely();
+        if (changed) this.saveSoon();
     }
 
     handleDelete(file: TAbstractFile): void {
@@ -161,7 +163,7 @@ export class MarkdownAnnotationSync {
         }
         if (sourceRecordIds.size > 0) {
             this.deleteRecords(sourceRecordIds);
-            void this.saveSafely();
+            this.saveSoon();
         }
         if (hasTargetRecord) this.schedule(file.path);
     }
@@ -188,6 +190,10 @@ export class MarkdownAnnotationSync {
         if (this.initialSyncTimer != null) {
             window.clearTimeout(this.initialSyncTimer);
             this.initialSyncTimer = null;
+        }
+        if (this.saveTimer != null) {
+            window.clearTimeout(this.saveTimer);
+            this.saveTimer = null;
         }
         for (const timer of this.syncTimers.values()) window.clearTimeout(timer);
         this.syncTimers.clear();
@@ -459,6 +465,15 @@ export class MarkdownAnnotationSync {
         if (candidate.includes(original) || original.includes(candidate)) return true;
         const minLength = Math.min(candidate.length, original.length);
         return this.commonPrefixLength(candidate, original) >= Math.min(8, Math.ceil(minLength * 0.6));
+    }
+
+    /** 记录变更的防抖落盘：500ms 内的多次登记/删除只写一次 data.json */
+    private saveSoon(): void {
+        if (this.saveTimer != null) window.clearTimeout(this.saveTimer);
+        this.saveTimer = window.setTimeout(() => {
+            this.saveTimer = null;
+            void this.saveSafely();
+        }, 500);
     }
 
     private async saveSafely(): Promise<void> {

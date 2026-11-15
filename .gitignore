@@ -15,3 +15,5 @@ pdf-reader-*-cmaps.zip
 # ESLint 本地缓存
 .npm-cache/
 .eslintcache
+# 个人/团队关键词词表：插件会在设置里的词表为空时自动读取，但不入库
+keyword-lexicon.json

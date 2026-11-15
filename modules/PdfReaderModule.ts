@@ -2,6 +2,7 @@ import { Editor, FileView, MarkdownView, Notice, TAbstractFile, TFile, TFolder, 
 import { DEFAULT_SETTINGS, type FileUploadData, type ModuleContext, type PluginModule, type SavedSelectionInfo } from '../types';
 import { buildNoteBaseRegex, renderNoteBaseName, sanitizeLinkAlias } from './noteNaming';
 import { loadPdfjsLib } from './pdfjsLoader';
+import { extractKeywordsFromText } from './keywordEngine';
 
 declare function require(name: string): any;
 /**
@@ -17,11 +18,15 @@ type RectHighlightEntry = { page: number; rect: NormRect };
 const LINE_BREAK_THRESHOLD = 5;
 /** 「PDF名, 页面 N」式冗长批注链接别名（缩短为短标签时匹配） */
 const LONG_PDF_LINK_RE = /\[\[([^\]|]+?\.pdf#[^\]|]*?)\|[^\]|]*?[,，]\s*页面\s*\d+\]\]/g;
+/** 不带 g 的版本：带 g 的 RegExp.test() 会累积 lastIndex，导致命令可用性时有时无 */
+const LONG_PDF_LINK_TEST = /\[\[([^\]|]+?\.pdf#[^\]|]*?)\|[^\]|]*?[,，]\s*页面\s*\d+\]\]/;
 export class PdfReaderModule implements PluginModule {
   private floatingBtn: HTMLElement | null;
   private floatingBadge: HTMLElement | null;
   private trackedRange: Range | null;
   private followTimerId: number | null;
+  /** 鼠标松开后 150ms 才检测选区；只保留最后一个，避免每次 mouseup 都往插件注册表塞清理闭包 */
+  private mouseUpTimer: number | null;
   private savedSelections: SavedSelectionInfo[];
   private currentPdfPath: string | null;
   /** 批注写入后回调（由主入口注入 PdfHighlightModule.refresh） */
@@ -70,6 +75,7 @@ export class PdfReaderModule implements PluginModule {
     this.trackedRange = null;
     /** 选区位置轮询定时器（兜底捕获不触发 scroll/resize 的布局变化，如 pdf.js 缩放、侧栏动画） */
     this.followTimerId = null;
+    this.mouseUpTimer = null;
     this.savedSelections = [];
     /** 当前选区所属的 PDF 路径，用于跨文件时重置多选缓存 */
     this.currentPdfPath = null;
@@ -155,7 +161,7 @@ export class PdfReaderModule implements PluginModule {
       // 直接写 vault 会丢掉光标位置、撤销栈与折叠状态（官方指南：活动文件优先用 Editor API）
       editorCheckCallback: (checking, editor) => {
         const content = editor.getValue();
-        if (!LONG_PDF_LINK_RE.test(content))
+        if (!LONG_PDF_LINK_TEST.test(content))
           return false;
         if (!checking)
           this.shortenPdfAnnotationLinksInEditor(editor, content);
@@ -190,6 +196,10 @@ export class PdfReaderModule implements PluginModule {
     this.trackActiveNote();
   }
   unload(): void {
+    if (this.mouseUpTimer !== null) {
+      window.clearTimeout(this.mouseUpTimer);
+      this.mouseUpTimer = null;
+    }
     this.removeFloatingButton();
     this.savedSelections = [];
     this.currentPdfPath = null;
@@ -462,7 +472,13 @@ export class PdfReaderModule implements PluginModule {
     if (noteFile instanceof TFolder)
       return null;
     const initialContent = await this.generateNoteContent(sourceFile);
-    return await this.ctx.plugin.app.vault.create(notePath, initialContent);
+    try {
+      return await this.ctx.plugin.app.vault.create(notePath, initialContent);
+    } catch (e) {
+      console.error("[PdfReader] 创建阅读笔记失败:", e);
+      new Notice(`创建阅读笔记失败：${notePath}（${(e as Error).message}）`);
+      return null;
+    }
   }
   /**
    * 解析阅读笔记路径（文件名来自可配置模板，{name} = 文献文件名）：
@@ -556,7 +572,7 @@ export class PdfReaderModule implements PluginModule {
     const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     let tags: string[] = [];
     // 关键词只对 PDF 提取：md 文献本身就是文本，交给用户自己打标签
-    if (sourceFile.extension === "pdf") {
+    if (sourceFile.extension === "pdf" && this.ctx.getSettings().keywordAutoExtract !== false) {
       try {
         const text = await this.extractPdfText(sourceFile);
         tags = this.extractKeywords(text);
@@ -696,220 +712,19 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     return true;
   }
   // ========== 关键词提取 ==========
+  /**
+   * 从 PDF 全文抽取标签。
+   *
+   * 解析、同义归并、无关键词兜底都在 modules/keywordEngine.ts 里（纯逻辑、可单测），
+   * 这里只负责读设置并保持既有方法签名，供 generateNoteContent 调用。
+   */
   extractKeywords(text: string): string[] {
-    text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-    const stopMarkers = [
-      "中图分类号", "文献标识码", "文章编号", "DOI", "doi", "分类号", "收稿日期", "修回日期", "基金项目",
-      "摘要", "Abstract", "abstract", "Keywords", "keywords",
-      // 英文期刊关键词经常换行后直接接正文一级标题，需要在标题处截断
-      "Introduction", "Materials and methods", "Results", "Discussion", "Conclusions", "References", "Acknowledgements",
-      "引言", "材料与方法", "结果", "讨论", "结论", "参考文献", "致谢"
-    ];
-    const compactedText = text.replace(/\s+/g, "");
-    const isCjkChar = (ch: string): boolean =>
-      ch.length > 0 && /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(ch);
-    /** 全角转半角，并合并 PDF 逐字排版产生的字母/数字间空格，如“Ｃ Ｒ Ｉ Ｓ Ｐ Ｒ” → “CRISPR” */
-    const normalizeKeywordFragment = (s: string): string => {
-      let out = s.replace(/[\uFF01-\uFF5E]/g, (ch) =>
-        String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)
-      );
-      // 合并逐字排版：C R I S P R → CRISPR、C m b Z I P 5 3 → CmbZIP53、BSR -s e q → BSR-seq
-      // 只合并“单个字母/数字”或被短缩写包围的相邻片段，保留 Deep learning 这类正常词组。
-      const tokens = out.split(/\s+/);
-      const merged: string[] = [];
-      for (let i = 0; i < tokens.length; i++) {
-        let token = tokens[i];
-        while (i + 1 < tokens.length) {
-          const next = tokens[i + 1];
-          const nextIsSingle = /^[A-Za-z0-9]$/.test(next);
-          const tokenEndsAlnum = /[A-Za-z0-9]$/.test(token);
-          const acronymPrefix = /^[A-Z]$/.test(token) && /^[A-Z0-9]/.test(next);
-          if ((nextIsSingle && tokenEndsAlnum) || acronymPrefix) {
-            token += next;
-            i++;
-            continue;
-          }
-          break;
-        }
-        merged.push(token);
-      }
-      return merged.join(" ")
-        .replace(/\s*-\s*/g, "-")
-        .replace(/(?<=[A-Za-z0-9])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])/g, "")
-        .replace(/(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[A-Za-z0-9])/g, "");
-    };
-    /** 单行一个英文关键词的格式（如 Elsevier 的 Keywords: 换行列表） */
-    const isSingleEnglishKeywordLine = (line: string): boolean => {
-      const t = line.trim();
-      if (!t || t.length > 60)
-        return false;
-      if (!/^[A-Za-z][A-Za-z0-9 .()\-–—×]*$/.test(t))
-        return false;
-      if (/(?:19|20)\d{2}/.test(t))
-        return false;
-      const compact = t.replace(/\s+/g, "").toLowerCase();
-      return !stopMarkers.some((m) => m.replace(/\s+/g, "").toLowerCase() === compact);
-    };
-    /**
-     * 判断关键词标签后的下一行是否仍是关键词列表。
-     *
-     * 仅凭“标签后还有行”直接续读会误伤：中文期刊的关键词行下面常紧跟着
-     * “作者 (年份). 题目. 期刊 卷, 页.” 格式的引用行，不是关键词。
-     */
-    const isKeywordContinuationLine = (line: string): boolean => {
-      const t = line.trim();
-      if (!t)
-        return false;
-      // 引用行中的年份
-      if (/(?:19|20)\d{2}/.test(t))
-        return false;
-      // 英文关键词续行常以小写字母开头，且可能以句点收尾（如 Index Terms 换行后的第二行）
-      if (/^[a-z]/.test(t))
-        return true;
-      // 句末标点/英文句点通常意味着已经进入正文或引用行
-      if (/[。？！?!]/.test(t) || /\./.test(t))
-        return false;
-      // 纯中文短片段：是中文关键词被换行截断的特征（如“机器” + “学习”）
-      const compactCjk = t.replace(
-        /(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])[ \t\u3000]+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])/g,
-        ""
-      );
-      if (/^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$/.test(compactCjk))
-        return compactCjk.length <= 6;
-      // 含关键词分隔符时，要求每个片段都足够短，避免把正文句子当成关键词续行
-      if (!/[；;，,、·•‧・]/.test(t))
-        return false;
-      const parts = t.split(/[；;，,、·•‧・]/).map((s) => s.trim()).filter((s) => s.length > 0);
-      if (parts.length < 2)
-        return false;
-      return Math.max(...parts.map((s) => s.length)) <= 15;
-    };
-    /** 从第一行关键词之后，最多再合并两行真正的关键词续行 */
-    const extendKeywordContent = (source: string, match: RegExpMatchArray): string => {
-      let content = match[1].trim();
-      const singleKeywordMode =
-        !/[；;，,、·•‧・]/.test(content) &&
-        !/\s/.test(content) &&
-        /^[A-Za-z][A-Za-z0-9()-]*$/.test(content);
-      const rest = source.slice((match.index ?? 0) + match[0].length);
-      const lines = rest.split("\n");
-      const maxLines = singleKeywordMode ? 10 : 2;
-      for (let i = 1; i <= maxLines && i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (singleKeywordMode) {
-          if (!isSingleEnglishKeywordLine(line))
-            break;
-          content += "；" + line;
-          continue;
-        }
-        if (!isKeywordContinuationLine(line))
-          break;
-        // 下一行若以已解析出的某个关键词开头并继续成句，说明这是正文而不是关键词续行
-        const firstSegment = line.split(/[；;，,、·•‧・]/)[0].trim();
-        const existingKeywords = content.split(/[；;，,、·•‧・\n]/).map((s) => s.trim()).filter((s) => s.length > 0);
-        if (!/^[；;，,、·•‧・]/.test(line) &&
-            existingKeywords.some((k) => k.length > 0 && firstSegment.startsWith(k) && firstSegment.length > k.length)) {
-          break;
-        }
-        // 中文关键词被换行截断时直接拼回，避免生成“机器-学习”这种标签
-        const prev = content.charAt(content.length - 1);
-        const next = line.charAt(0);
-        content += isCjkChar(prev) && isCjkChar(next) ? line : "\n" + line;
-      }
-      return content;
-    };
-    const tryOnText = (source: string, pattern: RegExp): string => {
-      const match = source.match(pattern);
-      if (match && match[1].trim()) {
-        let content = extendKeywordContent(source, match);
-        const compactedContent = content.replace(/\s+/g, "");
-        for (const marker of stopMarkers) {
-          let idx = content.indexOf(marker);
-          if (idx < 0) {
-            idx = compactedContent.indexOf(marker);
-            if (idx >= 0) {
-              let nonWs = 0;
-              let mapped = false;
-              for (let c = 0; c < content.length; c++) {
-                if (/\s/.test(content[c]))
-                  continue;
-                if (nonWs === idx) {
-                  idx = c;
-                  mapped = true;
-                  break;
-                }
-                nonWs++;
-              }
-              if (!mapped)
-                idx = -1;
-            }
-          }
-          if (idx >= 0) {
-            // 若停止标记位于后续行，切到该行行首：避免把“1. Introduction”的“1.”残留成关键词
-            const lineStart = content.lastIndexOf("\n", Math.max(0, idx - 1)) + 1;
-            content = content.substring(0, lineStart > 0 ? lineStart : idx).trim();
-            break;
-          }
-        }
-        return content;
-      }
-      return "";
-    };
-    const patterns = [
-      /关[ \t\u3000]*键[ \t\u3000]*词\s*[：:∶]?\s*([^\n。]+)/,
-      /关[ \t\u3000]*键[ \t\u3000]*字\s*[：:∶]?\s*([^\n。]+)/,
-      /[Kk]ey\s*words?\s*[：:∶]?\s*([^\n。]+)/,
-      /[Ii]ndex\s+[Tt]erms\s*[—–\-:：]?\s*([^\n。]+)/
-    ];
-    let keywordsStr = "";
-    for (const pattern of patterns) {
-      keywordsStr = tryOnText(text, pattern);
-      if (keywordsStr)
-        break;
-      keywordsStr = tryOnText(compactedText, pattern);
-      if (keywordsStr) {
-        keywordsStr = keywordsStr.replace(/\s+/g, "");
-        break;
-      }
-    }
-    if (!keywordsStr)
-      return [];
-    // 有些 PDF 用私有区字符当关键词分隔符；先统一成可识别的分隔符。
-    keywordsStr = keywordsStr.replace(/[\uE000-\uF8FF]/g, "；").replace(/\u00A0/g, " ").trim();
-    if (!/[；;，,、·•‧・]/.test(keywordsStr) && /[ \t\u3000]{2,}/.test(keywordsStr)) {
-      // 没有标点分隔、但存在明显大段空白时：大空白是词间分隔，单个中文间空格是词内排版
-      keywordsStr = keywordsStr
-        .replace(/[ \t\u3000]{2,}/g, "；")
-        .replace(
-          /(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])[ \t\u3000](?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])/g,
-          ""
-        );
-    }
-    let rawKeywords = keywordsStr.split(/[；;，,、·•‧・]/).map((k) => k.trim()).filter((k) => k.length > 0);
-    const hasPunctuationSeparator = /[；;，,、·•‧・]/.test(keywordsStr);
-    if (!hasPunctuationSeparator && rawKeywords.length <= 2) {
-      const spaceSplit = keywordsStr.split(/\s+/).map((k) => k.trim()).filter((k) => k.length > 0);
-      if (spaceSplit.length > rawKeywords.length) {
-        rawKeywords = spaceSplit;
-      }
-    } else {
-      // 中文 PDF 常把关键词逐字排版成“种 子 耐 淹 性”，标点分隔才可信；此时只去掉中文词内空白。
-      rawKeywords = rawKeywords.map((k) =>
-        k.replace(
-          /(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])[ \t\u3000]+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])/g,
-          ""
-        )
-      );
-    }
-    const MAX_TAG_LENGTH = 40;
-    const tags = rawKeywords.map((k) => {
-      return normalizeKeywordFragment(k)
-        .replace(/\s+/g, "-")
-        .replace(/[^\w\u4e00-\u9fff-]/g, "")
-        .replace(/-+/g, "-")
-        .replace(/^-+|-+$/g, "");
-    }).filter((k) => k.length > 0 && k.length <= MAX_TAG_LENGTH);
-    return [...new Set(tags)];
+    const settings = this.ctx.getSettings();
+    return extractKeywordsFromText(text, {
+      normalize: settings.keywordNormalize !== false,
+      fallback: settings.keywordFallbackInfer !== false,
+      maxTags: settings.keywordMaxTags ?? DEFAULT_SETTINGS.keywordMaxTags,
+    }).tags;
   }
 
   // ========== 浮动批注按钮 ==========
@@ -922,7 +737,8 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     this.floatingBadge = badge;
     this.ctx.plugin.registerDomEvent(this.floatingBtn, "click", () => {
       this.handleAnnotation();
-      // 隐藏按钮的同时清掉原生文字选区（内部先清选区再置 display:none）：
+      // 隐藏按钮的同时清掉原生文字选区（内部先清选区，再摘掉 is-visible class，
+      // 按钮由 styles.css 的 display:none 隐藏）：
       // 紫色选区高亮必须与按钮同生共死，否则批注完成后会留下看起来“没生效”的残留高亮，
       // 且 handlePdfMouseUp 的 150ms 延迟回调会把选区重新塞回缓存、把按钮重新显示出来
       this.hideFloatingButton();
@@ -958,7 +774,11 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     }
     this.repositionFloatingButton();
     if (this.followTimerId === null) {
-      this.followTimerId = window.setInterval(() => this.repositionFloatingButton(), 200);
+      this.followTimerId = window.setInterval(() => {
+        // 窗口/标签页不可见时 getClientRects 只会强制布局，不做无意义跟随
+        if (document.hidden) return;
+        this.repositionFloatingButton();
+      }, 200);
     }
   }
   /**
@@ -986,18 +806,18 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
     }
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+    // 显隐统一走 is-visible class（styles.css：默认 display:none，.is-visible 才显示）。
+    // 绝不能在这里写内联 display：内联样式优先级高于任何 class 规则，
+    // 一旦留下内联 display:block，hideFloatingButton 的 removeClass("is-visible")
+    // 就再也藏不住按钮 —— 表现为「点击『批注到笔记』或取消勾选后按钮卡在页面上不消失」。
     if (probe.bottom <= 0 || probe.top >= vh || probe.right <= 0 || probe.left >= vw) {
       // 整段选区滚出视口：只隐藏按钮、保留原生选区与锚点，滚回视口时自动重现。
-      // 不能在此调用 hideFloatingButton——它会 removeAllRanges 主动清掉选区，
-      // 用户滚动一下页面再回来，紫色高亮就没了
-      if (btn.style.display !== "none") {
-        btn.style.display = "none";
-      }
+      // 同时停掉 200ms 跟随定时器：否则用户只是滚走，之后每秒 5 次强制布局会一直跑。
+      btn.classList.remove("is-visible");
+      this.stopFollowTimer();
       return;
     }
-    if (btn.style.display === "none") {
-      btn.style.display = "block";
-    }
+    btn.classList.add("is-visible");
     const btnW = btn.offsetWidth || 80;
     const btnH = btn.offsetHeight || 30;
     let left = rect.right - btnW / 2 + btnW / 4;
@@ -1174,7 +994,9 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
       this.hideFloatingButton();
       return;
     }
-    const timer = window.setTimeout(() => {
+    if (this.mouseUpTimer !== null) window.clearTimeout(this.mouseUpTimer);
+    this.mouseUpTimer = window.setTimeout(() => {
+      this.mouseUpTimer = null;
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
         this.hideFloatingButton();
@@ -1209,8 +1031,6 @@ ${tags.map((t) => `  - ${t}`).join("\n")}`;
         }
       }
     }, 150);
-    // 插件卸载时清掉待触发的回调，避免卸载后仍操作选区/按钮
-    this.ctx.plugin.register(() => window.clearTimeout(timer));
   }
   getPdfSelectionInfo(): Omit<SavedSelectionInfo, "text"> | null {
     const sel = window.getSelection();

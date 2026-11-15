@@ -1,6 +1,6 @@
 # 文献阅读助手插件技术手册
 
-> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「文献阅读助手」，版本 `2.5.1`，`minAppVersion: 1.7.0`，仅桌面端（`isDesktopOnly: true`）。
+> 面向 AI 查阅的简洁参考。插件 ID: `pdf-reader`，插件名「PDF Reader」，版本 `2.6.0`，`minAppVersion: 1.12.7`，仅桌面端（`isDesktopOnly: true`）。
 
 ---
 
@@ -12,7 +12,7 @@
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| PdfReaderModule | `modules/PdfReaderModule.ts` | 开始阅读（PDF 与 md 文献）、关键词提取、文字/截图/OCR 批注写入笔记（写入后聚焦目标笔记 `focusNoteLeaf`）、上传文件数据源 |
+| PdfReaderModule | `modules/PdfReaderModule.ts` | 开始阅读（PDF 与 md 文献）、关键词提取入口（委托 keywordEngine）、文字/截图/OCR 批注写入笔记（写入后聚焦目标笔记 `focusNoteLeaf`）、上传文件数据源 |
 | DeepSeekModule | `modules/DeepSeekModule.ts` | DeepSeek 浮动窗口/工作区标签页（webview）、拖拽/最小化、上传当前文件到聊天框 |
 | ScreenshotModule | `modules/ScreenshotModule.ts` | 截图批注：框选区域 → PDF 嵌入链接（无图片文件），注册自定义 EmbedCreator 实时渲染裁剪区 |
 | ScreenshotHighlightModule | `modules/ScreenshotHighlightModule.ts` | 截图批注区域持久高亮（笔记 `&rect=` 链接驱动，黄色边框、内部不填充） |
@@ -22,6 +22,9 @@
 | OcrHighlightModule | `modules/OcrHighlightModule.ts` | OCR 区域持久高亮（笔记 `&ocr=` 链接驱动，不可交互） |
 | PdfJumpModule | `modules/PdfJumpModule.ts` | 双向跳转：点击 PDF 高亮 → 笔记对应批注；点击笔记 PDF 链接 → PDF 对应位置（目标未打开时自动分屏） |
 | AnnotationModeModule | `modules/AnnotationModeModule.ts` | 批注原文附带模式（测试功能）：工具条「附带原文」开关，默认关闭=只写链接（定位 + 用户输入）；开启=附带原文（原文 / 定位 / 笔记：）。按钮图标化，状态靠 tooltip 区分 |
+| KeywordModule | `modules/KeywordModule.ts` | 关键词补标签：命令「为当前文献笔记添加关键词」对已有笔记重新提取并弹窗勾选，只追加 frontmatter tags；新建笔记的自动提取由 PdfReaderModule 调用 keywordEngine |
+| keywordEngine | `modules/keywordEngine.ts` | 纯逻辑（无 Obsidian 依赖）：关键词段解析、清洗/去噪、同义归并、无关键词兜底推断、frontmatter tags 合并 |
+| keywordLexicon | `modules/keywordLexicon.ts` | 词表数据结构与文本/JSON 格式解析（`parseLexiconText` / `serializeLexiconText` / `parseLexiconJson` / `summarizeLexicon`）。**不含任何内置词条**：词表内容来自设置项 `keywordLexicon`，由用户自己维护 |
 | QuickTagModule | `modules/QuickTagModule.ts` | 快速添加标签：PDF / Markdown 工具条「标签」按钮 / 命令快捷键唤起选择器，词表取自设置里的 `quickTags`，把 `#标签 ` 插入笔记光标处；首次运行做一次性迁移 |
 | MarkdownReadingModule | `modules/MarkdownReadingModule.ts` | Markdown 批注：来源笔记标记、工具条、浮动「批注到笔记」按钮、写入蓝框/纯链接；点击「定位」链接时接管导航（复用已打开的文献叶子，未打开则左侧分屏，不替换当前笔记）并**只点亮来源里对应的 `==…==`**（避免 Obsidian 原生按标题闪整节） |
 | MarkdownAnnotationSync | `modules/MarkdownAnnotationSync.ts` | Markdown 批注配对记录：把「定位」链接 ↔ 来源 `==…==` 配对；点击链接时按记录还原批注位置，删除链接时同步撤销 `==` 包裹（保留正文文字） |
@@ -53,6 +56,11 @@
 | `quickTags` | `TagDef[]` | `[]` | 标签定义列表（稳定 `id` + `name` + `description`）；标签的唯一真源，在设置面板「标签管理」中逐行编辑 |
 | `pendingTagRenames` | `PendingRename[]` | `[]` | 待同步到笔记的改名（`{id, from, to}`）；用户改名瞬间登记，同步或「撤销改名」后清空 |
 | `quickTagToolbarButton` | `boolean` | `true` | 是否在每个 PDF 视图工具条注入「标签」按钮；关闭后仅保留命令/快捷键入口 |
+| `keywordAutoExtract` | `boolean` | `true` | 新建阅读笔记时是否自动提取 PDF 关键词并写入 frontmatter `tags` |
+| `keywordNormalize` | `boolean` | `true` | 是否用语料词表把同义/中英文关键词归并为规范标签 |
+| `keywordFallbackInfer` | `boolean` | `true` | PDF 没有作者关键词段时，是否用标题 + 摘要命名词表兜底推断 |
+| `keywordMaxTags` | `number` | `8` | 每篇笔记最多写入多少个自动/手动关键词标签 |
+| `fileListTitleWrap` | `boolean` | `true` | 左侧文件列表（文件管理器）中的文件/文件夹标题是否换行显示完整名称；关闭后恢复 Obsidian 原生单行省略 |
 
 设置面板 500ms 防抖保存；关闭面板时冲刷未落盘修改。OCR 设置区含「测试连接」按钮（拉取 `/v1/models` 列出可用模型）。
 
@@ -66,10 +74,12 @@
 2. 创建 `PdfHighlightModule`，把 `highlightModule.refresh` 注入 `pdfModule.setRefreshHighlights`
 3. 创建 `ScreenshotModule(ctx, pdfModule)`、`OcrModule(ctx, pdfModule)`
 4. 创建 `OcrHighlightModule`，把 `ocrHighlightModule.refresh` 注入 `ocrModule.setHighlightRefresh`
-5. 创建 `QuickTagModule(ctx, pdfModule)`（快速添加标签，复用 `pdfModule.getAnnotationTargetNote` 定位目标笔记）
-6. 创建 `TagSyncModule(ctx)`（标签同步，并把实例传给设置面板用于渲染变更区）
-7. 模块按顺序加载，**单个失败不拖垮其余**（try/catch 兜底）；卸载逆序
-8. 注册统一设置面板 `UnifiedSettingTab`
+5. 创建 `KeywordModule(ctx, pdfModule)`（关键词补标签：按活动文件找 PDF / 阅读笔记，弹窗勾选后写入 frontmatter）
+6. 创建 `QuickTagModule(ctx, pdfModule)`（快速添加标签，复用 `pdfModule.getAnnotationTargetNote` 定位目标笔记）
+7. 创建 `TagSyncModule(ctx)`（标签同步，并把实例传给设置面板用于渲染变更区）
+8. 模块按顺序加载，**单个失败不拖垮其余**（try/catch 兜底）；卸载逆序
+9. 注册统一设置面板 `UnifiedSettingTab`（关键词模块实例一并传入，设置页按钮复用同一入口）
+10. `loadSettings` / `saveSettings` 同步文件列表标题换行开关：给每个 `file-explorer` 叶子的 `containerEl` 切换 `pdf-reader-file-list-wrap` 类（样式在 `styles.css`），并监听 `layout-change` / `onLayoutReady` 处理文件管理器重建
 
 模块通过 `ModuleContext`（`plugin` / `getSettings` / `saveSettings` / 可选 `getCurrentFileForUpload`）访问共享资源，避免直接耦合。
 
@@ -153,10 +163,20 @@
 - 其他：兜底活动 `.md` 文件；无可用文件返回 `null`
 
 ### 4.5 关键词提取 `extractKeywords(text): string[]`
-- 正则（优先级）：`/关键词[：:∶]?/`、`/关键字[：:∶]?/`、`/[Kk]eywords?[：:∶]?/`，原始文本与去空格文本各试一次
-- 停止标记：`中图分类号`、`文献标识码`、`文章编号`、`DOI`、`分类号`、`收稿日期`、`修回日期`、`基金项目`、`Abstract`、`Keywords` 等（含被空白打断的变体，紧凑文本定位后映射回原文）
-- 分割符：优先 `；;，,`；结果不足 2 个回退空格分割
-- 标签：空格转 `-`、去特殊字符、去重、长度上限 40
+实际逻辑在 `modules/keywordEngine.ts`（纯逻辑、可单测），`PdfReaderModule.extractKeywords` 只读设置并保持旧签名：
+
+1. **定位关键词段**：全文扫描 `关键词/关键字/主题词`、`Key words / KEYWORDS / Key-words`、`Index Terms`，大小写、连字符、下划线、全角空格、逐字排版空格都容忍；最多取 6 段（中英文各算一段）。
+2. **解析列表**：支持单行分号/逗号列表、Elsevier 的逐行关键词、中文被换行截断的关键词、大空白分隔；遇 `Introduction`、`中图分类号`、DOI、引用行等停止。第一行紧跟标签时不再用“长句”规则误杀。
+3. **清洗与去噪**：NFKC、合并逐字排版空格、去掉 `Correspondence` / `Abbreviations` / 脚注作者尾巴；过滤年份、作者单位、作者姓名、正文长句、`and/of` 等连接词、RGB 分量等碎片。
+4. **同义归并**（`keywordNormalize`）：词表来自设置项 `keywordLexicon`（用户自己的文本词表），`main.ts` 的 `applyKeywordLexicon()` 用 `parseLexiconText` 解析后经 `setKeywordConcepts()` 注入引擎；命中别名即归并到规范标签（如 `machine learning / ML / 机器学习` → `机器学习`），词表未命中的原文关键词仍按清洗结果保留，不丢弃。词表为空时整段退化为「只清洗」。
+5. **中英双段策略**：中文主段保留原文；英文副段只补充能归并到词表的概念，避免把英文翻译原样再打一遍标签。纯英文论文所有段都保留。
+6. **兜底推断**（`keywordFallbackInfer`）：没有任何关键词段时，用标题 + 摘要命名词表，按“标题命中 +4、摘要次数（上限 3）、词频加成（词表里 `corpusCount`，上限 2）”排序取前 5 个；`generic`（文本词表里标签后的 `*`）只有标题命中才参与。词表为空时直接返回空，不会瞎猜。
+7. **输出**：标签去重、长度上限 40；Obsidian 标签允许字母（含中文/希腊字母）、数字、`_`、`-`、`/`，因此 `CRISPR/Cas9` 保留斜杠、`CmRAP2.3` 转为 `CmRAP2-3`；超长标签在连字符边界截断，截不出像样的词则丢弃。
+
+词表维护入口：设置 → PDF Reader → 关键词 →「词表」（文本框，写入 `data.json` 的 `keywordLexicon`，600ms 防抖保存、保存即重算索引）、
+「导入…」（`importLexiconFile`：vault 内 .json/.txt/.md 任选，JSON 形态兼容 `{version,concepts}`、裸数组、字符串数组）、
+「导出」（`exportLexiconFile`：写 `pdf-reader-keyword-lexicon.json` 到 vault 根目录）。
+另有本地兜底文件：插件目录下的 `keyword-lexicon.json` 在 `keywordLexicon` 为空时由 `adoptLexiconFile()` 自动导入（该文件在 `.gitignore` 中）。
 
 ---
 
@@ -333,7 +353,7 @@
 
 ### 10.3 设置面板的标签编辑器
 
-设置 → 文献阅读助手 → 标签管理，每行一个标签：`#` + 名称输入框 + 描述输入框 + `↑` `↓` `✕`，下方是「＋ 添加标签」。
+设置 → PDF Reader → 标签管理，每行一个标签：`#` + 名称输入框 + 描述输入框 + `↑` `↓` `✕`，下方是「＋ 添加标签」。
 
 - **名称输入**：每次 `input` 调 `renameTag()` 登记待同步项，并只重绘待同步区（**不重绘行本身**，否则会丢焦点）
 - **名称失焦**：校验空名与重名，非法则 `revertTagName()` 回退到旧名（优先用待办里的 `from`）并提示
@@ -373,9 +393,21 @@
 
 | 命令 ID | 说明 |
 |---------|------|
+| `add-keywords-to-note` | 对当前 PDF / 阅读笔记提取关键词，弹窗勾选后追加到 frontmatter tags |
 | `quick-add-tag` | 打开标签选择器，插入到笔记光标处 |
 | `sync-tag-changes` | 有待同步改名时可用，打开设置页 |
 | `delete-tag-from-notes` | 打开删除候选选择器 |
+
+### 10.8 关键词补标签（KeywordModule）
+
+命令 `add-keywords-to-note`（设置 → PDF Reader → 关键词 →「选择关键词…」同一入口）：
+
+1. **找目标**：当前活动文件是 PDF → 按 frontmatter `pdf/source` 反查阅读笔记（再按命名模板兜底）；活动文件是笔记 → 按 `pdf` 字段反查 PDF（旧笔记按 `resolveNoteSource` 兜底）。
+2. **提取**：复用 `keywordEngine.extractKeywordsFromText`，与新建笔记时的自动提取完全同一套逻辑；`source` 为 `inferred` 时弹窗会注明“按标题/摘要推断”。
+3. **勾选**：候选默认全选；笔记已有标签以只读 chip 展示，不会重复加入；支持全选/全不选。
+4. **写入**：`mergeFrontmatterTags` 只在 frontmatter `tags` 末尾追加缺失项，正文与已有标签原样保留；写入走 `vault.process()`，避免覆盖并发修改。没有 frontmatter 时自动补一个。
+
+与「快速标签」的区别：快速标签是用户自己的状态词表（符合/方向/重要论文），插入正文光标处；关键词是文献主题标签，写入 frontmatter `tags`，供 Dataview / 标签面板聚合。
 
 ---
 
@@ -389,6 +421,7 @@
 | `deepseek-add-current-file` | 将当前阅读文件上传到 DeepSeek 聊天框 | DeepSeekModule |
 | `screenshot-annotate` | 截图批注到笔记 | ScreenshotModule |
 | `ocr-screenshot-annotate` | 截图 OCR 批注到笔记 | OcrModule |
+| `add-keywords-to-note` | 为当前文献笔记添加关键词（提取后弹窗勾选，只追加 frontmatter tags） | KeywordModule |
 | `quick-add-tag` | 快速添加标签（在笔记光标处插入凡例标签） | QuickTagModule |
 | `sync-tag-changes` | 同步标签改名到笔记（有待同步变更时可用，打开设置页） | TagSyncModule |
 | `delete-tag-from-notes` | 删除标签（从所有笔记中移除某个标签） | TagSyncModule |
@@ -492,7 +525,8 @@ Ribbon 机器人图标（按设置的默认方式）→ DeepSeek 浮动窗口或
 
 - **CMap 依赖**：中文 PDF 文本提取依赖 `cmaps/`，不可删除；目录改名后按 `manifest.dir` 重新解析仍可用
 - **文本提取范围**：仅提取 PDF 文本层，扫描版 PDF 无法提取关键词；逐页并行，单页失败跳过
-- **关键词提取**：依赖论文格式（「关键词：」行），非标准格式无法提取标签
+- **关键词提取**：优先读作者关键词段；完全没有关键词段（扫描版、Nature 系等）时用标题 + 摘要命名词表兜底。扫描版无文本层时仍可能没有标签，可在设置中关闭自动提取后用命令手动补
+- **关键词合并**：`mergeFrontmatterTags` 只追加标签、不覆盖已有标签与正文；`tags` 为行内数组时统一改写为块列表（Obsidian 官方写法）。手动补关键词通过 `vault.process()` 原子写入
 - **笔记覆盖**：`createReadingNote` 仅在笔记不存在/需去重时写初始内容，已存在笔记不更新 frontmatter（除 pdf 字段失效修复）
 - **批注定位**：跨页选区、文本层未渲染会回退为纯文字；无 `data-idx` 的文本（标题/图表标注）会回退为“页码链接 + 归一化矩形（`&ocr=`）”，由 OCR 高亮通道渲染持久矩形高亮；矩形计算失败时仅页码链接（`beginIndex=-1`）
 - **PUA 字符**：无 ToUnicode 映射的字形会输出 Unicode 私有区字符（U+E000–U+F8FF，渲染为 □/⏎），批注文本清洗时移除

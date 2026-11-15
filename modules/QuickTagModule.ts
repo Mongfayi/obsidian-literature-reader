@@ -18,7 +18,7 @@ import { toolbarPoller, pruneStaleLeaves } from './toolbarPoller';
 /**
  * 快速添加标签模块
  *
- * 词表来自插件设置 `quickTags`（带稳定 id 的结构化列表，在 设置 → 文献阅读助手 → 标签管理
+ * 词表来自插件设置 `quickTags`（带稳定 id 的结构化列表，在 设置 → PDF Reader → 标签管理
  * 中逐行编辑）。经工具条按钮或快捷键唤起选择器，把 `#标签 ` 插入笔记光标处。
  *
  * 三个入口：
@@ -263,7 +263,7 @@ export class QuickTagModule implements PluginModule {
     openTagPicker(): void {
         const items = this.loadTagEntries();
         if (items.length === 0) {
-            new Notice('快速标签：还没有标签，请在 设置 → 文献阅读助手 → 标签管理 中添加');
+            new Notice('快速标签：还没有标签，请在 设置 → PDF Reader → 标签管理 中添加');
             return;
         }
 

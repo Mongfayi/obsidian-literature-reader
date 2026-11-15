@@ -11,6 +11,7 @@ import { OcrHighlightModule } from './modules/OcrHighlightModule';
 import { AnnotationModeModule } from './modules/AnnotationModeModule';
 import { CalloutPasteModule } from './modules/CalloutPasteModule';
 import { QuickTagModule } from './modules/QuickTagModule';
+import { KeywordModule } from './modules/KeywordModule';
 import { TagSyncModule } from './modules/TagSyncModule';
 import { PdfJumpModule } from './modules/PdfJumpModule';
 import { ReadingNoteMarkerModule } from './modules/ReadingNoteMarkerModule';
@@ -18,10 +19,18 @@ import { WordCountFixModule } from './modules/WordCountFixModule';
 import { SearchEnhancementModule } from './modules/SearchEnhancementModule';
 import { UnifiedSettingTab } from './modules/SettingsTab';
 import { NoteContentCache } from './modules/noteContentCache';
+import { setKeywordConcepts } from './modules/keywordEngine';
+import {
+    parseLexiconJson,
+    parseLexiconText,
+    serializeLexiconText,
+    type KeywordConcept,
+    type LexiconIssue,
+} from './modules/keywordLexicon';
 import { toolbarPoller } from './modules/toolbarPoller';
 
 /**
- * 文献阅读助手（合并插件）
+ * PDF Reader（合并插件）
  *
  * 由原 pdf-reader 与 deepseek-sidebar 合并而来，包含两大功能模块：
  *  1. PdfReaderModule —— PDF 一键阅读、关键词提取、批注到笔记
@@ -30,13 +39,19 @@ import { toolbarPoller } from './modules/toolbarPoller';
  * 本类仅负责设置加载、模块编排与生命周期管理，具体功能下沉到各模块。
  */
 export default class LiteratureReaderPlugin extends Plugin {
-    private settings: PluginSettings = DEFAULT_SETTINGS;
+    // Obsidian 1.13.0 起 `Plugin` 基类声明了 `settings?: unknown`（声明式设置用），
+    // 子类同名字段不能再是 private，否则 TS2415 编译失败。这里保持 public 以兼容新版本。
+    settings: PluginSettings = DEFAULT_SETTINGS;
     private modules: PluginModule[] = [];
     /** 公开 PDF 模块实例，供 pdf-ocr 等插件调用批注 API */
     pdfModule: PdfReaderModule | null = null;
 
     async onload() {
         await this.loadSettings();
+
+        // 文件列表标题换行：文件管理器叶子可能稍后创建/重开，布局就绪与变化时重新套用开关 class
+        this.registerEvent(this.app.workspace.on('layout-change', () => this.applyFileListTitleWrap()));
+        this.app.workspace.onLayoutReady(() => this.applyFileListTitleWrap());
 
         // 共享笔记内容缓存：高亮/跳转模块的索引重建共用一次笔记读取
         const noteContentCache = new NoteContentCache(this);
@@ -61,6 +76,9 @@ export default class LiteratureReaderPlugin extends Plugin {
         // PDF 模块先行创建，以便将其 getCurrentFileForUpload 注入 DeepSeek 模块上下文
         const pdfModule = new PdfReaderModule(ctx);
         this.pdfModule = pdfModule;
+
+        // 关键词模块：命令「为当前文献笔记添加关键词」，提取后弹窗勾选写入 frontmatter
+        const keywordModule = new KeywordModule(ctx, pdfModule);
 
         // 快速标签模块：PDF / Markdown 工具条「标签」按钮 / 快捷键，把设置的标签插入笔记光标处
         const quickTagModule = new QuickTagModule(ctx, pdfModule);
@@ -126,6 +144,7 @@ export default class LiteratureReaderPlugin extends Plugin {
             markdownReadingModule,
             annotationModeModule,
             calloutPasteModule,
+            keywordModule,
             quickTagModule,
             tagSyncModule,
             highlightModule,
@@ -159,12 +178,23 @@ export default class LiteratureReaderPlugin extends Plugin {
                 ctx.saveSettings,
                 searchEnhancementModule,
                 tagSyncModule,
-                wordCountFixModule
+                wordCountFixModule,
+                keywordModule,
+                () => this.applyKeywordLexicon()
             )
         );
     }
 
     onunload() {
+        // 移除文件列表标题换行的开关 class（styles.css 已随插件卸载，仍做防御性清理）
+        try {
+            for (const leaf of this.app.workspace.getLeavesOfType('file-explorer')) {
+                leaf.view?.containerEl?.classList.remove('pdf-reader-file-list-wrap');
+            }
+        } catch (e) {
+            console.error('[LiteratureReader] 清理文件列表样式失败:', e);
+        }
+
         // 逆序卸载，保证后注册的模块先清理
         for (let i = this.modules.length - 1; i >= 0; i--) {
             try {
@@ -178,13 +208,54 @@ export default class LiteratureReaderPlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        await this.adoptLexiconFile();
+        this.applyKeywordLexicon();
         this.applyHighlightStyle();
+        this.applyFileListTitleWrap();
+    }
+
+    /**
+     * 词表本地文件兜底：`keywordLexicon` 为空时，读插件目录下的 `keyword-lexicon.json`
+     * （已被 .gitignore 排除，适合放个人词表 / 团队共享词表），转成文本词表存进设置。
+     * 只在词表为空时执行一次，之后以设置里的文本为准。
+     */
+    private async adoptLexiconFile(): Promise<void> {
+        if ((this.settings.keywordLexicon ?? '').trim()) return;
+        const dir = this.manifest.dir;
+        if (!dir) return;
+        const path = `${dir}/keyword-lexicon.json`;
+        try {
+            const adapter = this.app.vault.adapter;
+            if (!(await adapter.exists(path))) return;
+            const parsed = parseLexiconJson(await adapter.read(path));
+            if (!parsed || parsed.concepts.length === 0) return;
+            this.settings.keywordLexicon = serializeLexiconText(parsed.concepts);
+            await this.saveData(this.settings);
+        } catch (e) {
+            console.warn('[LiteratureReader] 读取本地词表文件失败:', e);
+        }
+    }
+
+    /**
+     * 把设置里的文本词表解析并注入 keywordEngine。
+     * 返回解析结果，供设置页显示「N 个概念 / M 行需要修正」。
+     */
+    applyKeywordLexicon(): { concepts: number; issues: LexiconIssue[] } {
+        const text = this.settings.keywordLexicon ?? '';
+        const parsed = parseLexiconText(text);
+        const concepts: KeywordConcept[] = parsed.concepts;
+        setKeywordConcepts(concepts);
+        return { concepts: concepts.length, issues: parsed.issues };
     }
 
     async saveSettings() {
         await this.saveData(this.settings);
+        // 词表即时生效：改完不用重载插件，下一次提取关键词就用新词表
+        this.applyKeywordLexicon();
         // 高亮外观即时生效：设置面板/批注按钮等任何保存动作都同步刷新 CSS 变量
         this.applyHighlightStyle();
+        // 文件列表标题换行开关也即时生效，无需重启
+        this.applyFileListTitleWrap();
     }
 
     /**
@@ -211,6 +282,18 @@ export default class LiteratureReaderPlugin extends Plugin {
         } else {
             // 无效颜色：移除变量，回退到主题高亮色 --text-highlight-bg-rgb
             body.style.removeProperty('--pdf-reader-highlight-rgb');
+        }
+    }
+
+    /**
+     * 文件列表标题换行：在文件管理器视图容器上切换开关 class，具体样式见 styles.css。
+     * class 挂在叶子容器而不是 body 上，多个文件列表/弹出窗口也能各自生效。
+     */
+    private applyFileListTitleWrap(): void {
+        const enabled = this.settings.fileListTitleWrap !== false;
+        for (const leaf of this.app.workspace.getLeavesOfType('file-explorer')) {
+            const container = leaf.view?.containerEl;
+            if (container) container.classList.toggle('pdf-reader-file-list-wrap', enabled);
         }
     }
 }

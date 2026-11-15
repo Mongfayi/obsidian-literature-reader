@@ -90,6 +90,8 @@ export interface PluginSettings {
     ocrSanitizeOutput: boolean;
     /** 是否在文件管理器为已有阅读笔记的文献（PDF 或 md 文献）显示小图标 */
     fileMarkerEnabled: boolean;
+    /** 文件列表标题换行：文件/文件夹名称自动换行显示完整名称（关闭恢复单行省略） */
+    fileListTitleWrap: boolean;
     /** 状态栏字数统计修正：图片/链接语法不计词（[[目标|别名]] 只计别名，嵌入与 URL 移除） */
     wordCountFixEnabled: boolean;
     /** 搜索增强-忽略链接：核心搜索时忽略 [[链接目标|别名]] 的目标文本（含 PDF 路径与定位参数） */
@@ -104,6 +106,19 @@ export interface PluginSettings {
     pendingTagRenames: PendingRename[];
     /** 快速标签-是否在每个 PDF 视图工具条注入「标签」按钮（嫌工具条拥挤可关闭，仅用快捷键） */
     quickTagToolbarButton: boolean;
+    /** 关键词-新建阅读笔记时是否自动从 PDF 提取关键词并写入 frontmatter tags */
+    keywordAutoExtract: boolean;
+    /** 关键词-是否用词表把同义/中英文关键词归并到规范标签 */
+    keywordNormalize: boolean;
+    /** 关键词-PDF 没有作者关键词段时，是否用标题 + 摘要命名词表兜底推断 */
+    keywordFallbackInfer: boolean;
+    /** 关键词-每篇阅读笔记最多写入多少个标签 */
+    keywordMaxTags: number;
+    /**
+     * 关键词-用户自己维护的词表（文本格式，一行一个概念：`规范标签 = 别名1, 别名2`）。
+     * 插件不内置任何词条：这份文本是本机词表的唯一真源，留空即「只清洗、不归并」。
+     */
+    keywordLexicon: string;
     /** Markdown 批注链接与来源高亮的配对记录（删除链接时同步撤销 `==`） */
     markdownAnnotationRecords: MarkdownAnnotationRecord[];
     /** @deprecated 上一版的文本框存储，仅用于首次迁移到 quickTags，之后不再写入 */
@@ -137,11 +152,17 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     ocrMaxUpscaleFactor: 4,
     ocrSanitizeOutput: true,
     fileMarkerEnabled: true,
+    fileListTitleWrap: true,
     wordCountFixEnabled: true,
     searchIgnoreLinks: false,
     quickTags: [],
     pendingTagRenames: [],
     quickTagToolbarButton: true,
+    keywordAutoExtract: true,
+    keywordNormalize: true,
+    keywordFallbackInfer: true,
+    keywordMaxTags: 8,
+    keywordLexicon: '',
     markdownAnnotationRecords: [],
     deepseekWindowGeometry: null,
 };

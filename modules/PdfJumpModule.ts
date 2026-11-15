@@ -1,5 +1,6 @@
 import { TFile, WorkspaceLeaf, FileView, MarkdownView, Menu, Notice, Editor, EditorPosition } from 'obsidian';
 import type { ModuleContext, PluginModule } from '../types';
+import { notesLinkingToPdf } from './pdfLinkIndex';
 
 /**
  * 笔记 ↔ PDF 双向跳转模块
@@ -305,8 +306,7 @@ export class PdfJumpModule implements PluginModule {
         const newIndex: PdfJumpIndex = new Map();
         const app = this.ctx.plugin.app;
 
-        for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
-            if (!links[pdfPath]) continue;
+        for (const sourcePath of notesLinkingToPdf(app, pdfPath)) {
             const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
             if (!(sourceFile instanceof TFile)) continue;
             try {

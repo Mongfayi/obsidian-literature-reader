@@ -704,6 +704,21 @@ body:has(> .modal-container) .deepseek-float-container {
 }
 
 
+/* ---------- 文件列表标题换行 ---------- */
+
+/* Obsidian 默认 white-space: pre + text-overflow: ellipsis，标题单行截断。
+   开启设置后 main.ts 在文件管理器视图容器上加 .pdf-reader-file-list-wrap。
+   保留核心的 overflow: hidden：flex 项靠它把 min-width 归零，才能收缩换行；
+   同时显式 min-width: 0，兼容旧版 Obsidian / 主题的 flex 实现。 */
+.pdf-reader-file-list-wrap .nav-file-title-content:not([contenteditable="true"]),
+.pdf-reader-file-list-wrap .nav-folder-title-content:not([contenteditable="true"]) {
+  white-space: pre-wrap;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+
 /* ---------- 批注 callout：无标题栏，框紧密包裹内容 ---------- */
 
 .callout[data-callout="pdf-annotation"] {
@@ -855,4 +870,150 @@ body:has(> .modal-container) .deepseek-float-container {
 
 .pdfreader-pdf-annotate-floating-btn .pdfreader-pdf-annotate-badge.is-visible {
   display: inline;
+}
+
+/* ===== 关键词勾选弹窗 ===== */
+.pdfreader-keyword-modal {
+  max-width: 620px;
+}
+
+.pdfreader-keyword-info {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+
+.pdfreader-keyword-hint {
+  color: var(--text-faint);
+}
+
+.pdfreader-keyword-summary {
+  color: var(--text-normal);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+
+.pdfreader-keyword-existing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  margin-bottom: 10px;
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.pdfreader-keyword-existing-label {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pdfreader-keyword-chip {
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+}
+
+.pdfreader-keyword-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.pdfreader-keyword-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+}
+
+.pdfreader-keyword-item:last-child {
+  border-bottom: none;
+}
+
+.pdfreader-keyword-item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.pdfreader-keyword-item input[type="checkbox"] {
+  margin-top: 2px;
+}
+
+.pdfreader-keyword-body {
+  min-width: 0;
+}
+
+.pdfreader-keyword-tag {
+  color: var(--text-accent);
+  font-weight: 600;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.pdfreader-keyword-desc {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.pdfreader-keyword-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.pdfreader-keyword-spacer {
+  flex: 1;
+}
+
+.pdfreader-keyword-footer button.is-disabled {
+  opacity: 0.5;
+}
+
+.pdfreader-lexicon-input {
+  width: 100%;
+  min-height: 180px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 4;
+  resize: vertical;
+  color: var(--text-normal);
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 4px);
+}
+
+.pdfreader-lexicon-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.pdfreader-lexicon-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pdfreader-lexicon-status-empty {
+  color: var(--text-faint);
+}
+
+.pdfreader-lexicon-issues {
+  color: var(--text-error);
+  line-height: 1.5;
 }

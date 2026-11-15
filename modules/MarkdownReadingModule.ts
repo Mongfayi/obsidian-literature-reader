@@ -1029,7 +1029,10 @@ export class MarkdownReadingModule implements PluginModule {
         btn.classList.add('is-visible');
         this.repositionFloatingButton();
         if (this.followTimerId == null) {
-            this.followTimerId = window.setInterval(() => this.repositionFloatingButton(), 200);
+            this.followTimerId = window.setInterval(() => {
+                if (document.hidden) return;
+                this.repositionFloatingButton();
+            }, 200);
         }
     }
 
@@ -1062,7 +1065,9 @@ export class MarkdownReadingModule implements PluginModule {
         const vw = window.innerWidth;
         const vh = window.innerHeight;
         if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) {
+            // 选区滚出视口：隐藏按钮并停掉 200ms 跟随定时器；滚回时由 scroll 监听重新定位
             btn.classList.remove('is-visible');
+            this.stopFollowTimer();
             return;
         }
         btn.classList.add('is-visible');

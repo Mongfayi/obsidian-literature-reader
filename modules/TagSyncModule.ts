@@ -273,7 +273,7 @@ export class TagSyncModule implements PluginModule {
             setting.open();
             setting.openTabById(this.ctx.plugin.manifest.id);
         } else {
-            new Notice('请在 设置 → 文献阅读助手 → 标签管理 中同步标签改名');
+            new Notice('请在 设置 → PDF Reader → 标签管理 中同步标签改名');
         }
     }
 

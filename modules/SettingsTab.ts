@@ -3,8 +3,17 @@ import type { DeepSeekOpenMode, PluginSettings } from '../types';
 import { DEFAULT_SETTINGS } from '../types';
 import { OcrService } from './OcrService';
 import { findDuplicateName, moveTag, newTagId, removeTag, renameTag } from './tagVocabulary';
+import {
+    LEXICON_FORMAT_HELP,
+    parseLexiconJson,
+    parseLexiconText,
+    serializeLexiconJson,
+    serializeLexiconText,
+    summarizeLexicon,
+} from './keywordLexicon';
 import type { TagSyncModule } from './TagSyncModule';
 import type { WordCountFixModule } from './WordCountFixModule';
+import type { KeywordModule } from './KeywordModule';
 import {
     DEFAULT_NOTE_NAME_TEMPLATE,
     isValidNameTemplate,
@@ -31,6 +40,10 @@ export class UnifiedSettingTab extends PluginSettingTab {
     private tagSync?: TagSyncModule;
     /** 字数统计修正模块（可选，用于开关切换时立即生效/还原） */
     private wordCountFix?: WordCountFixModule;
+    /** 关键词模块（可选，设置页「选择关键词…」按钮直接复用同一入口） */
+    private keywordModule?: KeywordModule;
+    /** 词表应用回调（插件侧解析并注入 keywordEngine，让新词表立即生效） */
+    private applyLexicon?: () => void;
     /** 防抖保存定时器（连续输入时避免每字符一次全量写盘） */
     private saveTimer: number | null = null;
 
@@ -41,7 +54,9 @@ export class UnifiedSettingTab extends PluginSettingTab {
         saveSettings: () => Promise<void>,
         searchEnhancement?: SearchEnhancementSync,
         tagSync?: TagSyncModule,
-        wordCountFix?: WordCountFixModule
+        wordCountFix?: WordCountFixModule,
+        keywordModule?: KeywordModule,
+        applyLexicon?: () => void
     ) {
         super(app, plugin);
         this.getSettings = getSettings;
@@ -49,6 +64,8 @@ export class UnifiedSettingTab extends PluginSettingTab {
         this.searchEnhancement = searchEnhancement;
         this.tagSync = tagSync;
         this.wordCountFix = wordCountFix;
+        this.keywordModule = keywordModule;
+        this.applyLexicon = applyLexicon;
     }
 
     /**
@@ -402,6 +419,16 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
+            .setName('文件列表标题换行')
+            .setDesc('左侧文件列表中的文件与文件夹名称不再用省略号截断，改为自动换行显示完整名称；长名称会占用多行。关闭后恢复 Obsidian 默认的单行省略')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().fileListTitleWrap !== false)
+                .onChange(async (value) => {
+                    this.getSettings().fileListTitleWrap = value;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
             .setName('字数统计修正')
             .setDesc('状态栏词数不再把图片嵌入、链接与 base64 数据算作正文：![[图片]]/![](data:...) 整体移除，[[目标|别名]] 只计别名，[[目标]] 只计显示名，[文字](网址) 只计文字，裸网址移除；字符数保持原生不变。统计口径与 Obsidian 原生完全一致，仅剔除图片与链接')
             .addToggle((toggle) => toggle
@@ -446,6 +473,170 @@ export class UnifiedSettingTab extends PluginSettingTab {
                 if (this.tagSync) void this.tagSync.openDeletePicker();
             }));
 
+
+        // ===== 关键词 =====
+        new Setting(containerEl).setName('关键词').setHeading();
+        containerEl.createEl('p', {
+            text: '新建阅读笔记时自动从 PDF 的关键词段提取标签，并用你自己维护的词表归并同义写法。'
+                + '词表不内置任何词条：留空时按原文清洗后直接当作标签，不做归并。'
+                + '没有关键词段的论文会尝试用标题和摘要兜底。',
+            cls: 'setting-item-description',
+        });
+
+        new Setting(containerEl)
+            .setName('自动提取关键词')
+            .setDesc('新建阅读笔记时，从 PDF 关键词段提取标签并写入 frontmatter 的 tags；关闭后新笔记不带 tags，'
+                + '仍可随时用下方「选择关键词」命令补标签')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().keywordAutoExtract !== false)
+                .onChange(async (value) => {
+                    this.getSettings().keywordAutoExtract = value;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('归并同义关键词')
+            .setDesc('按词表把同一概念的不同写法（machine learning / ML / 机器学习）归并成规范标签，'
+                + '并统一英文大小写、单复数和全角字符。关闭后按原文清洗，不做词表归并')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().keywordNormalize !== false)
+                .onChange(async (value) => {
+                    this.getSettings().keywordNormalize = value;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('无关键词时兜底推断')
+            .setDesc('扫描版或没有 Keywords 段的论文，按标题和摘要命中词表生成少量标签；'
+                + '关闭后这类论文新建笔记不带 tags')
+            .addToggle((toggle) => toggle
+                .setValue(this.getSettings().keywordFallbackInfer !== false)
+                .onChange(async (value) => {
+                    this.getSettings().keywordFallbackInfer = value;
+                    await this.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('每篇最多标签数')
+            .setDesc('自动提取与手动补关键词时，单篇笔记最多写入多少个标签（已有的标签不计入）')
+            .addDropdown((dropdown) => {
+                for (const n of [5, 8, 10, 12, 15]) dropdown.addOption(String(n), `${n} 个`);
+                dropdown
+                    .setValue(String(this.getSettings().keywordMaxTags ?? DEFAULT_SETTINGS.keywordMaxTags))
+                    .onChange(async (value) => {
+                        this.getSettings().keywordMaxTags = Number(value) || DEFAULT_SETTINGS.keywordMaxTags;
+                        await this.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName('为当前笔记补关键词')
+            .setDesc('对当前打开的 PDF 或阅读笔记重新提取关键词，弹窗勾选后只追加到 frontmatter tags，'
+                + '不改写正文；已经存在的标签不会重复添加')
+            .addButton((btn) => btn.setButtonText('选择关键词…').onClick(() => {
+                if (this.keywordModule) {
+                    this.keywordModule.openForActiveFile();
+                } else {
+                    new Notice('关键词模块尚未加载，请重载插件后再试');
+                }
+            }));
+
+        // 词表编辑器：先声明，按钮回调里引用（点击时已初始化）
+        let lexiconInput: HTMLTextAreaElement;
+        let applyLexicon: () => void;
+
+        new Setting(containerEl)
+            .setName('词表')
+            .setDesc('一行一个概念：「规范标签 = 别名1, 别名2」。标签后的 * 表示泛化词（只在标题命中时参与兜底推断），'
+                + '方括号里可写分类，只用于展示。改完自动保存，下次提取关键词即生效')
+            .addButton((btn) => btn
+                .setButtonText('导入…')
+                .setTooltip('从 vault 里选一个 .json / .txt / .md 词表文件导入')
+                .onClick(() => {
+                    if (!this.keywordModule) {
+                        new Notice('关键词模块尚未加载，请重载插件后再试');
+                        return;
+                    }
+                    this.keywordModule.importLexiconFile((text, path) => {
+                        const parsedJson = parseLexiconJson(text);
+                        lexiconInput.value = parsedJson
+                            ? serializeLexiconText(parsedJson.concepts)
+                            : text;
+                        applyLexicon();
+                        const count = parseLexiconText(lexiconInput.value).concepts.length;
+                        new Notice(`已从 ${path} 导入 ${count} 个概念`);
+                    });
+                }))
+            .addButton((btn) => btn
+                .setButtonText('导出')
+                .setTooltip('把当前词表写成 JSON，存到 vault 根目录')
+                .onClick(() => {
+                    if (!this.keywordModule) {
+                        new Notice('关键词模块尚未加载，请重载插件后再试');
+                        return;
+                    }
+                    const parsed = parseLexiconText(this.getSettings().keywordLexicon ?? '');
+                    void this.keywordModule.exportLexiconFile(serializeLexiconJson(parsed.concepts));
+                }))
+            .addButton((btn) => btn
+                .setButtonText('清空')
+                .setWarning()
+                .setTooltip('清空词表（之后只按原文清洗，不做归并）')
+                .onClick(() => {
+                    lexiconInput.value = '';
+                    applyLexicon();
+                }));
+
+        lexiconInput = containerEl.createEl('textarea', {
+            cls: 'pdfreader-lexicon-input',
+            attr: {
+                placeholder: LEXICON_FORMAT_HELP,
+                spellcheck: 'false',
+                rows: '12',
+            },
+        });
+        lexiconInput.value = this.getSettings().keywordLexicon ?? '';
+        const lexiconStatus = containerEl.createDiv({ cls: 'pdfreader-lexicon-status' });
+
+        const renderLexiconStatus = (): void => {
+            lexiconStatus.empty();
+            const parsed = parseLexiconText(lexiconInput.value);
+            const summary = summarizeLexicon(parsed.concepts);
+            if (summary.total === 0) {
+                lexiconStatus.createSpan({
+                    text: '词表为空：标签只按原文清洗，不做归并，也不会兜底推断。',
+                    cls: 'pdfreader-lexicon-status-empty',
+                });
+            } else {
+                lexiconStatus.createSpan({ text: `当前生效：${summary.total} 个概念、${summary.aliases} 个别名` });
+                if (summary.categories) lexiconStatus.createSpan({ text: ` · ${summary.categories}` });
+            }
+            if (parsed.issues.length > 0) {
+                const list = lexiconStatus.createDiv({ cls: 'pdfreader-lexicon-issues' });
+                list.createSpan({ text: `${parsed.issues.length} 行需要修正：` });
+                for (const issue of parsed.issues.slice(0, 3)) {
+                    list.createDiv({ text: `第 ${issue.line} 行：${issue.message}` });
+                }
+                if (parsed.issues.length > 3) {
+                    list.createDiv({ text: `…… 其余 ${parsed.issues.length - 3} 行见控制台` });
+                    console.warn('[Keyword] 词表解析问题:', parsed.issues);
+                }
+            }
+        };
+
+        applyLexicon = (): void => {
+            this.getSettings().keywordLexicon = lexiconInput.value;
+            renderLexiconStatus();
+            if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+            this.saveTimer = window.setTimeout(() => {
+                this.saveTimer = null;
+                void this.persist();
+                this.applyLexicon?.();
+            }, 600);
+        };
+
+        lexiconInput.addEventListener('input', () => applyLexicon());
+        renderLexiconStatus();
 
         // ===== 搜索增强 =====
         new Setting(containerEl).setName('搜索增强').setHeading();

@@ -52,6 +52,7 @@ async function build() {
         logLevel: 'info',
         sourcemap: prod ? false : 'inline',
         treeShaking: true,
+        minify: prod,
         outfile: path.join(pluginDir, 'main.js'),
     });
 

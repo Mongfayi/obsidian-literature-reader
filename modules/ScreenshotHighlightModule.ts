@@ -1,6 +1,7 @@
 import { TFile } from 'obsidian';
 import type { ModuleContext } from '../types';
 import { BasePdfHighlightModule } from './HighlightBase';
+import { notesLinkingToPdf } from './pdfLinkIndex';
 
 /**
  * 截图批注区域持久高亮模块
@@ -85,8 +86,7 @@ export class ScreenshotHighlightModule extends BasePdfHighlightModule<PdfScreens
         const app = this.ctx.plugin.app;
         let readFailed = false;
 
-        for (const [sourcePath, links] of Object.entries(app.metadataCache.resolvedLinks)) {
-            if (!links[pdfPath]) continue;
+        for (const sourcePath of notesLinkingToPdf(app, pdfPath)) {
             const sourceFile = app.vault.getAbstractFileByPath(sourcePath);
             if (!(sourceFile instanceof TFile)) continue;
             try {
