@@ -186,3 +186,5 @@ npm run build   # 产出 main.js，并自动从 node_modules/pdfjs-dist/cmaps �
 如果这个插件对你有帮助，欢迎请我喝杯咖啡 ☕
 
 <img src="docs/sponsor.jpg" alt="赞赏码" width="295" />
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
